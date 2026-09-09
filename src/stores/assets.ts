@@ -1,0 +1,273 @@
+import { computed, reactive } from "vue";
+import {
+  currentAssetVersion,
+  stripFileExtension,
+  type AssetCategory,
+  type AssetItem,
+  type AssetMediaType,
+  type AssetVersion,
+} from "../domain/assets";
+
+type ImportSource = "本地上传" | "剪贴板";
+
+interface AssetStoreState {
+  items: AssetItem[];
+  selectedId: string | null;
+  activeCategory: "全部" | AssetCategory;
+  query: string;
+  detailTab: "versions" | "links";
+  notice: string;
+}
+
+const nowText = () => new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+}).format(new Date()).replace(/\//g, "-");
+
+const uid = (prefix: string) => `${prefix}-${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`;
+
+function version(label: string, fileName: string, dimensions: string | undefined, duration: string | undefined, note: string): AssetVersion {
+  return {
+    id: uid("version"),
+    label,
+    fileName,
+    format: fileName.split(".").pop()?.toUpperCase() ?? "未知",
+    dimensions,
+    duration,
+    createdAt: "2026-09-08 14:28",
+    note,
+  };
+}
+
+function seedAsset(
+  id: string,
+  name: string,
+  category: AssetCategory,
+  fallbackImage: string,
+  fileName: string,
+  links: string[],
+  versionCount = 1,
+): AssetItem {
+  const mediaType: AssetMediaType = category === "音频" ? "audio" : "image";
+  const versions = Array.from({ length: versionCount }, (_, index) => {
+    const number = versionCount - index;
+    return version(
+      `V${number}`,
+      fileName,
+      mediaType === "image" ? "1920 × 1080" : undefined,
+      mediaType === "audio" ? "02:42" : undefined,
+      number === 1 ? "初始版本" : "优化了构图、亮度和画面细节",
+    );
+  });
+  return {
+    id,
+    name,
+    category,
+    mediaType,
+    source: "演示素材",
+    description: name === "闪电构图"
+      ? "乌云密布的夜空中闪电劈下，突出雷电的强烈感，用于科普分镜的关键画面。"
+      : `${name}，用于当前项目的参考素材。`,
+    fallbackImage,
+    currentVersionId: versions[0].id,
+    versions,
+    linkedShotIds: links,
+  };
+}
+
+const state = reactive<AssetStoreState>({
+  items: [
+    seedAsset("clouds", "雷云场景", "场景", "clouds", "thunder-clouds.png", ["01", "02", "03"]),
+    seedAsset("bolt", "闪电构图", "场景", "bolt", "lightning.png", ["01", "02", "03", "04", "05"], 2),
+    seedAsset("runner", "安全避险人物", "角色", "runner", "runner.png", ["02", "04", "05"]),
+    seedAsset("mountain", "山地背景", "场景", "mountain", "mountain.png", ["01", "03"]),
+    seedAsset("palette", "科普配色", "风格", "palette", "palette.png", ["01"]),
+    seedAsset("audio", "轻柔科普音乐", "音频", "audio", "science-music.mp3", ["01", "03", "05"]),
+    seedAsset("safety", "避险道具组合", "道具", "safety", "safety-kit.png", ["05"]),
+    seedAsset("village", "夜晚小镇", "场景", "village", "night-town.png", ["02", "04"]),
+    seedAsset("street", "雨夜街道", "场景", "street", "rain-street.png", ["04"]),
+  ],
+  selectedId: "bolt",
+  activeCategory: "全部",
+  query: "",
+  detailTab: "versions",
+  notice: "",
+});
+
+const selectedAsset = computed(() => state.items.find((item) => item.id === state.selectedId) ?? null);
+const filteredAssets = computed(() => {
+  const keyword = state.query.trim().toLocaleLowerCase();
+  return state.items.filter((asset) => {
+    const categoryMatches = state.activeCategory === "全部" || asset.category === state.activeCategory;
+    const keywordMatches = !keyword || `${asset.name} ${asset.category} ${asset.description}`.toLocaleLowerCase().includes(keyword);
+    return categoryMatches && keywordMatches;
+  });
+});
+
+function readImageDimensions(url: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve(`${image.naturalWidth} × ${image.naturalHeight}`);
+    image.onerror = () => resolve(undefined);
+    image.src = url;
+  });
+}
+
+function readAudioDuration(url: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const audio = document.createElement("audio");
+    audio.preload = "metadata";
+    audio.onloadedmetadata = () => {
+      const seconds = Number.isFinite(audio.duration) ? Math.round(audio.duration) : 0;
+      resolve(`${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`);
+    };
+    audio.onerror = () => resolve(undefined);
+    audio.src = url;
+  });
+}
+
+async function versionFromFile(file: File, number: number, note: string): Promise<AssetVersion & { mediaType: AssetMediaType }> {
+  const mediaType: AssetMediaType = file.type.startsWith("audio/") ? "audio" : "image";
+  const previewUrl = URL.createObjectURL(file);
+  const [dimensions, duration] = await Promise.all([
+    mediaType === "image" ? readImageDimensions(previewUrl) : Promise.resolve(undefined),
+    mediaType === "audio" ? readAudioDuration(previewUrl) : Promise.resolve(undefined),
+  ]);
+  return {
+    id: uid("version"),
+    label: `V${number}`,
+    fileName: file.name,
+    format: file.name.split(".").pop()?.toUpperCase() || file.type.split("/").pop()?.toUpperCase() || "未知",
+    dimensions,
+    duration,
+    createdAt: nowText(),
+    note,
+    previewUrl,
+    mediaType,
+  };
+}
+
+function acceptedFiles(files: File[]): File[] {
+  return files.filter((file) => file.type.startsWith("image/") || file.type.startsWith("audio/"));
+}
+
+async function importFiles(files: File[], source: ImportSource): Promise<number> {
+  const accepted = acceptedFiles(files);
+  const imported = await Promise.all(accepted.map(async (file) => {
+    const nextVersion = await versionFromFile(file, 1, "初始版本");
+    const asset: AssetItem = {
+      id: uid("asset"),
+      name: stripFileExtension(file.name),
+      category: nextVersion.mediaType === "audio" ? "音频" : "场景",
+      mediaType: nextVersion.mediaType,
+      source,
+      description: "新导入的项目素材，可在右侧补充用途和说明。",
+      fallbackImage: nextVersion.mediaType === "audio" ? "audio" : "clouds",
+      currentVersionId: nextVersion.id,
+      versions: [nextVersion],
+      linkedShotIds: [],
+    };
+    return asset;
+  }));
+  state.items.unshift(...imported);
+  if (imported[0]) {
+    state.selectedId = imported[0].id;
+    state.activeCategory = "全部";
+  }
+  const ignored = files.length - accepted.length;
+  state.notice = imported.length
+    ? `已导入 ${imported.length} 个素材${ignored ? `，忽略 ${ignored} 个不支持的文件` : ""}`
+    : "未发现支持的图片或音频文件";
+  return imported.length;
+}
+
+async function replaceSelected(file: File): Promise<boolean> {
+  const asset = selectedAsset.value;
+  if (!asset || !acceptedFiles([file]).length) {
+    state.notice = "请选择图片或音频文件";
+    return false;
+  }
+  const next = await versionFromFile(file, asset.versions.length + 1, "替换文件，保留历史版本");
+  if (next.mediaType !== asset.mediaType) {
+    URL.revokeObjectURL(next.previewUrl ?? "");
+    state.notice = `替换文件必须保持为${asset.mediaType === "image" ? "图片" : "音频"}`;
+    return false;
+  }
+  const { mediaType: _, ...assetVersion } = next;
+  asset.versions.unshift(assetVersion);
+  asset.currentVersionId = assetVersion.id;
+  state.notice = `${asset.name} 已新增 ${assetVersion.label}，旧版本仍可查看`;
+  return true;
+}
+
+function renameSelected(name: string) {
+  const asset = selectedAsset.value;
+  const nextName = name.trim();
+  if (asset && nextName) asset.name = nextName;
+}
+
+function updateDescription(description: string) {
+  const asset = selectedAsset.value;
+  if (asset) asset.description = description;
+}
+
+function changeCategory(category: AssetCategory) {
+  const asset = selectedAsset.value;
+  if (!asset || (asset.mediaType === "audio" && category !== "音频") || (asset.mediaType === "image" && category === "音频")) return;
+  asset.category = category;
+}
+
+function activateVersion(versionId: string) {
+  const asset = selectedAsset.value;
+  if (asset?.versions.some((item) => item.id === versionId)) asset.currentVersionId = versionId;
+}
+
+function unlinkShot(shotId: string) {
+  const asset = selectedAsset.value;
+  if (!asset) return;
+  asset.linkedShotIds = asset.linkedShotIds.filter((id) => id !== shotId);
+  state.notice = `已解除与分镜 ${shotId} 的关联`;
+}
+
+function unlinkAll() {
+  const asset = selectedAsset.value;
+  if (!asset) return;
+  asset.linkedShotIds = [];
+  state.notice = "已解除该素材的全部分镜关联";
+}
+
+function removeSelected(): boolean {
+  const asset = selectedAsset.value;
+  if (!asset || asset.linkedShotIds.length) {
+    state.notice = "素材仍被分镜使用，需先解除关联";
+    return false;
+  }
+  const index = state.items.findIndex((item) => item.id === asset.id);
+  state.items.splice(index, 1);
+  state.selectedId = state.items[0]?.id ?? null;
+  state.notice = "未使用素材已删除";
+  return true;
+}
+
+export function useAssetStore() {
+  return {
+    state,
+    selectedAsset,
+    filteredAssets,
+    currentVersion: computed(() => selectedAsset.value ? currentAssetVersion(selectedAsset.value) : null),
+    selectAsset: (id: string) => { state.selectedId = id; },
+    importFiles,
+    replaceSelected,
+    renameSelected,
+    updateDescription,
+    changeCategory,
+    activateVersion,
+    unlinkShot,
+    unlinkAll,
+    removeSelected,
+  };
+}
