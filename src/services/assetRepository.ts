@@ -68,4 +68,43 @@ export const assetRepository = {
     });
     return result?.map(fromNative) ?? [];
   },
+  async importPayload(projectId: string, filename: string, base64Data: string, source: "本地上传" | "剪贴板"): Promise<AssetItem> {
+    const result = await invokeNative<NativeAsset>("import_asset_payload", {
+      input: { projectId, filename, base64Data, source },
+    });
+    if (!result) throw new Error("剪贴板素材只能在桌面客户端中导入。");
+    return fromNative(result);
+  },
+  async update(input: {
+    id: string;
+    name: string;
+    category: AssetItem["category"];
+    description: string;
+  }): Promise<AssetItem> {
+    const result = await invokeNative<NativeAsset>("update_asset", { input });
+    if (!result) throw new Error("素材信息只能在桌面客户端中保存。");
+    return fromNative(result);
+  },
+  async replace(assetId: string, sourcePath: string): Promise<AssetItem> {
+    const result = await invokeNative<NativeAsset>("replace_asset_file", {
+      input: { assetId, sourcePath },
+    });
+    if (!result) throw new Error("素材文件只能在桌面客户端中替换。");
+    return fromNative(result);
+  },
+  async setCurrentVersion(assetId: string, versionId: string): Promise<AssetItem> {
+    const result = await invokeNative<NativeAsset>("set_current_asset_version", {
+      input: { assetId, versionId },
+    });
+    if (!result) throw new Error("素材版本只能在桌面客户端中切换。");
+    return fromNative(result);
+  },
+  delete: (assetId: string) => invokeNative<void>("delete_asset", { assetId }),
+  async unlink(assetId: string, sceneId?: string): Promise<AssetItem> {
+    const result = await invokeNative<NativeAsset>("unlink_asset", {
+      input: { assetId, sceneId },
+    });
+    if (!result) throw new Error("分镜关联只能在桌面客户端中修改。");
+    return fromNative(result);
+  },
 };

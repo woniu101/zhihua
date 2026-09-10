@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { ChevronDown, FileAudio2, Link2, MoreVertical, Search, Trash2, Upload, X } from "lucide-vue-next";
 import { ASSET_CATEGORIES, currentAssetVersion, type AssetCategory, type AssetItem } from "../domain/assets";
 import { useAssetStore } from "../stores/assets";
@@ -17,6 +19,7 @@ const selectedVersionIndex = computed(() => {
   return selected.value.versions.findIndex((item) => item.id === selected.value?.currentVersionId) + 1;
 });
 const replacementAccept = computed(() => selected.value?.mediaType === "audio" ? "audio/*" : selected.value?.mediaType === "video" ? "video/*" : "image/*");
+let unlistenDragDrop: UnlistenFn | undefined;
 
 async function chooseFiles() {
   if (!isNativeRuntime()) {
@@ -33,6 +36,25 @@ async function chooseFiles() {
   });
   const paths = selection ? (Array.isArray(selection) ? selection : [selection]) : [];
   await store.importPaths(paths);
+}
+
+async function chooseReplacement() {
+  if (!selected.value) return;
+  if (!isNativeRuntime()) {
+    replaceInput.value?.click();
+    return;
+  }
+  const extensions = selected.value.mediaType === "image"
+    ? ["jpg", "jpeg", "png", "webp"]
+    : selected.value.mediaType === "audio"
+      ? ["mp3", "wav"]
+      : ["mp4", "mov", "webm"];
+  const selection = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "同类型素材", extensions }],
+  });
+  if (typeof selection === "string") await store.replaceSelectedPath(selection);
 }
 
 function previewStyle(asset: AssetItem) {
@@ -86,8 +108,23 @@ function setCategory(event: Event) {
 onMounted(() => {
   window.addEventListener("paste", onPaste);
   void store.loadActiveProject();
+  if (isNativeRuntime()) {
+    void getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        dragActive.value = true;
+      } else if (event.payload.type === "drop") {
+        dragActive.value = false;
+        void store.importPaths(event.payload.paths);
+      } else {
+        dragActive.value = false;
+      }
+    }).then((unlisten) => { unlistenDragDrop = unlisten; });
+  }
 });
-onBeforeUnmount(() => window.removeEventListener("paste", onPaste));
+onBeforeUnmount(() => {
+  window.removeEventListener("paste", onPaste);
+  unlistenDragDrop?.();
+});
 </script>
 
 <template>
@@ -141,7 +178,7 @@ onBeforeUnmount(() => window.removeEventListener("paste", onPaste));
           <article v-for="shotId in selected.linkedShotIds" :key="shotId"><span class="link-badge">{{ shotId }}</span><div><b>分镜 {{ shotId }}</b><small>使用当前素材版本</small></div><button class="btn link" @click="store.unlinkShot(shotId)">解除关联</button></article>
           <div v-if="!selected.linkedShotIds.length" class="empty-links"><Link2 :size="25"/><b>暂未关联分镜</b><span>可在分镜页将本素材绑定为参考输入</span></div>
         </div>
-        <footer><button class="btn primary" @click="replaceInput?.click()">▣　替换文件</button><button v-if="selected.linkedShotIds.length" class="btn" @click="store.unlinkAll">解除全部关联</button><button v-else class="btn danger" @click="store.removeSelected"><Trash2 :size="16"/>删除素材</button><input ref="replaceInput" class="visually-hidden" type="file" :accept="replacementAccept" @change="replaceSelection"/></footer>
+        <footer><button class="btn primary" @click="chooseReplacement">▣　替换文件</button><button v-if="selected.linkedShotIds.length" class="btn" @click="store.unlinkAll">解除全部关联</button><button v-else class="btn danger" @click="store.removeSelected"><Trash2 :size="16"/>删除素材</button><input ref="replaceInput" class="visually-hidden" type="file" :accept="replacementAccept" @change="replaceSelection"/></footer>
       </aside>
       <aside v-else class="panel asset-detail detail-empty"><Upload :size="34"/><b>选择一个素材查看详情</b></aside>
     </div>

@@ -162,6 +162,20 @@ function acceptedFiles(files: File[]): File[] {
   return files.filter((file) => file.type.startsWith("image/") || file.type.startsWith("audio/") || file.type.startsWith("video/"));
 }
 
+function fileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`无法读取素材“${file.name}”`));
+    reader.onload = () => {
+      const value = typeof reader.result === "string" ? reader.result : "";
+      const separator = value.indexOf(",");
+      if (separator < 0) reject(new Error(`无法编码素材“${file.name}”`));
+      else resolve(value.slice(separator + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 async function loadActiveProject(force = false): Promise<void> {
   if (!isNativeRuntime()) return;
   const projectId = activeProjectId();
@@ -209,6 +223,38 @@ async function importPaths(paths: string[]): Promise<number> {
 
 async function importFiles(files: File[], source: ImportSource): Promise<number> {
   const accepted = acceptedFiles(files);
+  if (isNativeRuntime()) {
+    const projectId = activeProjectId();
+    if (!projectId) {
+      state.notice = "请先在项目页打开一个项目";
+      return 0;
+    }
+    const imported: AssetItem[] = [];
+    try {
+      for (const file of accepted) {
+        if (file.size > 20 * 1024 * 1024) {
+          throw new Error(`“${file.name}”超过剪贴板导入的 20 MB 上限，请使用上传素材`);
+        }
+        imported.push(await assetRepository.importPayload(
+          projectId,
+          file.name,
+          await fileAsBase64(file),
+          source,
+        ));
+      }
+      state.items.unshift(...imported);
+      if (imported[0]) state.selectedId = imported[0].id;
+      const ignored = files.length - accepted.length;
+      state.notice = imported.length
+        ? `已导入并保存 ${imported.length} 个素材${ignored ? `，忽略 ${ignored} 个不支持的文件` : ""}`
+        : "未发现支持的图片、音频或视频文件";
+      return imported.length;
+    } catch (error) {
+      state.notice = error instanceof Error ? error.message : String(error);
+      await loadActiveProject(true);
+      return 0;
+    }
+  }
   const imported = await Promise.all(accepted.map(async (file) => {
     const nextVersion = await versionFromFile(file, 1, "初始版本");
     const asset: AssetItem = {
@@ -256,53 +302,121 @@ async function replaceSelected(file: File): Promise<boolean> {
   return true;
 }
 
-function renameSelected(name: string) {
+async function replaceSelectedPath(sourcePath: string): Promise<boolean> {
+  const asset = selectedAsset.value;
+  if (!asset) return false;
+  try {
+    const saved = await assetRepository.replace(asset.id, sourcePath);
+    replaceAsset(saved);
+    state.notice = `${saved.name} 已新增 ${currentAssetVersion(saved).label}，旧版本仍可查看`;
+    return true;
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+    return false;
+  }
+}
+
+function replaceAsset(saved: AssetItem) {
+  const index = state.items.findIndex((item) => item.id === saved.id);
+  if (index >= 0) state.items[index] = saved;
+}
+
+async function persistMetadata(asset: AssetItem) {
+  if (!isNativeRuntime()) return;
+  try {
+    replaceAsset(await assetRepository.update({
+      id: asset.id,
+      name: asset.name,
+      category: asset.category,
+      description: asset.description,
+    }));
+    state.notice = "素材信息已保存";
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+    await loadActiveProject(true);
+  }
+}
+
+async function renameSelected(name: string) {
   const asset = selectedAsset.value;
   const nextName = name.trim();
-  if (asset && nextName) asset.name = nextName;
+  if (asset && nextName) {
+    asset.name = nextName;
+    await persistMetadata(asset);
+  }
 }
 
-function updateDescription(description: string) {
+async function updateDescription(description: string) {
   const asset = selectedAsset.value;
-  if (asset) asset.description = description;
+  if (asset) {
+    asset.description = description;
+    await persistMetadata(asset);
+  }
 }
 
-function changeCategory(category: AssetCategory) {
+async function changeCategory(category: AssetCategory) {
   const asset = selectedAsset.value;
   if (!asset || (asset.mediaType === "audio" && category !== "音频") || (asset.mediaType !== "audio" && category === "音频")) return;
   asset.category = category;
+  await persistMetadata(asset);
 }
 
-function activateVersion(versionId: string) {
+async function activateVersion(versionId: string) {
   const asset = selectedAsset.value;
-  if (asset?.versions.some((item) => item.id === versionId)) asset.currentVersionId = versionId;
+  if (!asset?.versions.some((item) => item.id === versionId)) return;
+  if (!isNativeRuntime()) {
+    asset.currentVersionId = versionId;
+    return;
+  }
+  try {
+    replaceAsset(await assetRepository.setCurrentVersion(asset.id, versionId));
+    state.notice = "当前素材版本已切换";
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+  }
 }
 
-function unlinkShot(shotId: string) {
+async function unlinkShot(shotId: string) {
   const asset = selectedAsset.value;
   if (!asset) return;
-  asset.linkedShotIds = asset.linkedShotIds.filter((id) => id !== shotId);
-  state.notice = `已解除与分镜 ${shotId} 的关联`;
+  try {
+    if (isNativeRuntime()) replaceAsset(await assetRepository.unlink(asset.id, shotId));
+    else asset.linkedShotIds = asset.linkedShotIds.filter((id) => id !== shotId);
+    state.notice = `已解除与分镜 ${shotId} 的关联`;
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+  }
 }
 
-function unlinkAll() {
+async function unlinkAll() {
   const asset = selectedAsset.value;
   if (!asset) return;
-  asset.linkedShotIds = [];
-  state.notice = "已解除该素材的全部分镜关联";
+  try {
+    if (isNativeRuntime()) replaceAsset(await assetRepository.unlink(asset.id));
+    else asset.linkedShotIds = [];
+    state.notice = "已解除该素材的全部分镜关联";
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+  }
 }
 
-function removeSelected(): boolean {
+async function removeSelected(): Promise<boolean> {
   const asset = selectedAsset.value;
   if (!asset || asset.linkedShotIds.length) {
     state.notice = "素材仍被分镜使用，需先解除关联";
     return false;
   }
-  const index = state.items.findIndex((item) => item.id === asset.id);
-  state.items.splice(index, 1);
-  state.selectedId = state.items[0]?.id ?? null;
-  state.notice = "未使用素材已删除";
-  return true;
+  try {
+    if (isNativeRuntime()) await assetRepository.delete(asset.id);
+    const index = state.items.findIndex((item) => item.id === asset.id);
+    state.items.splice(index, 1);
+    state.selectedId = state.items[0]?.id ?? null;
+    state.notice = "未使用素材已删除";
+    return true;
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+    return false;
+  }
 }
 
 export function useAssetStore() {
@@ -317,6 +431,7 @@ export function useAssetStore() {
     importPaths,
     loadActiveProject,
     replaceSelected,
+    replaceSelectedPath,
     renameSelected,
     updateDescription,
     changeCategory,

@@ -7,7 +7,10 @@ mod ssh_tunnel;
 mod storage;
 mod storyboard;
 
-use asset::{AssetError, AssetItem, AssetStorage, ImportAssetFilesInput};
+use asset::{
+    AssetError, AssetItem, AssetStorage, ImportAssetFilesInput, ImportAssetPayloadInput,
+    ReplaceAssetFileInput, SetCurrentAssetVersionInput, UnlinkAssetInput, UpdateAssetInput,
+};
 use comp_share::{
     BindCompShareInstanceInput, CompShareActionResult, CompShareBalance, CompShareConfiguration,
     CompShareConnectionTest, CompShareError, CompShareInstance, CompSharePowerState,
@@ -730,6 +733,49 @@ fn list_assets(
 }
 
 #[tauri::command]
+fn update_asset(
+    storage: State<'_, AssetStorage>,
+    input: UpdateAssetInput,
+) -> Result<AssetItem, AssetError> {
+    storage.update(input)
+}
+
+#[tauri::command]
+async fn replace_asset_file(
+    storage: State<'_, AssetStorage>,
+    input: ReplaceAssetFileInput,
+) -> Result<AssetItem, AssetError> {
+    let storage = storage.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.replace_file(input))
+        .await
+        .map_err(|error| AssetError {
+            code: "asset_task_failed".to_owned(),
+            message: format!("素材替换任务失败：{error}"),
+        })?
+}
+
+#[tauri::command]
+fn set_current_asset_version(
+    storage: State<'_, AssetStorage>,
+    input: SetCurrentAssetVersionInput,
+) -> Result<AssetItem, AssetError> {
+    storage.set_current_version(input)
+}
+
+#[tauri::command]
+fn delete_asset(storage: State<'_, AssetStorage>, asset_id: String) -> Result<(), AssetError> {
+    storage.delete(&asset_id)
+}
+
+#[tauri::command]
+fn unlink_asset(
+    storage: State<'_, AssetStorage>,
+    input: UnlinkAssetInput,
+) -> Result<AssetItem, AssetError> {
+    storage.unlink(input)
+}
+
+#[tauri::command]
 async fn import_asset_files(
     storage: State<'_, AssetStorage>,
     input: ImportAssetFilesInput,
@@ -740,6 +786,20 @@ async fn import_asset_files(
         .map_err(|error| AssetError {
             code: "asset_task_failed".to_owned(),
             message: format!("素材导入任务失败：{error}"),
+        })?
+}
+
+#[tauri::command]
+async fn import_asset_payload(
+    storage: State<'_, AssetStorage>,
+    input: ImportAssetPayloadInput,
+) -> Result<AssetItem, AssetError> {
+    let storage = storage.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.import_payload(input))
+        .await
+        .map_err(|error| AssetError {
+            code: "asset_task_failed".to_owned(),
+            message: format!("剪贴板素材导入失败：{error}"),
         })?
 }
 
@@ -851,6 +911,12 @@ pub fn run() {
             download_completed_job,
             list_assets,
             import_asset_files,
+            import_asset_payload,
+            update_asset,
+            replace_asset_file,
+            set_current_asset_version,
+            delete_asset,
+            unlink_asset,
             get_compshare_configuration,
             save_compshare_credentials,
             clear_compshare_credentials,
