@@ -1,8 +1,15 @@
+mod comp_share;
 mod service;
 mod source;
 mod storage;
 mod storyboard;
 
+use comp_share::{
+    BindCompShareInstanceInput, CompShareActionResult, CompShareBalance, CompShareConfiguration,
+    CompShareConnectionTest, CompShareError, CompShareInstance, CompShareProvider,
+    CompShareSchedulerResult, CompShareStartMode, ListCompShareInstancesInput,
+    SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
+};
 use service::{
     SaveServiceConnectionInput, ServiceClient, ServiceConnectionError, ServiceConnectionInfo,
     ServiceConnectionResult, ServiceJob, ServiceProbe, SubmitServiceJobInput,
@@ -13,6 +20,88 @@ use source::{
 use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
 use storyboard::{ReorderScenesInput, SceneDraft, StoryboardStorage};
 use tauri::{AppHandle, Manager, State};
+
+#[tauri::command]
+fn get_compshare_configuration(
+    provider: State<'_, CompShareProvider>,
+) -> Result<CompShareConfiguration, CompShareError> {
+    provider.configuration()
+}
+
+#[tauri::command]
+fn save_compshare_credentials(
+    provider: State<'_, CompShareProvider>,
+    input: SaveCompShareCredentialsInput,
+) -> Result<CompShareConfiguration, CompShareError> {
+    provider.save_credentials(input)
+}
+
+#[tauri::command]
+fn clear_compshare_credentials(
+    provider: State<'_, CompShareProvider>,
+) -> Result<(), CompShareError> {
+    provider.clear_credentials()
+}
+
+#[tauri::command]
+async fn test_compshare_connection(
+    provider: State<'_, CompShareProvider>,
+) -> Result<CompShareConnectionTest, CompShareError> {
+    provider.test_connection().await
+}
+
+#[tauri::command]
+async fn get_compshare_balance(
+    provider: State<'_, CompShareProvider>,
+) -> Result<CompShareBalance, CompShareError> {
+    provider.get_balance().await
+}
+
+#[tauri::command]
+async fn list_compshare_instances(
+    provider: State<'_, CompShareProvider>,
+    input: ListCompShareInstancesInput,
+) -> Result<Vec<CompShareInstance>, CompShareError> {
+    provider.list_instances(input).await
+}
+
+#[tauri::command]
+async fn bind_compshare_instance(
+    provider: State<'_, CompShareProvider>,
+    input: BindCompShareInstanceInput,
+) -> Result<CompShareInstance, CompShareError> {
+    provider.bind_instance(input).await
+}
+
+#[tauri::command]
+async fn get_bound_compshare_instance(
+    provider: State<'_, CompShareProvider>,
+) -> Result<CompShareInstance, CompShareError> {
+    provider.bound_instance().await
+}
+
+#[tauri::command]
+async fn start_compshare_instance(
+    provider: State<'_, CompShareProvider>,
+    mode: CompShareStartMode,
+) -> Result<CompShareActionResult, CompShareError> {
+    provider.start_instance(mode).await
+}
+
+#[tauri::command]
+async fn stop_compshare_instance(
+    provider: State<'_, CompShareProvider>,
+) -> Result<CompShareActionResult, CompShareError> {
+    provider.stop_instance().await
+}
+
+#[tauri::command]
+async fn update_compshare_stop_scheduler(
+    provider: State<'_, CompShareProvider>,
+    input: UpdateCompShareStopSchedulerInput,
+) -> Result<CompShareSchedulerResult, CompShareError> {
+    provider.update_stop_scheduler(input).await
+}
 
 #[tauri::command]
 fn get_storage_info(storage: State<'_, ProjectStorage>) -> StorageInfo {
@@ -256,10 +345,18 @@ pub fn run() {
                     .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
             )
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let comp_share = CompShareProvider::new(
+                app.handle()
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             app.manage(storage);
             app.manage(source_storage);
             app.manage(storyboard_storage);
             app.manage(service);
+            app.manage(comp_share);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -289,6 +386,17 @@ pub fn run() {
             submit_service_job,
             get_service_job,
             cancel_service_job,
+            get_compshare_configuration,
+            save_compshare_credentials,
+            clear_compshare_credentials,
+            test_compshare_connection,
+            get_compshare_balance,
+            list_compshare_instances,
+            bind_compshare_instance,
+            get_bound_compshare_instance,
+            start_compshare_instance,
+            stop_compshare_instance,
+            update_compshare_stop_scheduler,
         ])
         .run(tauri::generate_context!())
         .expect("error while running zhihua");
