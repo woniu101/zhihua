@@ -48,10 +48,45 @@ pub struct CandidateVersion {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalVersion {
+    pub id: String,
+    pub project_id: String,
+    pub scene_id: String,
+    pub source_candidate_id: String,
+    pub job_id: String,
+    pub workflow_id: String,
+    pub prompt_id: Option<String>,
+    pub artifact_id: String,
+    pub filename: String,
+    pub media_type: String,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub created_at: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct RecordCandidateInput {
     pub project_id: String,
     pub scene_id: String,
+    pub job_id: String,
+    pub workflow_id: String,
+    pub prompt_id: Option<String>,
+    pub artifact_id: String,
+    pub filename: String,
+    pub media_type: String,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordFinalInput {
+    pub project_id: String,
+    pub scene_id: String,
+    pub source_candidate_id: String,
     pub job_id: String,
     pub workflow_id: String,
     pub prompt_id: Option<String>,
@@ -99,6 +134,27 @@ impl GenerationStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_candidate_versions_scene
                 ON candidate_versions(project_id, scene_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS final_versions (
+                id                  TEXT PRIMARY KEY NOT NULL,
+                project_id          TEXT NOT NULL,
+                scene_id            TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                job_id              TEXT NOT NULL,
+                workflow_id         TEXT NOT NULL,
+                prompt_id           TEXT,
+                artifact_id         TEXT NOT NULL,
+                filename            TEXT NOT NULL,
+                media_type          TEXT NOT NULL,
+                local_path          TEXT NOT NULL UNIQUE,
+                size_bytes          INTEGER NOT NULL,
+                sha256              TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_candidate_id) REFERENCES candidate_versions(id),
+                UNIQUE(job_id, artifact_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_final_versions_scene
+                ON final_versions(project_id, scene_id, created_at DESC);
             ",
             )
             .map_err(database_error)?;
@@ -140,6 +196,31 @@ impl GenerationStorage {
             .map_err(database_error)?;
         let rows = statement
             .query_map(params![project_id, scene_id], candidate_from_row)
+            .map_err(database_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
+    }
+
+    pub fn list_finals(
+        &self,
+        project_id: &str,
+        scene_id: &str,
+    ) -> GenerationResult<Vec<FinalVersion>> {
+        self.project_storage
+            .get_project(project_id)
+            .map_err(|error| GenerationError::new("project_unavailable", error.to_string()))?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, project_id, scene_id, source_candidate_id, job_id,
+                        workflow_id, prompt_id, artifact_id, filename, media_type,
+                        local_path, size_bytes, sha256, created_at
+                 FROM final_versions
+                 WHERE project_id = ?1 AND scene_id = ?2
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![project_id, scene_id], final_from_row)
             .map_err(database_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
     }
@@ -231,7 +312,7 @@ impl GenerationStorage {
         self.find(version_id)
     }
 
-    fn find(&self, id: &str) -> GenerationResult<CandidateVersion> {
+    pub fn find(&self, id: &str) -> GenerationResult<CandidateVersion> {
         self.connection()?
             .query_row(
                 "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
@@ -260,6 +341,81 @@ impl GenerationStorage {
             )
             .map_err(database_error)
     }
+
+    pub fn record_final(&self, input: RecordFinalInput) -> GenerationResult<FinalVersion> {
+        self.project_storage
+            .get_project(&input.project_id)
+            .map_err(|error| GenerationError::new("project_unavailable", error.to_string()))?;
+        let source = self.find(&input.source_candidate_id)?;
+        if source.project_id != input.project_id || source.scene_id != input.scene_id {
+            return Err(GenerationError::new(
+                "source_candidate_mismatch",
+                "1080p 成片的来源候选不属于当前分镜",
+            ));
+        }
+        if !source.selected {
+            return Err(GenerationError::new(
+                "source_candidate_not_selected",
+                "只有正式版本才能制作 1080p 成片",
+            ));
+        }
+        if !input.local_path.is_absolute() || !input.local_path.is_file() {
+            return Err(GenerationError::new(
+                "final_file_unavailable",
+                "1080p 成片尚未完整保存到项目目录",
+            ));
+        }
+        let id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO final_versions (
+                    id, project_id, scene_id, source_candidate_id, job_id,
+                    workflow_id, prompt_id, artifact_id, filename, media_type,
+                    local_path, size_bytes, sha256, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(job_id, artifact_id) DO UPDATE SET
+                    local_path = excluded.local_path,
+                    size_bytes = excluded.size_bytes,
+                    sha256 = excluded.sha256",
+                params![
+                    id,
+                    input.project_id,
+                    input.scene_id,
+                    input.source_candidate_id,
+                    input.job_id,
+                    input.workflow_id,
+                    input.prompt_id,
+                    input.artifact_id,
+                    input.filename,
+                    input.media_type,
+                    input.local_path.to_string_lossy(),
+                    input.size_bytes,
+                    input.sha256,
+                    created_at,
+                ],
+            )
+            .map_err(database_error)?;
+        self.find_final_by_job_artifact(&input.job_id, &input.artifact_id)
+    }
+
+    fn find_final_by_job_artifact(
+        &self,
+        job_id: &str,
+        artifact_id: &str,
+    ) -> GenerationResult<FinalVersion> {
+        self.connection()?
+            .query_row(
+                "SELECT id, project_id, scene_id, source_candidate_id, job_id,
+                        workflow_id, prompt_id, artifact_id, filename, media_type,
+                        local_path, size_bytes, sha256, created_at
+                 FROM final_versions WHERE job_id = ?1 AND artifact_id = ?2",
+                params![job_id, artifact_id],
+                final_from_row,
+            )
+            .map_err(database_error)
+    }
 }
 
 fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateVersion> {
@@ -277,6 +433,25 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateVers
         size_bytes: row.get(10)?,
         sha256: row.get(11)?,
         selected: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
+fn final_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FinalVersion> {
+    Ok(FinalVersion {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        scene_id: row.get(2)?,
+        source_candidate_id: row.get(3)?,
+        job_id: row.get(4)?,
+        workflow_id: row.get(5)?,
+        prompt_id: row.get(6)?,
+        artifact_id: row.get(7)?,
+        filename: row.get(8)?,
+        media_type: row.get(9)?,
+        local_path: PathBuf::from(row.get::<_, String>(10)?),
+        size_bytes: row.get(11)?,
+        sha256: row.get(12)?,
         created_at: row.get(13)?,
     })
 }
@@ -330,6 +505,7 @@ mod tests {
                 asset_ids: vec![],
                 selected_version_id: None,
                 last_job_id: None,
+                last_upscale_job_id: None,
                 pending_request_id: None,
                 generation_stage: None,
                 status: SceneStatus::Generated,
@@ -364,7 +540,32 @@ mod tests {
         assert!(versions[0].selected);
         assert_eq!(
             storyboards.list(&project.id).expect("scenes")[0].selected_version_id,
-            Some(candidate.id)
+            Some(candidate.id.clone())
         );
+
+        let final_path = project.project_dir.join("cache/final/clip-1080p.mp4");
+        std::fs::create_dir_all(final_path.parent().unwrap()).expect("final directory");
+        std::fs::write(&final_path, b"upscaled-video").expect("final video");
+        let final_version = storage
+            .record_final(RecordFinalInput {
+                project_id: project.id.clone(),
+                scene_id: scene.id.clone(),
+                source_candidate_id: candidate.id.clone(),
+                job_id: "upscale-1".to_owned(),
+                workflow_id: "seedvr2-1080p-v1".to_owned(),
+                prompt_id: Some("prompt-2".to_owned()),
+                artifact_id: "video-1080p".to_owned(),
+                filename: "clip-1080p.mp4".to_owned(),
+                media_type: "video/mp4".to_owned(),
+                local_path: final_path.clone(),
+                size_bytes: 14,
+                sha256: "b".repeat(64),
+            })
+            .expect("record final");
+        assert_eq!(final_version.source_candidate_id, candidate.id);
+        assert_eq!(storage.list(&project.id, &scene.id).unwrap().len(), 1);
+        let finals = storage.list_finals(&project.id, &scene.id).unwrap();
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].local_path, final_path);
     }
 }

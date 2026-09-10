@@ -156,6 +156,7 @@ export function useStoryboardStore() {
       title: `${source.title}（副本）`,
       selectedVersionId: undefined,
       lastJobId: undefined,
+      lastUpscaleJobId: undefined,
       pendingRequestId: undefined,
       generationStage: undefined,
       status: "draft",

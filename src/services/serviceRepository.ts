@@ -98,6 +98,14 @@ export interface ServiceArtifactDownload {
   resumed: boolean;
 }
 
+export interface VideoUpscaleRequest {
+  clientRequestId: string;
+  projectId: string;
+  sceneId: string;
+  sourcePath: string;
+  seed: number;
+}
+
 function candidateDimensions(aspectRatio: VideoGenerationRequest["aspectRatio"]): {
   width: number;
   height: number;
@@ -270,6 +278,43 @@ export class ComfyUiH3Provider implements VideoProvider {
       return mapJob(job);
     } catch (error) {
       await Promise.allSettled(uploaded.map((item) => serviceRepository.deleteInput(item.inputId)));
+      throw error;
+    }
+  }
+
+  async submitUpscale(request: VideoUpscaleRequest): Promise<GenerationJob> {
+    const workflowId = "seedvr2-1080p-v1";
+    const capabilities = await this.getCapabilities();
+    if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
+      throw new Error("知画服务版本尚未接受 SeedVR2 1080p 工作流，请先更新服务。");
+    }
+    if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
+      throw new Error("SeedVR2 1080p 工作流或公共模型尚未就绪，当前不会启动 GPU。");
+    }
+    const uploaded = await serviceRepository.uploadInput(request.sourcePath);
+    if (!uploaded) throw new Error("正式版本上传失败。");
+    try {
+      const probe = await serviceRepository.prepareGeneration();
+      if (!probe?.comfyuiReady) {
+        throw new Error(probe?.detail ?? "1080p 生成环境尚未就绪，请稍后重试。");
+      }
+      const job = await invokeNative<NativeServiceJob>("submit_service_job", {
+        input: {
+          clientRequestId: request.clientRequestId,
+          projectId: request.projectId,
+          sceneId: request.sceneId,
+          kind: "video_upscale",
+          workflowId,
+          parameters: {
+            sourceVideoFile: uploaded.remoteFile,
+            seed: request.seed,
+          },
+        },
+      });
+      if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
+      return mapJob(job);
+    } catch (error) {
+      await serviceRepository.deleteInput(uploaded.inputId).catch(() => undefined);
       throw error;
     }
   }

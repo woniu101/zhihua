@@ -949,6 +949,7 @@ mod tests {
                 asset_ids: vec![activated.id.clone()],
                 selected_version_id: None,
                 last_job_id: None,
+                last_upscale_job_id: None,
                 pending_request_id: None,
                 generation_stage: None,
                 status: SceneStatus::Ready,

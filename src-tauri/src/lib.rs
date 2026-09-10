@@ -17,7 +17,10 @@ use comp_share::{
     CompShareProvider, CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode,
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
-use generation::{CandidateVersion, GenerationError, GenerationStorage, RecordCandidateInput};
+use generation::{
+    CandidateVersion, FinalVersion, GenerationError, GenerationStorage, RecordCandidateInput,
+    RecordFinalInput,
+};
 use service::{
     DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceArtifactDownload,
     ServiceClient, ServiceConnectionError, ServiceConnectionInfo, ServiceConnectionResult,
@@ -43,6 +46,14 @@ use tauri::{AppHandle, Manager, State};
 struct DownloadCompletedJobInput {
     project_id: String,
     job_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadCompletedUpscaleInput {
+    project_id: String,
+    job_id: String,
+    source_candidate_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -569,6 +580,14 @@ fn list_candidate_versions(
 }
 
 #[tauri::command]
+fn list_final_versions(
+    storage: State<'_, GenerationStorage>,
+    input: CandidateVersionsInput,
+) -> Result<Vec<FinalVersion>, GenerationError> {
+    storage.list_finals(&input.project_id, &input.scene_id)
+}
+
+#[tauri::command]
 fn select_candidate_version(
     storage: State<'_, GenerationStorage>,
     input: SelectCandidateVersionInput,
@@ -595,6 +614,12 @@ async fn download_completed_job(
         .map_err(|error| error.message)?;
     if job.project_id != project.id {
         return Err("远端任务不属于当前项目，已停止下载。".to_owned());
+    }
+    if !matches!(
+        job.kind.as_str(),
+        "video_candidate" | "video_reference_remake"
+    ) {
+        return Err("远端任务不是候选视频任务，已停止下载。".to_owned());
     }
     if !storyboards
         .list(&project.id)
@@ -666,6 +691,109 @@ async fn download_completed_job(
     let revision = lifecycle.invalidate_idle_shutdown();
     schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
     Ok(candidates)
+}
+
+#[tauri::command]
+async fn download_completed_upscale(
+    app: AppHandle,
+    projects: State<'_, ProjectStorage>,
+    storyboards: State<'_, StoryboardStorage>,
+    generations: State<'_, GenerationStorage>,
+    service: State<'_, ServiceClient>,
+    lifecycle: State<'_, ComputeLifecycle>,
+    input: DownloadCompletedUpscaleInput,
+) -> Result<Vec<FinalVersion>, String> {
+    let project = projects
+        .get_project(&input.project_id)
+        .map_err(|error| error.to_string())?;
+    let source = generations
+        .find(&input.source_candidate_id)
+        .map_err(|error| error.message)?;
+    if source.project_id != project.id || !source.selected {
+        return Err("1080p 任务的来源不是当前项目的正式版本。".to_owned());
+    }
+    let scene = storyboards
+        .list(&project.id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|scene| scene.id == source.scene_id)
+        .ok_or_else(|| "1080p 任务对应的本地分镜不存在。".to_owned())?;
+    if scene.selected_version_id.as_deref() != Some(source.id.as_str()) {
+        return Err("正式版本已经变化，已停止保存旧任务的 1080p 成片。".to_owned());
+    }
+    let job = service
+        .get_job(&input.job_id)
+        .await
+        .map_err(|error| error.message)?;
+    if job.project_id != project.id || job.scene_id != scene.id || job.kind != "video_upscale" {
+        return Err("远端 1080p 任务与当前正式版本不匹配。".to_owned());
+    }
+    if job.workflow_id != "seedvr2-1080p-v1" {
+        return Err("远端任务没有使用已验证的 SeedVR2 1080p 工作流。".to_owned());
+    }
+    if job.status != "completed" {
+        return Err("1080p 任务尚未完成，暂时不能下载成片。".to_owned());
+    }
+    let manifest = job
+        .result_manifest
+        .ok_or_else(|| "1080p 任务已完成，但没有返回成品清单。".to_owned())?;
+    if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
+        return Err("1080p 成品清单与任务不匹配，已停止下载。".to_owned());
+    }
+    let artifacts = manifest
+        .artifacts
+        .into_iter()
+        .filter(|artifact| artifact.kind == "video")
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        return Err("SeedVR2 任务没有生成可下载的视频。".to_owned());
+    }
+    if artifacts.len() > 8 {
+        return Err("SeedVR2 任务返回的视频数量异常，已停止自动下载。".to_owned());
+    }
+
+    let mut finals = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
+        let destination = project
+            .project_dir
+            .join("cache")
+            .join("final")
+            .join(safe_path_component(&scene.id)?)
+            .join(safe_path_component(&job.id)?)
+            .join(&filename);
+        let downloaded = service
+            .download_artifact(DownloadServiceArtifactInput {
+                job_id: job.id.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256.clone(),
+            })
+            .await
+            .map_err(|error| error.message)?;
+        finals.push(
+            generations
+                .record_final(RecordFinalInput {
+                    project_id: project.id.clone(),
+                    scene_id: scene.id.clone(),
+                    source_candidate_id: source.id.clone(),
+                    job_id: job.id.clone(),
+                    workflow_id: job.workflow_id.clone(),
+                    prompt_id: job.prompt_id.clone(),
+                    artifact_id: artifact.artifact_id,
+                    filename,
+                    media_type: artifact.media_type,
+                    local_path: downloaded.destination_path.into(),
+                    size_bytes: downloaded.size_bytes,
+                    sha256: downloaded.sha256,
+                })
+                .map_err(|error| error.message)?,
+        );
+    }
+    let revision = lifecycle.invalidate_idle_shutdown();
+    schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
+    Ok(finals)
 }
 
 fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revision: u64) {
@@ -907,8 +1035,10 @@ pub fn run() {
             delete_service_input,
             download_service_artifact,
             list_candidate_versions,
+            list_final_versions,
             select_candidate_version,
             download_completed_job,
+            download_completed_upscale,
             list_assets,
             import_asset_files,
             import_asset_payload,

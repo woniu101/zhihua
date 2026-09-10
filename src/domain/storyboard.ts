@@ -25,6 +25,7 @@ export interface SceneDraft {
   assetIds: string[];
   selectedVersionId?: string;
   lastJobId?: string;
+  lastUpscaleJobId?: string;
   pendingRequestId?: string;
   generationStage?: string;
   status: SceneStatus;

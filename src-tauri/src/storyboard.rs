@@ -152,6 +152,7 @@ pub struct SceneDraft {
     pub asset_ids: Vec<String>,
     pub selected_version_id: Option<String>,
     pub last_job_id: Option<String>,
+    pub last_upscale_job_id: Option<String>,
     pub pending_request_id: Option<String>,
     pub generation_stage: Option<String>,
     pub status: SceneStatus,
@@ -179,7 +180,8 @@ impl StoryboardStorage {
             project_storage,
             database_path,
         };
-        storage.connection()?.execute_batch(
+        let connection = storage.connection()?;
+        connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS storyboard_scenes (
                 id                    TEXT PRIMARY KEY NOT NULL,
@@ -196,6 +198,7 @@ impl StoryboardStorage {
                 asset_ids_json        TEXT NOT NULL DEFAULT '[]',
                 selected_version_id   TEXT,
                 last_job_id           TEXT,
+                last_upscale_job_id   TEXT,
                 pending_request_id    TEXT,
                 generation_stage      TEXT,
                 status                TEXT NOT NULL,
@@ -207,6 +210,19 @@ impl StoryboardStorage {
                 ON storyboard_scenes(project_id, order_index ASC, id ASC);
             ",
         )?;
+        let has_upscale_job = {
+            let mut statement = connection.prepare("PRAGMA table_info(storyboard_scenes)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "last_upscale_job_id")
+        };
+        if !has_upscale_job {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN last_upscale_job_id TEXT",
+                [],
+            )?;
+        }
         Ok(storage)
     }
 
@@ -225,7 +241,7 @@ impl StoryboardStorage {
             "SELECT id, project_id, order_index, title, purpose, source_refs_json,
                     narration, on_screen_text_json, visual_plan, generation_mode,
                     target_duration_ms, asset_ids_json, selected_version_id, last_job_id,
-                    pending_request_id, generation_stage, status, quality, updated_at
+                    last_upscale_job_id, pending_request_id, generation_stage, status, quality, updated_at
              FROM storyboard_scenes WHERE project_id = ?1
              ORDER BY order_index ASC, id ASC",
         )?;
@@ -245,11 +261,11 @@ impl StoryboardStorage {
             "INSERT INTO storyboard_scenes (
                 id, project_id, order_index, title, purpose, source_refs_json, narration,
                 on_screen_text_json, visual_plan, generation_mode, target_duration_ms,
-                asset_ids_json, selected_version_id, last_job_id, pending_request_id,
-                generation_stage, status, quality, updated_at
+                asset_ids_json, selected_version_id, last_job_id, last_upscale_job_id,
+                pending_request_id, generation_stage, status, quality, updated_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19
+                ?15, ?16, ?17, ?18, ?19, ?20
              )
              ON CONFLICT(id) DO UPDATE SET
                 order_index = excluded.order_index,
@@ -264,6 +280,7 @@ impl StoryboardStorage {
                 asset_ids_json = excluded.asset_ids_json,
                 selected_version_id = excluded.selected_version_id,
                 last_job_id = excluded.last_job_id,
+                last_upscale_job_id = excluded.last_upscale_job_id,
                 pending_request_id = excluded.pending_request_id,
                 generation_stage = excluded.generation_stage,
                 status = excluded.status,
@@ -285,6 +302,7 @@ impl StoryboardStorage {
                 asset_ids,
                 scene.selected_version_id,
                 scene.last_job_id,
+                scene.last_upscale_job_id,
                 scene.pending_request_id,
                 scene.generation_stage,
                 scene.status.as_str(),
@@ -410,8 +428,8 @@ fn scene_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SceneDraft> {
     let on_screen_text_json: String = row.get(7)?;
     let asset_ids_json: String = row.get(11)?;
     let generation_mode: String = row.get(9)?;
-    let status: String = row.get(16)?;
-    let quality: String = row.get(17)?;
+    let status: String = row.get(17)?;
+    let quality: String = row.get(18)?;
 
     Ok(SceneDraft {
         id: row.get(0)?,
@@ -433,12 +451,13 @@ fn scene_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SceneDraft> {
             .map_err(|error| conversion_error(11, error))?,
         selected_version_id: row.get(12)?,
         last_job_id: row.get(13)?,
-        pending_request_id: row.get(14)?,
-        generation_stage: row.get(15)?,
-        status: SceneStatus::from_database(&status).map_err(|error| conversion_error(16, error))?,
+        last_upscale_job_id: row.get(14)?,
+        pending_request_id: row.get(15)?,
+        generation_stage: row.get(16)?,
+        status: SceneStatus::from_database(&status).map_err(|error| conversion_error(17, error))?,
         quality: CandidateQuality::from_database(&quality)
-            .map_err(|error| conversion_error(17, error))?,
-        updated_at: row.get(18)?,
+            .map_err(|error| conversion_error(18, error))?,
+        updated_at: row.get(19)?,
     })
 }
 
@@ -498,6 +517,7 @@ mod tests {
             asset_ids: vec!["asset-1".to_owned()],
             selected_version_id: Some("version-1".to_owned()),
             last_job_id: Some("job-1".to_owned()),
+            last_upscale_job_id: Some("upscale-1".to_owned()),
             pending_request_id: Some("request-1".to_owned()),
             generation_stage: Some("生成中".to_owned()),
             status: SceneStatus::Generating,
@@ -521,6 +541,7 @@ mod tests {
         assert_eq!(listed, vec![first, second]);
         assert_eq!(listed[0].generation_mode, GenerationMode::R2v);
         assert_eq!(listed[0].last_job_id.as_deref(), Some("job-1"));
+        assert_eq!(listed[0].last_upscale_job_id.as_deref(), Some("upscale-1"));
         assert_eq!(listed[0].pending_request_id.as_deref(), Some("request-1"));
     }
 
