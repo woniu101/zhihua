@@ -736,14 +736,18 @@ mod tests {
         let result: ServiceResult<_> = tauri::async_runtime::block_on(async {
             let probe = client.probe().await?;
             let request = SubmitServiceJobInput {
-                client_request_id: "rust-client-live-smoke-t2v-20260910".to_owned(),
+                client_request_id: "rust-client-live-smoke-t2v-20260910-v2".to_owned(),
                 project_id: "rust-client-project".to_owned(),
                 scene_id: "rust-client-scene".to_owned(),
                 kind: "video_candidate".to_owned(),
                 workflow_id: "h3-t2v-turbo-v1".to_owned(),
                 parameters: serde_json::json!({
                     "prompt": "雷电形成过程",
-                    "durationSec": 5
+                    "durationSec": 5,
+                    "width": 1344,
+                    "height": 768,
+                    "length": 124,
+                    "discardH3Audio": true
                 }),
             };
             let first = client.submit_job(request.clone()).await?;
@@ -756,9 +760,13 @@ mod tests {
         let (probe, first, second, fetched) = result.expect("run live service contract");
         assert!(probe.compatible);
         assert_eq!(probe.api_version.as_deref(), Some("v1"));
-        assert_eq!(probe.service_version, "0.2.0");
+        assert_eq!(probe.service_version, "0.3.0");
         assert!(probe.workflows.iter().any(|item| item == "h3-t2v-turbo-v1"));
-        assert!(probe.available_workflows.is_empty());
+        assert_eq!(probe.available_workflows.len(), 10);
+        assert!(probe
+            .available_workflows
+            .iter()
+            .any(|item| item == "h3-t2v-turbo-v1"));
         assert_eq!(first.id, second.id);
         assert_eq!(fetched.id, first.id);
         assert!(!first.id.is_empty());
