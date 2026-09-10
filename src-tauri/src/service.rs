@@ -698,4 +698,49 @@ mod tests {
             "invalid_job_kind"
         );
     }
+
+    #[test]
+    #[ignore = "requires an SSH tunnel and ZHIHUA_TEST_SERVICE_TOKEN"]
+    fn connects_to_live_secure_service_and_recovers_idempotent_job() {
+        let base_url = std::env::var("ZHIHUA_TEST_SERVICE_URL")
+            .expect("set ZHIHUA_TEST_SERVICE_URL for live contract test");
+        let token = std::env::var("ZHIHUA_TEST_SERVICE_TOKEN")
+            .expect("set ZHIHUA_TEST_SERVICE_TOKEN for live contract test");
+        let client = client();
+        client
+            .save(SaveServiceConnectionInput {
+                instance_id: "zhihua-live-contract-test".to_owned(),
+                base_url,
+                token,
+            })
+            .expect("save temporary credential");
+
+        let result: ServiceResult<_> = tauri::async_runtime::block_on(async {
+            let probe = client.probe().await?;
+            let request = SubmitServiceJobInput {
+                client_request_id: "rust-client-live-smoke-20260910".to_owned(),
+                project_id: "rust-client-project".to_owned(),
+                scene_id: "rust-client-scene".to_owned(),
+                kind: "video_candidate".to_owned(),
+                workflow_id: "h3-fl2v-turbo-v1".to_owned(),
+                parameters: serde_json::json!({
+                    "prompt": "雷电形成过程",
+                    "durationSec": 5
+                }),
+            };
+            let first = client.submit_job(request.clone()).await?;
+            let second = client.submit_job(request).await?;
+            let fetched = client.get_job(&first.id).await?;
+            Ok((probe, first, second, fetched))
+        });
+
+        client.clear().expect("clear temporary credential");
+        let (probe, first, second, fetched) = result.expect("run live service contract");
+        assert!(probe.compatible);
+        assert_eq!(probe.api_version.as_deref(), Some("v1"));
+        assert_eq!(probe.service_version, "0.2.0");
+        assert_eq!(first.id, second.id);
+        assert_eq!(fetched.id, first.id);
+        assert!(!first.id.is_empty());
+    }
 }
