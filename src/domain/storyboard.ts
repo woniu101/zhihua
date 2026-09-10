@@ -24,6 +24,9 @@ export interface SceneDraft {
   targetDurationMs: 5000 | 10000 | 15000;
   assetIds: string[];
   selectedVersionId?: string;
+  lastJobId?: string;
+  pendingRequestId?: string;
+  generationStage?: string;
   status: SceneStatus;
   quality: CandidateQuality;
   updatedAt: string;

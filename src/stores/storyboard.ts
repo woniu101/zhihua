@@ -44,11 +44,16 @@ watch([scenes, settings], () => writeLocal(STORAGE_KEY, { scenes: scenes.value, 
 export function useStoryboardStore() {
   const selectedScene = computed(() => scenes.value.find((scene) => scene.id === selectedSceneId.value) ?? scenes.value[0]);
 
+  const update = (id: string, patch: Partial<SceneDraft>) => {
+    const scene = scenes.value.find((item) => item.id === id);
+    if (!scene) return;
+    Object.assign(scene, patch, { updatedAt: new Date().toISOString() });
+  };
   const select = (id: string) => { selectedSceneId.value = id; };
   const updateSelected = (patch: Partial<SceneDraft>) => {
     const scene = selectedScene.value;
     if (!scene) return;
-    Object.assign(scene, patch, { updatedAt: new Date().toISOString() });
+    update(scene.id, patch);
   };
   const setMode = (mode: GenerationMode) => updateSelected({ generationMode: mode });
   const add = () => {
@@ -87,5 +92,5 @@ export function useStoryboardStore() {
     scenes.value.forEach((scene, order) => { scene.order = order; });
   };
 
-  return { scenes, settings, selectedSceneId, selectedScene, select, updateSelected, setMode, add, duplicateSelected, removeSelected, moveSelected };
+  return { scenes, settings, selectedSceneId, selectedScene, select, update, updateSelected, setMode, add, duplicateSelected, removeSelected, moveSelected };
 }

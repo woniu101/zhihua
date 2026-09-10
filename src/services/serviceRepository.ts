@@ -66,9 +66,15 @@ function mapJob(job: NativeServiceJob): GenerationJob {
 }
 
 function workflowFor(request: VideoGenerationRequest): string {
-  return request.mode === "r2v"
-    ? "h3-ref2va-turbo-v1"
-    : "h3-fl2v-turbo-v1";
+  const family = {
+    t2v: "t2v",
+    i2v: "i2v",
+    flf2v: "flf2v",
+    r2v: "ref2va",
+    continue: "i2v",
+  }[request.mode];
+  const quality = request.quality === "fast" ? "turbo" : "high";
+  return `h3-${family}-${quality}-v1`;
 }
 
 export async function testServiceConnection(
