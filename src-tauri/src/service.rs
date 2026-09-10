@@ -7,7 +7,7 @@ use std::{fs, path::PathBuf, sync::RwLock, time::Duration};
 const CREDENTIAL_SERVICE: &str = "cn.zhihua.desktop.zhihua-service";
 const CLIENT_VERSION: &str = "0.1.0";
 const API_VERSION: &str = "v1";
-const WORKFLOW_MANIFEST_VERSION: &str = "h3-workflows-2026.09.08";
+const WORKFLOW_MANIFEST_VERSION: &str = "h3-workflows-2026.09.10";
 const MODEL_MANIFEST_VERSION: &str = "public-models-2026.09.08";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 

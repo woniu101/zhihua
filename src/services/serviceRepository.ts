@@ -79,6 +79,24 @@ function workflowFor(request: VideoGenerationRequest): string {
   return `h3-${family}-${quality}-v1`;
 }
 
+function candidateDimensions(aspectRatio: VideoGenerationRequest["aspectRatio"]): {
+  width: number;
+  height: number;
+} {
+  return {
+    auto: { width: 1344, height: 768 },
+    "16:9": { width: 1344, height: 768 },
+    "9:16": { width: 768, height: 1344 },
+    "4:3": { width: 1152, height: 864 },
+    "3:4": { width: 864, height: 1152 },
+    "1:1": { width: 1024, height: 1024 },
+  }[aspectRatio];
+}
+
+function frameLength(durationSec: 5 | 10 | 15): 124 | 243 | 362 {
+  return { 5: 124, 10: 243, 15: 362 }[durationSec] as 124 | 243 | 362;
+}
+
 export async function testServiceConnection(
   baseUrl: string,
 ): Promise<ServiceConnectionResult> {
@@ -149,15 +167,16 @@ export class ComfyUiH3Provider implements VideoProvider {
     if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
       throw new Error(`工作流 ${workflowId} 尚未安装，当前不会启动 GPU。`);
     }
+    if (request.mode !== "t2v") {
+      throw new Error("当前分镜需要先把参考素材上传到知画服务；素材传输完成前不会启动 GPU。");
+    }
+    const dimensions = candidateDimensions(request.aspectRatio);
     const job = await invokeNative<NativeServiceJob>("submit_service_job", {
       input: {
         clientRequestId: request.clientRequestId,
         projectId: request.projectId,
         sceneId: request.sceneId,
-        kind:
-          request.mode === "r2v"
-            ? "video_reference_remake"
-            : "video_candidate",
+        kind: "video_candidate",
         workflowId,
         parameters: {
           mode: request.mode,
@@ -169,6 +188,9 @@ export class ComfyUiH3Provider implements VideoProvider {
           seed: request.seed,
           assetIds: request.assetIds,
           discardH3Audio: request.discardH3Audio,
+          width: dimensions.width,
+          height: dimensions.height,
+          length: frameLength(request.durationSec),
         },
       },
     });
