@@ -1,96 +1,234 @@
 import { computed, ref, watch } from "vue";
-import type { GenerationMode, SceneDraft, StoryboardProjectSettings } from "../domain/storyboard";
+import type {
+  GenerationMode,
+  SceneDraft,
+  StoryboardProjectSettings,
+} from "../domain/storyboard";
 import { readLocal, writeLocal } from "../services/nativeBridge";
+import {
+  activeProjectId,
+  storyboardRepository,
+} from "../services/storyboardRepository";
 
-const STORAGE_KEY = "zhihua.storyboard.demo.v1";
+const SETTINGS_KEY = "zhihua.storyboard.settings.v1";
+const scenes = ref<SceneDraft[]>([]);
+const settings = ref<StoryboardProjectSettings>(
+  readLocal<StoryboardProjectSettings>(SETTINGS_KEY, {
+    aspectRatio: "16:9",
+    outputWidth: 1920,
+    outputHeight: 1080,
+    discardH3Audio: true,
+  }),
+);
+const selectedSceneId = ref("");
+const currentProjectId = ref<string>();
+const loading = ref(false);
+const loadError = ref("");
+const persistTimers = new Map<string, number>();
 
-const initialScenes: SceneDraft[] = [
-  ["乌云正在聚集", "展现乌云中电荷逐渐聚集", "带电的云层中，正负电荷开始分离。", "乌云翻涌，云层上下电荷逐渐聚集，远处山谷保持稳定。"],
-  ["电荷开始分离", "解释电场持续增强", "电荷分离导致云层之间的电场不断增强。", "云层上方蓝色负电荷、下方橙色正电荷分布更加明显。"],
-  ["闪电划破天空", "解释空气被击穿", "当电场足够强，空气就会被击穿。", "强烈闪电从云层贯穿到地面，画面主体保持在安全区。"],
-  ["雷声随后传来", "解释雷声形成", "闪电让空气迅速受热膨胀，冲击波形成雷声。", "闪电余光照亮天空，空气波纹向外扩散。"],
-  ["雷雨天如何避险", "给出安全建议", "雷雨天气应远离高处、孤立大树和金属设施。", "用简洁图示表现室内避险和远离孤立高物。"],
-].map((item, index) => ({
-  id: `scene-${index + 1}`,
-  projectId: "demo-lightning",
-  order: index,
-  title: item[0],
-  purpose: item[1],
-  sourceRefs: [{ sourceId: "source-lightning", page: index + 2 }],
-  narration: item[2],
-  onScreenText: [item[0]],
-  visualPlan: item[3],
-  generationMode: index === 0 ? "t2v" : "i2v",
-  targetDurationMs: index === 0 ? 5000 : 10000,
-  assetIds: [],
-  selectedVersionId: index < 2 ? `version-${index + 1}` : undefined,
-  status: index === 0 ? "approved" : index === 1 ? "generated" : "draft",
-  quality: "fast",
-  updatedAt: new Date().toISOString(),
-})) as SceneDraft[];
+watch(
+  settings,
+  () => writeLocal(SETTINGS_KEY, settings.value),
+  { deep: true },
+);
 
-const saved = readLocal<{ scenes: SceneDraft[]; settings: StoryboardProjectSettings } | null>(STORAGE_KEY, null);
-const scenes = ref<SceneDraft[]>(saved?.scenes?.length ? saved.scenes : initialScenes);
-const settings = ref<StoryboardProjectSettings>(saved?.settings ?? {
-  aspectRatio: "16:9",
-  outputWidth: 1920,
-  outputHeight: 1080,
-  discardH3Audio: true,
-});
-const selectedSceneId = ref(scenes.value[0]?.id ?? "");
+function replaceScene(saved: SceneDraft) {
+  const index = scenes.value.findIndex((scene) => scene.id === saved.id);
+  if (index >= 0) scenes.value[index] = saved;
+}
 
-watch([scenes, settings], () => writeLocal(STORAGE_KEY, { scenes: scenes.value, settings: settings.value }), { deep: true });
+function cloneScene(scene: SceneDraft): SceneDraft {
+  return JSON.parse(JSON.stringify(scene)) as SceneDraft;
+}
+
+async function persistScene(scene: SceneDraft) {
+  const timer = persistTimers.get(scene.id);
+  if (timer !== undefined) window.clearTimeout(timer);
+  persistTimers.delete(scene.id);
+  try {
+    replaceScene(await storyboardRepository.upsert(cloneScene(scene)));
+    loadError.value = "";
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+function schedulePersist(scene: SceneDraft) {
+  const previous = persistTimers.get(scene.id);
+  if (previous !== undefined) window.clearTimeout(previous);
+  persistTimers.set(
+    scene.id,
+    window.setTimeout(() => void persistScene(scene), 300),
+  );
+}
+
+async function load(force = false) {
+  const projectId = activeProjectId();
+  if (!projectId) {
+    currentProjectId.value = undefined;
+    scenes.value = [];
+    selectedSceneId.value = "";
+    loadError.value = "请先在项目页打开一个项目。";
+    return;
+  }
+  if (!force && projectId === currentProjectId.value) return;
+  loading.value = true;
+  loadError.value = "";
+  try {
+    const loaded = await storyboardRepository.list(projectId);
+    currentProjectId.value = projectId;
+    scenes.value = loaded;
+    selectedSceneId.value = loaded[0]?.id ?? "";
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    loading.value = false;
+  }
+}
 
 export function useStoryboardStore() {
-  const selectedScene = computed(() => scenes.value.find((scene) => scene.id === selectedSceneId.value) ?? scenes.value[0]);
+  const selectedScene = computed(
+    () =>
+      scenes.value.find((scene) => scene.id === selectedSceneId.value) ??
+      scenes.value[0],
+  );
 
+  if (activeProjectId() !== currentProjectId.value) void load();
+
+  const select = (id: string) => {
+    selectedSceneId.value = id;
+  };
   const update = (id: string, patch: Partial<SceneDraft>) => {
     const scene = scenes.value.find((item) => item.id === id);
     if (!scene) return;
     Object.assign(scene, patch, { updatedAt: new Date().toISOString() });
+    schedulePersist(scene);
   };
-  const select = (id: string) => { selectedSceneId.value = id; };
+  const save = async (id: string, patch: Partial<SceneDraft>) => {
+    const scene = scenes.value.find((item) => item.id === id);
+    if (!scene) return;
+    Object.assign(scene, patch, { updatedAt: new Date().toISOString() });
+    await persistScene(scene);
+  };
   const updateSelected = (patch: Partial<SceneDraft>) => {
     const scene = selectedScene.value;
-    if (!scene) return;
-    update(scene.id, patch);
+    if (scene) update(scene.id, patch);
   };
-  const setMode = (mode: GenerationMode) => updateSelected({ generationMode: mode });
-  const add = () => {
+  const setMode = (mode: GenerationMode) =>
+    updateSelected({ generationMode: mode });
+  const add = async () => {
+    const projectId = currentProjectId.value ?? activeProjectId();
+    if (!projectId) {
+      loadError.value = "请先打开项目，再新增分镜。";
+      return;
+    }
     const order = scenes.value.length;
+    const timestamp = new Date().toISOString();
     const scene: SceneDraft = {
-      id: crypto.randomUUID(), projectId: "demo-lightning", order,
-      title: `新分镜 ${order + 1}`, purpose: "", sourceRefs: [], narration: "", onScreenText: [], visualPlan: "",
-      generationMode: "t2v", targetDurationMs: 5000, assetIds: [], status: "draft", quality: "fast", updatedAt: new Date().toISOString(),
+      id: crypto.randomUUID(),
+      projectId,
+      order,
+      title: `新分镜 ${order + 1}`,
+      purpose: "",
+      sourceRefs: [],
+      narration: "",
+      onScreenText: [],
+      visualPlan: "",
+      generationMode: "t2v",
+      targetDurationMs: 5000,
+      assetIds: [],
+      status: "draft",
+      quality: "fast",
+      updatedAt: timestamp,
     };
     scenes.value.push(scene);
     selectedSceneId.value = scene.id;
+    await persistScene(scene);
   };
-  const duplicateSelected = () => {
+  const duplicateSelected = async () => {
     const source = selectedScene.value;
     if (!source) return;
     const index = scenes.value.indexOf(source) + 1;
-    const clone: SceneDraft = { ...structuredClone(source), id: crypto.randomUUID(), title: `${source.title}（副本）`, selectedVersionId: undefined, status: "draft", updatedAt: new Date().toISOString() };
+    const clone: SceneDraft = {
+      ...cloneScene(source),
+      id: crypto.randomUUID(),
+      order: index,
+      title: `${source.title}（副本）`,
+      selectedVersionId: undefined,
+      lastJobId: undefined,
+      pendingRequestId: undefined,
+      generationStage: undefined,
+      status: "draft",
+      updatedAt: new Date().toISOString(),
+    };
     scenes.value.splice(index, 0, clone);
-    scenes.value.forEach((scene, order) => { scene.order = order; });
+    scenes.value.forEach((scene, order) => {
+      scene.order = order;
+    });
     selectedSceneId.value = clone.id;
+    await persistScene(clone);
+    await storyboardRepository.reorder(
+      source.projectId,
+      scenes.value.map((scene) => scene.id),
+    );
   };
-  const removeSelected = () => {
+  const removeSelected = async () => {
     if (scenes.value.length <= 1) return false;
-    const index = scenes.value.findIndex((scene) => scene.id === selectedSceneId.value);
+    const index = scenes.value.findIndex(
+      (scene) => scene.id === selectedSceneId.value,
+    );
     if (index < 0) return false;
-    scenes.value.splice(index, 1);
-    scenes.value.forEach((scene, order) => { scene.order = order; });
-    selectedSceneId.value = scenes.value[Math.min(index, scenes.value.length - 1)].id;
+    const [removed] = scenes.value.splice(index, 1);
+    const timer = persistTimers.get(removed.id);
+    if (timer !== undefined) window.clearTimeout(timer);
+    persistTimers.delete(removed.id);
+    scenes.value.forEach((scene, order) => {
+      scene.order = order;
+    });
+    selectedSceneId.value =
+      scenes.value[Math.min(index, scenes.value.length - 1)].id;
+    await storyboardRepository.remove(removed.projectId, removed.id);
     return true;
   };
-  const moveSelected = (offset: -1 | 1) => {
-    const index = scenes.value.findIndex((scene) => scene.id === selectedSceneId.value);
+  const moveSelected = async (offset: -1 | 1) => {
+    const index = scenes.value.findIndex(
+      (scene) => scene.id === selectedSceneId.value,
+    );
     const target = index + offset;
     if (index < 0 || target < 0 || target >= scenes.value.length) return;
-    [scenes.value[index], scenes.value[target]] = [scenes.value[target], scenes.value[index]];
-    scenes.value.forEach((scene, order) => { scene.order = order; });
+    [scenes.value[index], scenes.value[target]] = [
+      scenes.value[target],
+      scenes.value[index],
+    ];
+    scenes.value.forEach((scene, order) => {
+      scene.order = order;
+    });
+    const projectId = currentProjectId.value;
+    if (projectId) {
+      await storyboardRepository.reorder(
+        projectId,
+        scenes.value.map((scene) => scene.id),
+      );
+    }
   };
 
-  return { scenes, settings, selectedSceneId, selectedScene, select, update, updateSelected, setMode, add, duplicateSelected, removeSelected, moveSelected };
+  return {
+    scenes,
+    settings,
+    selectedSceneId,
+    selectedScene,
+    currentProjectId,
+    loading,
+    loadError,
+    load,
+    select,
+    update,
+    save,
+    updateSelected,
+    setMode,
+    add,
+    duplicateSelected,
+    removeSelected,
+    moveSelected,
+  };
 }
