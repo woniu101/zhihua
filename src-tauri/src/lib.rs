@@ -1,6 +1,11 @@
+mod service;
 mod source;
 mod storage;
 
+use service::{
+    SaveServiceConnectionInput, ServiceClient, ServiceConnectionError, ServiceConnectionInfo,
+    ServiceConnectionResult, ServiceJob, ServiceProbe, SubmitServiceJobInput,
+};
 use source::{
     CreatePastedSourceInput, ImportSourceFileInput, SetSourceEnabledInput, Source, SourceStorage,
 };
@@ -123,6 +128,67 @@ fn delete_source(storage: State<'_, SourceStorage>, id: String) -> Result<(), St
     storage.delete(&id).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn test_service_connection(
+    service: State<'_, ServiceClient>,
+    base_url: String,
+) -> Result<ServiceConnectionResult, ServiceConnectionError> {
+    service.test_connection(&base_url).await
+}
+
+#[tauri::command]
+fn get_service_connection_info(
+    service: State<'_, ServiceClient>,
+) -> Result<ServiceConnectionInfo, ServiceConnectionError> {
+    service.info()
+}
+
+#[tauri::command]
+fn save_service_connection(
+    service: State<'_, ServiceClient>,
+    input: SaveServiceConnectionInput,
+) -> Result<ServiceConnectionInfo, ServiceConnectionError> {
+    service.save(input)
+}
+
+#[tauri::command]
+fn clear_service_connection(
+    service: State<'_, ServiceClient>,
+) -> Result<(), ServiceConnectionError> {
+    service.clear()
+}
+
+#[tauri::command]
+async fn probe_service(
+    service: State<'_, ServiceClient>,
+) -> Result<ServiceProbe, ServiceConnectionError> {
+    service.probe().await
+}
+
+#[tauri::command]
+async fn submit_service_job(
+    service: State<'_, ServiceClient>,
+    input: SubmitServiceJobInput,
+) -> Result<ServiceJob, ServiceConnectionError> {
+    service.submit_job(input).await
+}
+
+#[tauri::command]
+async fn get_service_job(
+    service: State<'_, ServiceClient>,
+    job_id: String,
+) -> Result<ServiceJob, ServiceConnectionError> {
+    service.get_job(&job_id).await
+}
+
+#[tauri::command]
+async fn cancel_service_job(
+    service: State<'_, ServiceClient>,
+    job_id: String,
+) -> Result<ServiceJob, ServiceConnectionError> {
+    service.cancel_job(&job_id).await
+}
+
 fn initialize_storage(app: &AppHandle) -> Result<ProjectStorage, String> {
     let app_data_dir = app
         .path()
@@ -144,8 +210,16 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let source_storage = SourceStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let service = ServiceClient::new(
+                app.handle()
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             app.manage(storage);
             app.manage(source_storage);
+            app.manage(service);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -163,6 +237,14 @@ pub fn run() {
             read_source_text,
             set_source_enabled,
             delete_source,
+            test_service_connection,
+            get_service_connection_info,
+            save_service_connection,
+            clear_service_connection,
+            probe_service,
+            submit_service_job,
+            get_service_job,
+            cancel_service_job,
         ])
         .run(tauri::generate_context!())
         .expect("error while running zhihua");

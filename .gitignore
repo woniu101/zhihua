@@ -1,4 +1,6 @@
 node_modules/
+.npm-cache/
+.service-work/
 dist/
 .vite/
 src-tauri/target/
