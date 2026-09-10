@@ -3,12 +3,15 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, LoaderCircle, Maximize2, Music2, Pause, Play, Plus, RotateCcw, Sparkles, Star, Subtitles, Trash2, Volume2, X } from "lucide-vue-next";
 import type { GenerationJob } from "../domain/providers";
 import type { CandidateQuality, GenerationMode } from "../domain/storyboard";
+import type { AssetItem, AssetMediaType } from "../domain/assets";
+import { assetRepository } from "../services/assetRepository";
 import { ComfyUiH3Provider, normalizeConnectionFailure } from "../services/serviceRepository";
 import { useStoryboardStore } from "../stores/storyboard";
 
-const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, select, update, save, updateSelected, setMode, add, duplicateSelected, removeSelected, moveSelected } = useStoryboardStore();
+const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, select, update, save, updateSelected, add, duplicateSelected, removeSelected, moveSelected } = useStoryboardStore();
 const provider = new ComfyUiH3Provider();
 const task = ref<GenerationJob>();
+const referenceAssets = ref<AssetItem[]>([]);
 const taskError = ref("");
 const submitting = ref(false);
 let pollTimer: number | undefined;
@@ -47,6 +50,39 @@ const taskDescription = computed(() => {
   if (task.value.status === "queued") return "任务已安全保存，等待生成执行器";
   return task.value.stageMessage;
 });
+
+const selectedReferenceIds = computed(() => selectedScene.value?.assetIds ?? []);
+const imageAssets = computed(() => referenceAssets.value.filter((asset) => asset.mediaType === "image"));
+const videoAssets = computed(() => referenceAssets.value.filter((asset) => asset.mediaType === "video"));
+
+async function loadReferenceAssets(projectId?: string) {
+  if (!projectId) {
+    referenceAssets.value = [];
+    return;
+  }
+  try {
+    referenceAssets.value = await assetRepository.list(projectId);
+  } catch {
+    referenceAssets.value = [];
+  }
+}
+
+function setReferenceSlot(slot: number, mediaType: AssetMediaType, event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  const scene = selectedScene.value;
+  if (!scene) return;
+  const ids = [...scene.assetIds];
+  const asset = referenceAssets.value.find((item) => item.id === value && item.mediaType === mediaType);
+  if (asset) ids[slot] = asset.id;
+  else if (slot === 0) ids.splice(0);
+  else ids.splice(slot, 1);
+  updateSelected({ assetIds: ids.filter(Boolean) });
+}
+
+function chooseMode(mode: GenerationMode) {
+  if (selectedScene.value?.generationMode === mode) return;
+  updateSelected({ generationMode: mode, assetIds: [] });
+}
 
 function clearPoll() {
   if (pollTimer !== undefined) window.clearTimeout(pollTimer);
@@ -137,6 +173,7 @@ watch(selectedSceneId, (sceneId) => {
   task.value = undefined;
   taskError.value = "";
   const scene = scenes.value.find((item) => item.id === sceneId);
+  void loadReferenceAssets(scene?.projectId);
   if (scene?.lastJobId) void refreshTask(scene.id, scene.lastJobId);
 }, { immediate: true });
 
@@ -178,7 +215,20 @@ const confirmRemove = () => {
         <div class="inspector-tabs"><button>内容</button><button>画面</button><button class="active">生成</button></div>
         <div class="inspector-body">
           <label class="section-label">生成方式</label>
-          <div class="mode-grid"><button v-for="item in modes" :key="item.id" :class="{active:selectedScene?.generationMode===item.id}" @click="setMode(item.id)"><span>{{ item.symbol }}</span>{{ item.label }}</button></div>
+          <div class="mode-grid"><button v-for="item in modes" :key="item.id" :class="{active:selectedScene?.generationMode===item.id}" @click="chooseMode(item.id)"><span>{{ item.symbol }}</span>{{ item.label }}</button></div>
+          <div v-if="selectedScene && selectedScene.generationMode !== 't2v'" class="reference-inputs">
+            <div class="field-head"><label class="section-label">参考素材</label><RouterLink to="/assets">管理素材　›</RouterLink></div>
+            <label v-if="selectedScene.generationMode === 'i2v' || selectedScene.generationMode === 'continue'"><span>首帧图片</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+            <template v-else-if="selectedScene.generationMode === 'flf2v'">
+              <label><span>首帧图片</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+              <label><span>尾帧图片</span><select :value="selectedReferenceIds[1] ?? ''" :disabled="!selectedReferenceIds[0]" @change="setReferenceSlot(1, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+            </template>
+            <template v-else-if="selectedScene.generationMode === 'r2v'">
+              <label><span>参考视频</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'video', $event)"><option value="">请选择视频</option><option v-for="asset in videoAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+              <label><span>参考图片</span><select :value="selectedReferenceIds[1] ?? ''" :disabled="!selectedReferenceIds[0]" @change="setReferenceSlot(1, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+            </template>
+            <p v-if="!referenceAssets.length">当前项目暂无可用素材，请先到素材页导入。</p>
+          </div>
           <div class="field-head"><label class="section-label">系统旁白 / 解说文案</label><a>♟ 重写文案</a></div>
           <textarea :value="selectedScene?.narration" @input="updateSelected({ narration: ($event.target as HTMLTextAreaElement).value })"></textarea>
           <div class="field-head"><label class="section-label">时长</label><label class="section-label">配音音色</label></div>
@@ -207,4 +257,5 @@ const confirmRemove = () => {
 .shot-actions{display:flex;align-items:center;gap:3px}.shot-actions button{width:28px;height:28px;padding:0;border:0;border-radius:6px;display:grid;place-items:center;color:#506787;background:transparent}.shot-actions button:hover{color:var(--blue);background:#edf4ff}.shot-actions .add{width:34px;height:34px;margin-left:3px;border:1px solid #cfe0f3;background:#fff}
 .head-actions .btn:disabled,.version-row .btn:disabled,.version:disabled{opacity:.58;cursor:not-allowed}.spin{animation:spin .9s linear infinite}.task-cancel{border:0;background:transparent;color:#d6463c;display:flex;align-items:center;gap:4px;font-size:12px}.task-main .task-error{color:#c53d35}.task-main .progress i{display:block;height:100%;border-radius:inherit;background:var(--blue);transition:width .25s ease}@keyframes spin{to{transform:rotate(360deg)}}
 .empty-storyboard{height:calc(100% - 50px);padding:28px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;color:#617697}.empty-storyboard b{color:#29466f}.empty-storyboard span{max-width:245px;font-size:12px;line-height:1.6}.empty-storyboard .btn{margin-top:7px}
+.reference-inputs{margin:-3px 0 12px;padding:9px 10px;border:1px solid #d9e4f1;border-radius:8px;background:#f8fbff;display:grid;grid-template-columns:1fr 1fr;gap:7px}.reference-inputs .field-head{grid-column:1/-1;margin:0 0 2px}.reference-inputs .field-head a{color:var(--blue);font-size:12px}.reference-inputs label{display:flex;flex-direction:column;gap:4px;color:#52698c;font-size:11px}.reference-inputs select{height:34px;min-width:0;border:1px solid #cfdced;border-radius:6px;background:#fff;padding:0 8px;color:#203b65}.reference-inputs p{grid-column:1/-1;color:#7385a2;font-size:11px}
 </style>

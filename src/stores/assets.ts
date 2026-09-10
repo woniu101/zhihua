@@ -7,6 +7,9 @@ import {
   type AssetMediaType,
   type AssetVersion,
 } from "../domain/assets";
+import { assetRepository } from "../services/assetRepository";
+import { isNativeRuntime } from "../services/nativeBridge";
+import { activeProjectId } from "../services/storyboardRepository";
 
 type ImportSource = "本地上传" | "剪贴板";
 
@@ -97,6 +100,8 @@ const state = reactive<AssetStoreState>({
   detailTab: "versions",
   notice: "",
 });
+let loadedProjectId: string | undefined;
+let loadingPromise: Promise<void> | undefined;
 
 const selectedAsset = computed(() => state.items.find((item) => item.id === state.selectedId) ?? null);
 const filteredAssets = computed(() => {
@@ -131,11 +136,13 @@ function readAudioDuration(url: string): Promise<string | undefined> {
 }
 
 async function versionFromFile(file: File, number: number, note: string): Promise<AssetVersion & { mediaType: AssetMediaType }> {
-  const mediaType: AssetMediaType = file.type.startsWith("audio/") ? "audio" : "image";
+  const mediaType: AssetMediaType = file.type.startsWith("audio/")
+    ? "audio"
+    : file.type.startsWith("video/") ? "video" : "image";
   const previewUrl = URL.createObjectURL(file);
   const [dimensions, duration] = await Promise.all([
     mediaType === "image" ? readImageDimensions(previewUrl) : Promise.resolve(undefined),
-    mediaType === "audio" ? readAudioDuration(previewUrl) : Promise.resolve(undefined),
+    mediaType === "audio" || mediaType === "video" ? readAudioDuration(previewUrl) : Promise.resolve(undefined),
   ]);
   return {
     id: uid("version"),
@@ -152,7 +159,52 @@ async function versionFromFile(file: File, number: number, note: string): Promis
 }
 
 function acceptedFiles(files: File[]): File[] {
-  return files.filter((file) => file.type.startsWith("image/") || file.type.startsWith("audio/"));
+  return files.filter((file) => file.type.startsWith("image/") || file.type.startsWith("audio/") || file.type.startsWith("video/"));
+}
+
+async function loadActiveProject(force = false): Promise<void> {
+  if (!isNativeRuntime()) return;
+  const projectId = activeProjectId();
+  if (!projectId) {
+    state.items = [];
+    state.selectedId = null;
+    state.notice = "请先在项目页打开一个项目";
+    return;
+  }
+  if (!force && loadedProjectId === projectId) return;
+  if (loadingPromise) return loadingPromise;
+  loadingPromise = (async () => {
+    try {
+      state.items = await assetRepository.list(projectId);
+      loadedProjectId = projectId;
+      state.selectedId = state.items[0]?.id ?? null;
+      state.notice = state.items.length ? "" : "当前项目还没有素材";
+    } catch (error) {
+      state.notice = error instanceof Error ? error.message : String(error);
+    } finally {
+      loadingPromise = undefined;
+    }
+  })();
+  return loadingPromise;
+}
+
+async function importPaths(paths: string[]): Promise<number> {
+  const projectId = activeProjectId();
+  if (!projectId) {
+    state.notice = "请先在项目页打开一个项目";
+    return 0;
+  }
+  if (!paths.length) return 0;
+  try {
+    const imported = await assetRepository.importPaths(projectId, paths);
+    state.items.unshift(...imported);
+    if (imported[0]) state.selectedId = imported[0].id;
+    state.notice = `已导入并保存 ${imported.length} 个素材`;
+    return imported.length;
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : String(error);
+    return 0;
+  }
 }
 
 async function importFiles(files: File[], source: ImportSource): Promise<number> {
@@ -217,7 +269,7 @@ function updateDescription(description: string) {
 
 function changeCategory(category: AssetCategory) {
   const asset = selectedAsset.value;
-  if (!asset || (asset.mediaType === "audio" && category !== "音频") || (asset.mediaType === "image" && category === "音频")) return;
+  if (!asset || (asset.mediaType === "audio" && category !== "音频") || (asset.mediaType !== "audio" && category === "音频")) return;
   asset.category = category;
 }
 
@@ -254,6 +306,7 @@ function removeSelected(): boolean {
 }
 
 export function useAssetStore() {
+  if (isNativeRuntime() && activeProjectId() !== loadedProjectId) void loadActiveProject();
   return {
     state,
     selectedAsset,
@@ -261,6 +314,8 @@ export function useAssetStore() {
     currentVersion: computed(() => selectedAsset.value ? currentAssetVersion(selectedAsset.value) : null),
     selectAsset: (id: string) => { state.selectedId = id; },
     importFiles,
+    importPaths,
+    loadActiveProject,
     replaceSelected,
     renameSelected,
     updateDescription,

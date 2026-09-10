@@ -528,6 +528,7 @@ fn create_project_directories(project_dir: &Path) -> Result<(), StorageError> {
         "extracted",
         "assets/images",
         "assets/audio",
+        "assets/video",
         "scenes",
         "subtitles",
         "exports",

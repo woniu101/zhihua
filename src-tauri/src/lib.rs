@@ -1,3 +1,4 @@
+mod asset;
 mod comp_share;
 mod service;
 mod source;
@@ -5,11 +6,12 @@ mod ssh_tunnel;
 mod storage;
 mod storyboard;
 
+use asset::{AssetError, AssetItem, AssetStorage, ImportAssetFilesInput};
 use comp_share::{
     BindCompShareInstanceInput, CompShareActionResult, CompShareBalance, CompShareConfiguration,
-    CompShareConnectionTest, CompShareError, CompShareInstance, CompShareProvider,
-    CompShareSchedulerResult, CompShareStartMode, ListCompShareInstancesInput,
-    SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
+    CompShareConnectionTest, CompShareError, CompShareInstance, CompSharePowerState,
+    CompShareProvider, CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode,
+    ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
 use service::{
     DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceArtifactDownload,
@@ -20,6 +22,7 @@ use source::{
     CreatePastedSourceInput, ImportSourceFileInput, SetSourceEnabledInput, Source, SourceStorage,
 };
 use ssh_tunnel::{SaveTunnelConfigurationInput, SshTunnelManager, TunnelError, TunnelStatus};
+use std::time::Duration;
 use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
 use storyboard::{ReorderScenesInput, SceneDraft, StoryboardStorage};
 use tauri::{AppHandle, Manager, State};
@@ -175,6 +178,93 @@ async fn connect_service_through_tunnel(
     comp_share: State<'_, CompShareProvider>,
 ) -> Result<ServiceProbe, String> {
     connect_service_through_tunnel_impl(&manager, &service, &comp_share).await
+}
+
+#[tauri::command]
+async fn prepare_generation_service(
+    manager: State<'_, SshTunnelManager>,
+    service: State<'_, ServiceClient>,
+    comp_share: State<'_, CompShareProvider>,
+) -> Result<ServiceProbe, String> {
+    let mut instance = comp_share
+        .bound_instance()
+        .await
+        .map_err(|error| error.message)?;
+    if instance.running_mode == CompShareRunningMode::NoGpu {
+        comp_share
+            .stop_instance()
+            .await
+            .map_err(|error| error.message)?;
+        instance = wait_for_instance_state(
+            &comp_share,
+            CompSharePowerState::Stopped,
+            None,
+            Duration::from_secs(120),
+        )
+        .await?;
+    }
+    if instance.state == CompSharePowerState::Stopped {
+        comp_share
+            .start_instance(CompShareStartMode::Gpu)
+            .await
+            .map_err(|error| error.message)?;
+    }
+    wait_for_instance_state(
+        &comp_share,
+        CompSharePowerState::Running,
+        Some(CompShareRunningMode::Gpu),
+        Duration::from_secs(180),
+    )
+    .await?;
+    let _ = comp_share
+        .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+            stop_time: chrono::Utc::now().timestamp() + 60 * 60,
+            project_id: None,
+        })
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        let readiness =
+            match connect_service_through_tunnel_impl(&manager, &service, &comp_share).await {
+                Ok(probe) if probe.comfyui_ready => return Ok(probe),
+                Ok(probe) => probe.detail,
+                Err(error) => error,
+            };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "GPU 已启动，但生成环境未在 4 分钟内就绪：{readiness}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+async fn wait_for_instance_state(
+    provider: &CompShareProvider,
+    expected_state: CompSharePowerState,
+    expected_mode: Option<CompShareRunningMode>,
+    timeout: Duration,
+) -> Result<CompShareInstance, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let instance = provider
+            .bound_instance()
+            .await
+            .map_err(|error| error.message)?;
+        if instance.state == expected_state
+            && expected_mode.map_or(true, |mode| instance.running_mode == mode)
+        {
+            return Ok(instance);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "实例状态切换超时，平台当前返回 {}",
+                instance.raw_state
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 }
 
 #[tauri::command]
@@ -413,6 +503,28 @@ async fn download_service_artifact(
     service.download_artifact(input).await
 }
 
+#[tauri::command]
+fn list_assets(
+    storage: State<'_, AssetStorage>,
+    project_id: String,
+) -> Result<Vec<AssetItem>, AssetError> {
+    storage.list(&project_id)
+}
+
+#[tauri::command]
+async fn import_asset_files(
+    storage: State<'_, AssetStorage>,
+    input: ImportAssetFilesInput,
+) -> Result<Vec<AssetItem>, AssetError> {
+    let storage = storage.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.import_files(input))
+        .await
+        .map_err(|error| AssetError {
+            code: "asset_task_failed".to_owned(),
+            message: format!("素材导入任务失败：{error}"),
+        })?
+}
+
 fn initialize_storage(app: &AppHandle) -> Result<ProjectStorage, String> {
     let app_data_dir = app
         .path()
@@ -436,6 +548,8 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let storyboard_storage = StoryboardStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let asset_storage = AssetStorage::initialize(storage.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let service = ServiceClient::new(
                 app.handle()
                     .path()
@@ -460,6 +574,7 @@ pub fn run() {
             app.manage(storage);
             app.manage(source_storage);
             app.manage(storyboard_storage);
+            app.manage(asset_storage);
             app.manage(service);
             app.manage(comp_share);
             app.manage(ssh_tunnel);
@@ -509,6 +624,8 @@ pub fn run() {
             upload_service_input,
             delete_service_input,
             download_service_artifact,
+            list_assets,
+            import_asset_files,
             get_compshare_configuration,
             save_compshare_credentials,
             clear_compshare_credentials,
@@ -525,6 +642,7 @@ pub fn run() {
             stop_ssh_tunnel,
             get_ssh_tunnel_status,
             connect_service_through_tunnel,
+            prepare_generation_service,
         ])
         .run(tauri::generate_context!())
         .expect("error while running zhihua");

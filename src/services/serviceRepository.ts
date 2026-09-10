@@ -5,6 +5,8 @@ import type {
   VideoProvider,
 } from "../domain/providers";
 import { invokeNative } from "./nativeBridge";
+import { assetRepository } from "./assetRepository";
+import { currentAssetVersion } from "../domain/assets";
 
 export interface ServiceConnectionResult {
   baseUrl: string;
@@ -149,6 +151,8 @@ export const serviceRepository = {
     invokeNative<ServiceConnectionInfo>("save_service_connection", { input }),
   clear: () => invokeNative<void>("clear_service_connection"),
   probe: () => invokeNative<ServiceProbe>("probe_service"),
+  prepareGeneration: () =>
+    invokeNative<ServiceProbe>("prepare_generation_service"),
   uploadInput: (sourcePath: string) =>
     invokeNative<ServiceInputUpload>("upload_service_input", { sourcePath }),
   deleteInput: (inputId: string) =>
@@ -194,35 +198,79 @@ export class ComfyUiH3Provider implements VideoProvider {
     if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
       throw new Error(`工作流 ${workflowId} 尚未安装，当前不会启动 GPU。`);
     }
+    const uploaded: ServiceInputUpload[] = [];
+    const parameters: Record<string, unknown> = {};
     if (request.mode !== "t2v") {
-      throw new Error("当前分镜需要先把参考素材上传到知画服务；素材传输完成前不会启动 GPU。");
+      const assets = await assetRepository.list(request.projectId);
+      const selected = request.assetIds
+        .map((id) => assets.find((asset) => asset.id === id))
+        .filter((asset): asset is NonNullable<typeof asset> => Boolean(asset));
+      const upload = async (asset: (typeof selected)[number]) => {
+        const path = currentAssetVersion(asset).storedPath;
+        if (!path) throw new Error(`参考素材“${asset.name}”没有可上传的本地文件。`);
+        const result = await serviceRepository.uploadInput(path);
+        if (!result) throw new Error(`参考素材“${asset.name}”上传失败。`);
+        uploaded.push(result);
+        return result.remoteFile;
+      };
+      try {
+        if (request.mode === "i2v" || request.mode === "continue") {
+          const image = selected.find((asset) => asset.mediaType === "image");
+          if (!image) throw new Error("“从这张画面开始”需要选择一张首帧图片。");
+          parameters.firstFrameFile = await upload(image);
+        } else if (request.mode === "flf2v") {
+          const images = selected.filter((asset) => asset.mediaType === "image");
+          if (images.length < 2) throw new Error("“首尾画面过渡”需要按顺序选择首帧和尾帧图片。");
+          parameters.firstFrameFile = await upload(images[0]);
+          parameters.lastFrameFile = await upload(images[1]);
+        } else if (request.mode === "r2v") {
+          const video = selected.find((asset) => asset.mediaType === "video");
+          const image = selected.find((asset) => asset.mediaType === "image");
+          if (!video || !image) throw new Error("“保持角色与场景”需要一段参考视频和一张参考图片。");
+          parameters.referenceVideoFile = await upload(video);
+          parameters.referenceImageFile = await upload(image);
+        }
+      } catch (error) {
+        await Promise.allSettled(uploaded.map((item) => serviceRepository.deleteInput(item.inputId)));
+        throw error;
+      }
     }
     const dimensions = candidateDimensions(request.aspectRatio);
-    const job = await invokeNative<NativeServiceJob>("submit_service_job", {
-      input: {
-        clientRequestId: request.clientRequestId,
-        projectId: request.projectId,
-        sceneId: request.sceneId,
-        kind: "video_candidate",
-        workflowId,
-        parameters: {
-          mode: request.mode,
-          quality: request.quality,
-          aspectRatio: request.aspectRatio,
-          durationSec: request.durationSec,
-          prompt: request.prompt,
-          narration: request.narration,
-          seed: request.seed,
-          assetIds: request.assetIds,
-          discardH3Audio: request.discardH3Audio,
-          width: dimensions.width,
-          height: dimensions.height,
-          length: frameLength(request.durationSec),
+    try {
+      const probe = await serviceRepository.prepareGeneration();
+      if (!probe?.comfyuiReady) {
+        throw new Error(probe?.detail ?? "生成环境尚未就绪，请稍后重试。");
+      }
+      const job = await invokeNative<NativeServiceJob>("submit_service_job", {
+        input: {
+          clientRequestId: request.clientRequestId,
+          projectId: request.projectId,
+          sceneId: request.sceneId,
+          kind: "video_candidate",
+          workflowId,
+          parameters: {
+            ...parameters,
+            mode: request.mode,
+            quality: request.quality,
+            aspectRatio: request.aspectRatio,
+            durationSec: request.durationSec,
+            prompt: request.prompt,
+            narration: request.narration,
+            seed: request.seed,
+            assetIds: request.assetIds,
+            discardH3Audio: request.discardH3Audio,
+            width: dimensions.width,
+            height: dimensions.height,
+            length: frameLength(request.durationSec),
+          },
         },
-      },
-    });
-    if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
-    return mapJob(job);
+      });
+      if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
+      return mapJob(job);
+    } catch (error) {
+      await Promise.allSettled(uploaded.map((item) => serviceRepository.deleteInput(item.inputId)));
+      throw error;
+    }
   }
 
   async getStatus(jobId: string): Promise<GenerationJob> {

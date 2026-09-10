@@ -1,6 +1,6 @@
 export type AssetCategory = "角色" | "场景" | "道具" | "风格" | "音频";
 
-export type AssetMediaType = "image" | "audio";
+export type AssetMediaType = "image" | "audio" | "video";
 
 export interface AssetVersion {
   id: string;
@@ -12,6 +12,9 @@ export interface AssetVersion {
   createdAt: string;
   note: string;
   previewUrl?: string;
+  storedPath?: string;
+  sizeBytes?: number;
+  sha256?: string;
 }
 
 export interface AssetItem {

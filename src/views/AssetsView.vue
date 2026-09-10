@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { open } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, FileAudio2, Link2, MoreVertical, Search, Trash2, Upload, X } from "lucide-vue-next";
 import { ASSET_CATEGORIES, currentAssetVersion, type AssetCategory, type AssetItem } from "../domain/assets";
 import { useAssetStore } from "../stores/assets";
+import { isNativeRuntime } from "../services/nativeBridge";
 
 const store = useAssetStore();
 const uploadInput = ref<HTMLInputElement | null>(null);
@@ -14,7 +16,24 @@ const selectedVersionIndex = computed(() => {
   if (!selected.value) return 0;
   return selected.value.versions.findIndex((item) => item.id === selected.value?.currentVersionId) + 1;
 });
-const replacementAccept = computed(() => selected.value?.mediaType === "audio" ? "audio/*" : "image/*");
+const replacementAccept = computed(() => selected.value?.mediaType === "audio" ? "audio/*" : selected.value?.mediaType === "video" ? "video/*" : "image/*");
+
+async function chooseFiles() {
+  if (!isNativeRuntime()) {
+    uploadInput.value?.click();
+    return;
+  }
+  const selection = await open({
+    multiple: true,
+    directory: false,
+    filters: [{
+      name: "图片、音频与参考视频",
+      extensions: ["jpg", "jpeg", "png", "webp", "mp3", "wav", "mp4", "mov", "webm"],
+    }],
+  });
+  const paths = selection ? (Array.isArray(selection) ? selection : [selection]) : [];
+  await store.importPaths(paths);
+}
 
 function previewStyle(asset: AssetItem) {
   const previewUrl = currentAssetVersion(asset).previewUrl;
@@ -64,7 +83,10 @@ async function onPaste(event: ClipboardEvent) {
 function setCategory(event: Event) {
   store.changeCategory((event.target as HTMLSelectElement).value as AssetCategory);
 }
-onMounted(() => window.addEventListener("paste", onPaste));
+onMounted(() => {
+  window.addEventListener("paste", onPaste);
+  void store.loadActiveProject();
+});
 onBeforeUnmount(() => window.removeEventListener("paste", onPaste));
 </script>
 
@@ -74,10 +96,10 @@ onBeforeUnmount(() => window.removeEventListener("paste", onPaste));
       <div><p class="breadcrumb">素材　/　素材库</p><div class="page-title-line"><h1>素材库</h1><span class="status-line"><span class="dot blue"></span><strong>优云智算 · 无卡运行</strong><span>|</span><span>生成时再切换 GPU</span></span></div></div>
       <div class="head-actions">
         <div class="status-pill"><span class="dot blue"></span>无卡模式</div>
-        <button class="btn primary" @click="uploadInput?.click()"><Upload :size="19"/>上传素材</button>
+        <button class="btn primary" @click="chooseFiles"><Upload :size="19"/>上传素材</button>
         <button class="btn" @click="readClipboard">▣　从剪贴板粘贴</button>
         <label class="search-box"><Search :size="19"/><input v-model="store.state.query" placeholder="搜索素材、分类或描述"/></label>
-        <input ref="uploadInput" class="visually-hidden" type="file" multiple accept="image/*,audio/*" @change="importSelection"/>
+        <input ref="uploadInput" class="visually-hidden" type="file" multiple accept="image/*,audio/*,video/*" @change="importSelection"/>
       </div>
     </header>
 
@@ -88,8 +110,8 @@ onBeforeUnmount(() => window.removeEventListener("paste", onPaste));
 
     <div class="asset-layout">
       <section class="asset-library">
-        <button class="drop-zone" :class="{dragging:dragActive}" @click="uploadInput?.click()" @dragenter.prevent="dragActive=true" @dragover.prevent="dragActive=true" @dragleave.prevent="dragActive=false" @drop.prevent="onDrop">
-          <Upload :size="21"/><b>拖入图片或音频</b><span>支持 JPG、PNG、WebP、MP3、WAV 等常见格式，也可直接按 Ctrl+V</span>
+        <button class="drop-zone" :class="{dragging:dragActive}" @click="chooseFiles" @dragenter.prevent="dragActive=true" @dragover.prevent="dragActive=true" @dragleave.prevent="dragActive=false" @drop.prevent="onDrop">
+          <Upload :size="21"/><b>导入图片、音频或参考视频</b><span>支持 JPG、PNG、WebP、MP3、WAV、MP4、MOV 和 WebM，也可直接按 Ctrl+V</span>
         </button>
         <div v-if="store.filteredAssets.value.length" class="asset-grid">
           <article v-for="asset in store.filteredAssets.value" :key="asset.id" :class="{selected:store.state.selectedId===asset.id}" @click="store.selectAsset(asset.id)">
