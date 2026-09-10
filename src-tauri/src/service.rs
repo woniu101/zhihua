@@ -72,6 +72,8 @@ pub struct ServiceProbe {
     pub api_version: Option<String>,
     pub workflow_manifest_version: String,
     pub model_manifest_version: String,
+    pub workflows: Vec<String>,
+    pub available_workflows: Vec<String>,
     pub comfyui_connected: bool,
     pub comfyui_ready: bool,
     pub queue_active: u64,
@@ -146,6 +148,12 @@ struct ComfyUiWire {
 struct QueueWire {
     active: u64,
     queued: u64,
+}
+
+#[derive(Deserialize)]
+struct CapabilitiesWire {
+    workflows: Vec<String>,
+    available_workflows: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -340,6 +348,14 @@ impl ServiceClient {
                 .map_err(connection_error)?,
         )
         .await?;
+        let capabilities: CapabilitiesWire = decode_response(
+            self.client
+                .get(format!("{base_url}/api/v1/capabilities"))
+                .send()
+                .await
+                .map_err(connection_error)?,
+        )
+        .await?;
         let queue: QueueWire = decode_response(
             self.authenticated(&connection, Method::GET, "/api/v1/jobs/queue")
                 .send()
@@ -363,6 +379,8 @@ impl ServiceClient {
             api_version: handshake.selected_api_version,
             workflow_manifest_version: handshake.workflow_manifest_version,
             model_manifest_version: handshake.model_manifest_version,
+            workflows: capabilities.workflows,
+            available_workflows: capabilities.available_workflows,
             comfyui_connected: comfyui.connected,
             comfyui_ready: comfyui.ready,
             queue_active: queue.active,
@@ -718,11 +736,11 @@ mod tests {
         let result: ServiceResult<_> = tauri::async_runtime::block_on(async {
             let probe = client.probe().await?;
             let request = SubmitServiceJobInput {
-                client_request_id: "rust-client-live-smoke-20260910".to_owned(),
+                client_request_id: "rust-client-live-smoke-t2v-20260910".to_owned(),
                 project_id: "rust-client-project".to_owned(),
                 scene_id: "rust-client-scene".to_owned(),
                 kind: "video_candidate".to_owned(),
-                workflow_id: "h3-fl2v-turbo-v1".to_owned(),
+                workflow_id: "h3-t2v-turbo-v1".to_owned(),
                 parameters: serde_json::json!({
                     "prompt": "雷电形成过程",
                     "durationSec": 5
@@ -739,6 +757,8 @@ mod tests {
         assert!(probe.compatible);
         assert_eq!(probe.api_version.as_deref(), Some("v1"));
         assert_eq!(probe.service_version, "0.2.0");
+        assert!(probe.workflows.iter().any(|item| item == "h3-t2v-turbo-v1"));
+        assert!(probe.available_workflows.is_empty());
         assert_eq!(first.id, second.id);
         assert_eq!(fetched.id, first.id);
         assert!(!first.id.is_empty());

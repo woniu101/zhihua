@@ -26,6 +26,8 @@ export interface ServiceProbe {
   apiVersion?: string;
   workflowManifestVersion: string;
   modelManifestVersion: string;
+  workflows: string[];
+  availableWorkflows: string[];
   comfyuiConnected: boolean;
   comfyuiReady: boolean;
   queueActive: number;
@@ -129,7 +131,15 @@ export class ComfyUiH3Provider implements VideoProvider {
       workflowVersion: probe.workflowManifestVersion,
       modelManifestVersion: probe.modelManifestVersion,
       comfyUiReady: probe.comfyuiReady,
-      workflows: ["t2v", "i2v", "flf2v", "r2v", "seedvr2"],
+      acceptedWorkflowIds: probe.workflows,
+      availableWorkflowIds: probe.availableWorkflows,
+      workflows: [
+        probe.availableWorkflows.some((item) => item.startsWith("h3-t2v-")) && "t2v",
+        probe.availableWorkflows.some((item) => item.startsWith("h3-i2v-")) && "i2v",
+        probe.availableWorkflows.some((item) => item.startsWith("h3-flf2v-")) && "flf2v",
+        probe.availableWorkflows.some((item) => item.startsWith("h3-ref2va-")) && "r2v",
+        probe.availableWorkflows.some((item) => item.startsWith("seedvr2-")) && "seedvr2",
+      ].filter((item): item is RuntimeCapabilities["workflows"][number] => Boolean(item)),
     };
     return this.capabilities;
   }

@@ -56,8 +56,10 @@ const checks = computed(() => [
   },
   {
     name: "工作流清单",
-    state: connected.value ? probe.value?.workflowManifestVersion ?? "未知" : "等待握手",
-    tone: connected.value ? "success" : "waiting",
+    state: connected.value
+      ? `${probe.value?.availableWorkflows.length ?? 0} / ${probe.value?.workflows.length ?? 0} 个模板已安装`
+      : "等待握手",
+    tone: probe.value?.availableWorkflows.length ? "success" : "waiting",
   },
   {
     name: "模型清单",

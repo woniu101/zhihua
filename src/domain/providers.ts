@@ -53,6 +53,8 @@ export interface RuntimeCapabilities {
   modelManifestVersion: string;
   comfyUiReady: boolean;
   workflows: Array<"t2v" | "i2v" | "flf2v" | "r2v" | "seedvr2">;
+  acceptedWorkflowIds?: string[];
+  availableWorkflowIds?: string[];
 }
 
 export type GenerationJobStatus =
