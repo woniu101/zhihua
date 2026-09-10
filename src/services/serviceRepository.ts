@@ -79,6 +79,22 @@ function workflowFor(request: VideoGenerationRequest): string {
   return `h3-${family}-${quality}-v1`;
 }
 
+export interface ServiceInputUpload {
+  inputId: string;
+  remoteFile: string;
+  originalFilename: string;
+  mediaType: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface ServiceArtifactDownload {
+  destinationPath: string;
+  sizeBytes: number;
+  sha256: string;
+  resumed: boolean;
+}
+
 function candidateDimensions(aspectRatio: VideoGenerationRequest["aspectRatio"]): {
   width: number;
   height: number;
@@ -133,6 +149,17 @@ export const serviceRepository = {
     invokeNative<ServiceConnectionInfo>("save_service_connection", { input }),
   clear: () => invokeNative<void>("clear_service_connection"),
   probe: () => invokeNative<ServiceProbe>("probe_service"),
+  uploadInput: (sourcePath: string) =>
+    invokeNative<ServiceInputUpload>("upload_service_input", { sourcePath }),
+  deleteInput: (inputId: string) =>
+    invokeNative<void>("delete_service_input", { inputId }),
+  downloadArtifact: (input: {
+    jobId: string;
+    artifactId: string;
+    destinationPath: string;
+    expectedSizeBytes: number;
+    expectedSha256: string;
+  }) => invokeNative<ServiceArtifactDownload>("download_service_artifact", { input }),
 };
 
 export class ComfyUiH3Provider implements VideoProvider {

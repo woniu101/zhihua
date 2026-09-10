@@ -24,10 +24,14 @@ encoding_rs = "0.8"
 pdf-extract = "0.9"
 quick-xml = "0.38"
 zip = { version = "4", default-features = false, features = ["deflate"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 keyring = "4"
 sha1 = "0.10"
+sha2 = "0.10"
+futures-util = "0.3"
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

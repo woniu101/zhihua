@@ -1,6 +1,7 @@
 mod comp_share;
 mod service;
 mod source;
+mod ssh_tunnel;
 mod storage;
 mod storyboard;
 
@@ -11,12 +12,14 @@ use comp_share::{
     SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
 use service::{
-    SaveServiceConnectionInput, ServiceClient, ServiceConnectionError, ServiceConnectionInfo,
-    ServiceConnectionResult, ServiceJob, ServiceProbe, SubmitServiceJobInput,
+    DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceArtifactDownload,
+    ServiceClient, ServiceConnectionError, ServiceConnectionInfo, ServiceConnectionResult,
+    ServiceInputUpload, ServiceJob, ServiceProbe, SubmitServiceJobInput,
 };
 use source::{
     CreatePastedSourceInput, ImportSourceFileInput, SetSourceEnabledInput, Source, SourceStorage,
 };
+use ssh_tunnel::{SaveTunnelConfigurationInput, SshTunnelManager, TunnelError, TunnelStatus};
 use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
 use storyboard::{ReorderScenesInput, SceneDraft, StoryboardStorage};
 use tauri::{AppHandle, Manager, State};
@@ -101,6 +104,77 @@ async fn update_compshare_stop_scheduler(
     input: UpdateCompShareStopSchedulerInput,
 ) -> Result<CompShareSchedulerResult, CompShareError> {
     provider.update_stop_scheduler(input).await
+}
+
+#[tauri::command]
+fn save_ssh_tunnel_configuration(
+    manager: State<'_, SshTunnelManager>,
+    input: SaveTunnelConfigurationInput,
+) -> Result<TunnelStatus, TunnelError> {
+    manager.save_configuration(input)
+}
+
+#[tauri::command]
+async fn start_ssh_tunnel(
+    manager: State<'_, SshTunnelManager>,
+) -> Result<TunnelStatus, TunnelError> {
+    manager.start().await
+}
+
+#[tauri::command]
+async fn stop_ssh_tunnel(
+    manager: State<'_, SshTunnelManager>,
+) -> Result<TunnelStatus, TunnelError> {
+    manager.stop().await
+}
+
+#[tauri::command]
+fn get_ssh_tunnel_status(
+    manager: State<'_, SshTunnelManager>,
+) -> Result<TunnelStatus, TunnelError> {
+    manager.status()
+}
+
+async fn connect_service_through_tunnel_impl(
+    manager: &SshTunnelManager,
+    service: &ServiceClient,
+    comp_share: &CompShareProvider,
+) -> Result<ServiceProbe, String> {
+    let tunnel = manager.start().await.map_err(|error| error.message)?;
+    let local_url = tunnel
+        .local_url
+        .ok_or_else(|| "SSH 隧道没有返回本机服务地址".to_owned())?;
+    let connection_info = service.info().map_err(|error| error.message)?;
+    if connection_info.configured && connection_info.credential_stored {
+        service.retarget(local_url).map_err(|error| error.message)?;
+    } else {
+        let instance_id = comp_share
+            .configuration()
+            .map_err(|error| error.message)?
+            .bound_instance_id
+            .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
+        let token = manager
+            .read_service_token()
+            .await
+            .map_err(|error| error.message)?;
+        service
+            .save(SaveServiceConnectionInput {
+                instance_id,
+                base_url: local_url,
+                token,
+            })
+            .map_err(|error| error.message)?;
+    }
+    service.probe().await.map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn connect_service_through_tunnel(
+    manager: State<'_, SshTunnelManager>,
+    service: State<'_, ServiceClient>,
+    comp_share: State<'_, CompShareProvider>,
+) -> Result<ServiceProbe, String> {
+    connect_service_through_tunnel_impl(&manager, &service, &comp_share).await
 }
 
 #[tauri::command]
@@ -315,6 +389,30 @@ async fn cancel_service_job(
     service.cancel_job(&job_id).await
 }
 
+#[tauri::command]
+async fn upload_service_input(
+    service: State<'_, ServiceClient>,
+    source_path: String,
+) -> Result<ServiceInputUpload, ServiceConnectionError> {
+    service.upload_input(&source_path).await
+}
+
+#[tauri::command]
+async fn delete_service_input(
+    service: State<'_, ServiceClient>,
+    input_id: String,
+) -> Result<(), ServiceConnectionError> {
+    service.delete_input(&input_id).await
+}
+
+#[tauri::command]
+async fn download_service_artifact(
+    service: State<'_, ServiceClient>,
+    input: DownloadServiceArtifactInput,
+) -> Result<ServiceArtifactDownload, ServiceConnectionError> {
+    service.download_artifact(input).await
+}
+
 fn initialize_storage(app: &AppHandle) -> Result<ProjectStorage, String> {
     let app_data_dir = app
         .path()
@@ -352,11 +450,33 @@ pub fn run() {
                     .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
             )
             .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let ssh_tunnel = SshTunnelManager::new(
+                app.handle()
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             app.manage(storage);
             app.manage(source_storage);
             app.manage(storyboard_storage);
             app.manage(service);
             app.manage(comp_share);
+            app.manage(ssh_tunnel);
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let manager = app_handle.state::<SshTunnelManager>();
+                let configured = manager
+                    .status()
+                    .map(|status| status.configured)
+                    .unwrap_or(false);
+                if configured {
+                    let service = app_handle.state::<ServiceClient>();
+                    let comp_share = app_handle.state::<CompShareProvider>();
+                    let _ =
+                        connect_service_through_tunnel_impl(&manager, &service, &comp_share).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -386,6 +506,9 @@ pub fn run() {
             submit_service_job,
             get_service_job,
             cancel_service_job,
+            upload_service_input,
+            delete_service_input,
+            download_service_artifact,
             get_compshare_configuration,
             save_compshare_credentials,
             clear_compshare_credentials,
@@ -397,6 +520,11 @@ pub fn run() {
             start_compshare_instance,
             stop_compshare_instance,
             update_compshare_stop_scheduler,
+            save_ssh_tunnel_configuration,
+            start_ssh_tunnel,
+            stop_ssh_tunnel,
+            get_ssh_tunnel_status,
+            connect_service_through_tunnel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running zhihua");

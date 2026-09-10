@@ -1,8 +1,20 @@
+use futures_util::StreamExt;
 use keyring::Entry;
-use reqwest::{Client, Method, Response, Url};
+use reqwest::{Client, Method, Response, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::PathBuf, sync::RwLock, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::RwLock,
+    time::Duration,
+};
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
+};
+use tokio_util::io::ReaderStream;
 
 const CREDENTIAL_SERVICE: &str = "cn.zhihua.desktop.zhihua-service";
 const CLIENT_VERSION: &str = "0.1.0";
@@ -10,6 +22,8 @@ const API_VERSION: &str = "v1";
 const WORKFLOW_MANIFEST_VERSION: &str = "h3-workflows-2026.09.10";
 const MODEL_MANIFEST_VERSION: &str = "public-models-2026.09.08";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceConnectionError {
@@ -34,6 +48,7 @@ struct ActiveConnection {
 
 pub struct ServiceClient {
     client: Client,
+    transfer_client: Client,
     metadata_path: PathBuf,
     active: RwLock<Option<ActiveConnection>>,
 }
@@ -112,6 +127,36 @@ pub struct ServiceJob {
     pub result_manifest: Option<Value>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceInputUpload {
+    pub input_id: String,
+    pub remote_file: String,
+    pub original_filename: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadServiceArtifactInput {
+    pub job_id: String,
+    pub artifact_id: String,
+    pub destination_path: String,
+    pub expected_size_bytes: u64,
+    pub expected_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceArtifactDownload {
+    pub destination_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub resumed: bool,
+}
+
 #[derive(Deserialize)]
 struct HealthWire {
     status: String,
@@ -184,6 +229,16 @@ struct JobWire {
     result_manifest: Option<Value>,
 }
 
+#[derive(Deserialize)]
+struct InputUploadWire {
+    input_id: String,
+    remote_file: String,
+    original_filename: String,
+    media_type: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
 impl From<JobWire> for ServiceJob {
     fn from(job: JobWire) -> Self {
         Self {
@@ -222,8 +277,13 @@ impl ServiceClient {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| format!("无法初始化知画服务客户端：{error}"))?;
+        let transfer_client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("无法初始化知画传输客户端：{error}"))?;
         Ok(Self {
             client,
+            transfer_client,
             metadata_path,
             active: RwLock::new(active),
         })
@@ -280,6 +340,15 @@ impl ServiceClient {
             instance_id: Some(metadata.instance_id),
             base_url: Some(metadata.base_url),
             credential_stored: true,
+        })
+    }
+
+    pub fn retarget(&self, base_url: String) -> ServiceResult<ServiceConnectionInfo> {
+        let connection = self.connection()?;
+        self.save(SaveServiceConnectionInput {
+            instance_id: connection.metadata.instance_id,
+            base_url,
+            token: connection.token,
         })
     }
 
@@ -440,6 +509,169 @@ impl ServiceClient {
         self.get_job(job_id).await
     }
 
+    pub async fn upload_input(&self, source_path: &str) -> ServiceResult<ServiceInputUpload> {
+        let path = validate_input_path(source_path)?;
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|_| service_error("input_unavailable", "无法读取本地参考素材。"))?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_INPUT_BYTES {
+            return Err(service_error(
+                "input_size_invalid",
+                "参考素材为空或超过 4 GB 上限。",
+            ));
+        }
+        validate_local_signature(&path).await?;
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| service_error("input_name_invalid", "参考素材文件名无效。"))?;
+        let connection = self.connection()?;
+        let file = File::open(&path)
+            .await
+            .map_err(|_| service_error("input_unavailable", "无法打开本地参考素材。"))?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        let response = self
+            .authenticated_with(
+                &self.transfer_client,
+                &connection,
+                Method::POST,
+                "/api/v1/inputs",
+            )
+            .query(&[("filename", filename)])
+            .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+            .body(body)
+            .send()
+            .await
+            .map_err(connection_error)?;
+        let uploaded: InputUploadWire = decode_response(response).await?;
+        Ok(ServiceInputUpload {
+            input_id: uploaded.input_id,
+            remote_file: uploaded.remote_file,
+            original_filename: uploaded.original_filename,
+            media_type: uploaded.media_type,
+            size_bytes: uploaded.size_bytes,
+            sha256: uploaded.sha256,
+        })
+    }
+
+    pub async fn delete_input(&self, input_id: &str) -> ServiceResult<()> {
+        validate_input_id(input_id)?;
+        let connection = self.connection()?;
+        let response = self
+            .authenticated(
+                &connection,
+                Method::DELETE,
+                &format!("/api/v1/inputs/{input_id}"),
+            )
+            .send()
+            .await
+            .map_err(connection_error)?;
+        ensure_empty_success(response).await
+    }
+
+    pub async fn download_artifact(
+        &self,
+        input: DownloadServiceArtifactInput,
+    ) -> ServiceResult<ServiceArtifactDownload> {
+        let job_id = validate_identifier(&input.job_id, "任务 ID")?;
+        let artifact_id = validate_identifier(&input.artifact_id, "成品 ID")?;
+        let expected_sha256 = validate_sha256(&input.expected_sha256)?;
+        if input.expected_size_bytes == 0 || input.expected_size_bytes > MAX_ARTIFACT_BYTES {
+            return Err(service_error(
+                "artifact_size_invalid",
+                "成品大小无效或超过 20 GB 上限。",
+            ));
+        }
+        let destination = validate_destination_path(&input.destination_path)?;
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|_| service_error("download_io", "无法创建成品目录。"))?;
+        }
+        let partial = partial_path(&destination);
+        let mut existing = tokio::fs::metadata(&partial)
+            .await
+            .map(|value| value.len())
+            .unwrap_or(0);
+        if existing > input.expected_size_bytes {
+            let _ = tokio::fs::remove_file(&partial).await;
+            existing = 0;
+        }
+        let connection = self.connection()?;
+        let path = format!("/api/v1/jobs/{job_id}/artifacts/{artifact_id}");
+        let mut request =
+            self.authenticated_with(&self.transfer_client, &connection, Method::GET, &path);
+        if existing > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+        }
+        let response = request.send().await.map_err(connection_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(response_error(response).await);
+        }
+        let resumed = existing > 0 && status == StatusCode::PARTIAL_CONTENT;
+        if existing > 0 && !resumed {
+            existing = 0;
+        }
+        let mut output = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(resumed)
+            .truncate(!resumed)
+            .open(&partial)
+            .await
+            .map_err(|_| service_error("download_io", "无法创建成品临时文件。"))?;
+        let mut received = existing;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(connection_error)?;
+            received = received.saturating_add(chunk.len() as u64);
+            if received > input.expected_size_bytes {
+                return Err(service_error(
+                    "artifact_size_mismatch",
+                    "服务返回的成品大于清单记录，已停止下载。",
+                ));
+            }
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(|_| service_error("download_io", "写入成品文件失败。"))?;
+        }
+        output
+            .flush()
+            .await
+            .map_err(|_| service_error("download_io", "刷新成品文件失败。"))?;
+        drop(output);
+        if received != input.expected_size_bytes {
+            return Err(service_error(
+                "artifact_incomplete",
+                "成品下载未完成，可稍后继续。",
+            ));
+        }
+        let actual_sha256 = sha256_file(&partial).await?;
+        if actual_sha256 != expected_sha256 {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(service_error(
+                "artifact_checksum_mismatch",
+                "成品校验失败，临时文件已删除。",
+            ));
+        }
+        if destination.exists() {
+            tokio::fs::remove_file(&destination)
+                .await
+                .map_err(|_| service_error("download_io", "无法替换已有成品。"))?;
+        }
+        tokio::fs::rename(&partial, &destination)
+            .await
+            .map_err(|_| service_error("download_io", "无法完成成品文件保存。"))?;
+        Ok(ServiceArtifactDownload {
+            destination_path: destination.to_string_lossy().into_owned(),
+            size_bytes: received,
+            sha256: actual_sha256,
+            resumed,
+        })
+    }
+
     fn connection(&self) -> ServiceResult<ActiveConnection> {
         self.active
             .read()
@@ -454,12 +686,167 @@ impl ServiceClient {
         method: Method,
         path: &str,
     ) -> reqwest::RequestBuilder {
-        self.client
+        self.authenticated_with(&self.client, connection, method, path)
+    }
+
+    fn authenticated_with(
+        &self,
+        client: &Client,
+        connection: &ActiveConnection,
+        method: Method,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        client
             .request(method, format!("{}{path}", connection.metadata.base_url))
             .bearer_auth(&connection.token)
             .header("X-Zhihua-API-Version", API_VERSION)
             .header("X-Zhihua-Client-Version", CLIENT_VERSION)
     }
+}
+
+async fn ensure_empty_success(response: Response) -> ServiceResult<()> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(response_error(response).await)
+}
+
+async fn response_error(response: Response) -> ServiceConnectionError {
+    let status = response.status();
+    let bytes = response.bytes().await.unwrap_or_default();
+    let code = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/detail/code")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown_error".to_owned());
+    service_error(
+        "http_status",
+        &format!("知画服务返回 HTTP {}：{code}。", status.as_u16()),
+    )
+}
+
+fn validate_input_path(value: &str) -> ServiceResult<PathBuf> {
+    let path = PathBuf::from(value.trim());
+    if !path.is_absolute() {
+        return Err(service_error(
+            "input_path_invalid",
+            "参考素材必须使用本机绝对路径。",
+        ));
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "mp4" | "mov" | "webm"
+    ) {
+        return Err(service_error(
+            "input_type_not_supported",
+            "参考素材格式不受支持。",
+        ));
+    }
+    Ok(path)
+}
+
+fn validate_destination_path(value: &str) -> ServiceResult<PathBuf> {
+    let path = PathBuf::from(value.trim());
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(service_error(
+            "download_path_invalid",
+            "成品保存路径必须是本机绝对文件路径。",
+        ));
+    }
+    Ok(path)
+}
+
+fn partial_path(destination: &Path) -> PathBuf {
+    let filename = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    destination.with_file_name(format!(".{filename}.zhihua-part"))
+}
+
+fn validate_input_id(value: &str) -> ServiceResult<()> {
+    let Some((stem, extension)) = value.rsplit_once('.') else {
+        return Err(service_error("input_id_invalid", "远端素材 ID 无效。"));
+    };
+    let valid_extension = matches!(
+        extension,
+        "jpg" | "jpeg" | "png" | "webp" | "mp4" | "mov" | "webm"
+    );
+    if stem.len() != 32 || !stem.bytes().all(|value| value.is_ascii_hexdigit()) || !valid_extension
+    {
+        return Err(service_error("input_id_invalid", "远端素材 ID 无效。"));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> ServiceResult<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 64 || !value.bytes().all(|character| character.is_ascii_hexdigit()) {
+        return Err(service_error(
+            "artifact_checksum_invalid",
+            "成品 SHA-256 无效。",
+        ));
+    }
+    Ok(value)
+}
+
+async fn validate_local_signature(path: &Path) -> ServiceResult<()> {
+    let mut file = File::open(path)
+        .await
+        .map_err(|_| service_error("input_unavailable", "无法读取本地参考素材。"))?;
+    let mut header = [0_u8; 16];
+    let length = file
+        .read(&mut header)
+        .await
+        .map_err(|_| service_error("input_unavailable", "无法读取本地参考素材。"))?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let valid = match extension.as_str() {
+        "jpg" | "jpeg" => header[..length].starts_with(&[0xff, 0xd8, 0xff]),
+        "png" => header[..length].starts_with(b"\x89PNG\r\n\x1a\n"),
+        "webp" => length >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP",
+        "mp4" | "mov" => length >= 12 && &header[4..8] == b"ftyp",
+        "webm" => header[..length].starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        _ => false,
+    };
+    if !valid {
+        return Err(service_error(
+            "input_content_invalid",
+            "参考素材内容与扩展名不匹配。",
+        ));
+    }
+    Ok(())
+}
+
+async fn sha256_file(path: &Path) -> ServiceResult<String> {
+    let mut file = File::open(path)
+        .await
+        .map_err(|_| service_error("download_io", "无法校验成品文件。"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let length = file
+            .read(&mut buffer)
+            .await
+            .map_err(|_| service_error("download_io", "无法校验成品文件。"))?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validate_health(health: &HealthWire) -> ServiceResult<()> {
@@ -641,6 +1028,18 @@ mod tests {
         ServiceClient::new(directory.keep()).expect("service client")
     }
 
+    fn connected_client(base_url: String) -> ServiceClient {
+        let client = client();
+        *client.active.write().expect("active connection") = Some(ActiveConnection {
+            metadata: ConnectionMetadata {
+                instance_id: "test-instance".to_owned(),
+                base_url,
+            },
+            token: "a".repeat(32),
+        });
+        client
+    }
+
     fn mock_server(status: &str, body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("test server address");
@@ -715,6 +1114,46 @@ mod tests {
             validate_job_input(&input).expect_err("invalid kind").code,
             "invalid_job_kind"
         );
+    }
+
+    #[test]
+    fn resumes_and_verifies_artifact_download() {
+        let content = b"0123456789";
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /api/v1/jobs/job-1/artifacts/video-0 HTTP/1.1"));
+            assert!(request.to_ascii_lowercase().contains("range: bytes=3-"));
+            let remaining = &content[3..];
+            let response = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nContent-Range: bytes 3-9/10\r\nConnection: close\r\n\r\n",
+                remaining.len()
+            );
+            stream.write_all(response.as_bytes()).expect("headers");
+            stream.write_all(remaining).expect("content");
+        });
+        let directory = TempDir::new().expect("download directory");
+        let destination = directory.path().join("result.mp4");
+        fs::write(partial_path(&destination), &content[..3]).expect("partial file");
+        let expected_sha256 = format!("{:x}", Sha256::digest(content));
+        let client = connected_client(format!("http://{address}"));
+        let downloaded = tauri::async_runtime::block_on(client.download_artifact(
+            DownloadServiceArtifactInput {
+                job_id: "job-1".to_owned(),
+                artifact_id: "video-0".to_owned(),
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size_bytes: content.len() as u64,
+                expected_sha256: expected_sha256.clone(),
+            },
+        ))
+        .expect("resumed download");
+        assert!(downloaded.resumed);
+        assert_eq!(downloaded.sha256, expected_sha256);
+        assert_eq!(fs::read(destination).expect("downloaded file"), content);
     }
 
     #[test]

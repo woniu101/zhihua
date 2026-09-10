@@ -4,7 +4,6 @@ import { CalendarClock, Calculator, Database, ExternalLink, Gauge, HardDrive, Ke
 import {
   normalizeConnectionFailure,
   serviceRepository,
-  testServiceConnection,
   type ServiceConnectionInfo,
   type ServiceProbe,
 } from "../services/serviceRepository";
@@ -15,19 +14,17 @@ import {
   type CompShareConfiguration,
   type CompShareInstance,
 } from "../services/compShareRepository";
+import {
+  sshTunnelRepository,
+  type TunnelStatus,
+} from "../services/sshTunnelRepository";
 
 const connectionInfo = ref<ServiceConnectionInfo>();
 const probe = ref<ServiceProbe>();
-const connectionOpen = ref(false);
+const tunnelStatus = ref<TunnelStatus>({ configured: false, phase: "stopped" });
 const computeOpen = ref(false);
 const busy = ref(false);
-const notice = ref("");
-const noticeTone = ref<"success" | "error" | "neutral">("neutral");
-const form = reactive({
-  instanceId: "",
-  baseUrl: "http://127.0.0.1:18000",
-  token: "",
-});
+const connectionError = ref("");
 const computeForm = reactive({ publicKey: "", privateKey: "" });
 const computeConfiguration = ref<CompShareConfiguration>();
 const computeBalance = ref<CompShareBalance>();
@@ -50,6 +47,9 @@ const connected = computed(
   () => Boolean(connectionInfo.value?.configured && probe.value?.compatible),
 );
 const connectionLabel = computed(() => {
+  if (tunnelStatus.value.phase === "connecting") return "正在建立安全连接";
+  if (tunnelStatus.value.phase === "reconnecting") return "安全连接正在恢复";
+  if (tunnelStatus.value.phase === "error") return "安全连接异常";
   if (!connectionInfo.value?.configured) return "尚未配置";
   if (connected.value) return "连接正常";
   return "等待连接";
@@ -100,15 +100,12 @@ const checks = computed(() => [
   },
   {
     name: "本机安全入口",
-    state: connected.value ? "SSH 隧道可达" : "仅允许本机回环地址",
-    tone: connected.value ? "success" : "waiting",
+    state: tunnelStatus.value.phase === "connected"
+      ? `SSH 已连接 · ${tunnelStatus.value.localUrl ?? "本机随机端口"}`
+      : tunnelStatus.value.lastError ?? (tunnelStatus.value.configured ? "等待建立 SSH 连接" : "尚未配置 SSH 连接"),
+    tone: tunnelStatus.value.phase === "connected" ? "success" : "waiting",
   },
 ]);
-
-function setNotice(message: string, tone: "success" | "error" | "neutral") {
-  notice.value = message;
-  noticeTone.value = tone;
-}
 
 function setComputeNotice(message: string, tone: "success" | "error" | "neutral") {
   computeNotice.value = message;
@@ -196,83 +193,33 @@ async function changeComputeMode(mode: "gpu" | "noGpu" | "stop") {
 
 async function refreshConnection() {
   try {
-    const info = await serviceRepository.info();
-    connectionInfo.value = info;
-    if (!info) return;
-    form.instanceId = info.instanceId ?? form.instanceId;
-    form.baseUrl = info.baseUrl ?? form.baseUrl;
-    if (!info.configured) return;
-    probe.value = await serviceRepository.probe();
+    tunnelStatus.value = await sshTunnelRepository.status();
+    if (tunnelStatus.value.configured) {
+      probe.value = await sshTunnelRepository.connectService();
+      tunnelStatus.value = await sshTunnelRepository.status();
+    }
+    connectionInfo.value = await serviceRepository.info();
+    if (connectionInfo.value?.configured && !probe.value) {
+      probe.value = await serviceRepository.probe();
+    }
+    connectionError.value = "";
   } catch (error) {
+    tunnelStatus.value = await sshTunnelRepository.status().catch(() => ({
+      configured: false,
+      phase: "error" as const,
+    }));
     probe.value = undefined;
-    setNotice(normalizeConnectionFailure(error).message, "error");
+    connectionError.value = normalizeConnectionFailure(error).message;
+    connectionInfo.value = await serviceRepository.info().catch(() => undefined);
   }
 }
-
-async function testAddress() {
-  busy.value = true;
-  setNotice("正在检查本机服务入口……", "neutral");
-  try {
-    const result = await testServiceConnection(form.baseUrl.trim());
-    setNotice(`已识别 ${result.service} v${result.version}。`, "success");
-  } catch (error) {
-    setNotice(normalizeConnectionFailure(error).message, "error");
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function saveConnection() {
-  if (!form.instanceId.trim() || !form.baseUrl.trim() || !form.token) {
-    setNotice("请填写实例标识、本机服务地址和服务令牌。", "error");
-    return;
-  }
-  busy.value = true;
-  setNotice("正在保存到 Windows 凭据库并验证连接……", "neutral");
-  try {
-    connectionInfo.value = await serviceRepository.save({
-      instanceId: form.instanceId.trim(),
-      baseUrl: form.baseUrl.trim(),
-      token: form.token,
-    });
-    form.token = "";
-    probe.value = await serviceRepository.probe();
-    setNotice("连接已保存，服务版本与工作流清单兼容。", "success");
-  } catch (error) {
-    probe.value = undefined;
-    setNotice(normalizeConnectionFailure(error).message, "error");
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function clearConnection() {
-  busy.value = true;
-  try {
-    await serviceRepository.clear();
-    connectionInfo.value = { configured: false, credentialStored: false };
-    probe.value = undefined;
-    form.token = "";
-    setNotice("已删除本机保存的知画服务连接。", "success");
-  } catch (error) {
-    setNotice(normalizeConnectionFailure(error).message, "error");
-  } finally {
-    busy.value = false;
-  }
-}
-
-function openConnection() {
-  connectionOpen.value = true;
-  setNotice("服务令牌只保存到 Windows 凭据管理器。", "neutral");
-}
-
 onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute()]));
 </script>
 
 <template>
   <section class="page settings-page">
     <header class="settings-head"><div class="page-title-line"><h1>设置与算力</h1><span class="status-line"><span class="dot" :class="{ gray: !connected }"></span><strong>{{ serviceStatus }}</strong><span>|</span><span>生成任务提交后再启动 GPU</span></span></div></header>
-    <nav class="settings-tabs"><button type="button" @click="openConnection"><KeyRound :size="22"/>连接配置</button><button class="active" type="button"><Server :size="22"/>算力实例</button><button type="button" title="环境状态显示在下方"><ShieldCheck :size="22"/>环境检查</button><button type="button" disabled title="将在语音与导出阶段开放"><Gauge :size="22"/>语音与导出</button><button type="button" disabled title="将在本地设置阶段开放"><Monitor :size="22"/>存储与外观</button></nav>
+    <nav class="settings-tabs"><button type="button" @click="refreshConnection"><KeyRound :size="22"/>连接状态</button><button class="active" type="button"><Server :size="22"/>算力实例</button><button type="button" title="环境状态显示在下方"><ShieldCheck :size="22"/>环境检查</button><button type="button" disabled title="将在语音与导出阶段开放"><Gauge :size="22"/>语音与导出</button><button type="button" disabled title="将在本地设置阶段开放"><Monitor :size="22"/>存储与外观</button></nav>
 
     <div class="settings-grid">
       <section class="panel account"><div class="panel-head"><h2>账户概览</h2><button class="btn link" type="button" :disabled="busy" @click="refreshCompute"><RefreshCw :size="17"/>实时刷新</button></div><div class="money-row"><article><Database :size="34"/><div><span>可用余额</span><b>{{ computeBalance?.amountAvailable ? `¥ ${computeBalance.amountAvailable}` : '--' }}</b></div></article><article><span>当前实例模式</span><b>{{ computeModeLabel }}</b><small>{{ computeConfigured ? '来自优云智算实时接口' : '请先配置算力账户' }}</small></article><article class="cost"><Calculator :size="32"/><div><span>当前实例费率</span><b>{{ computeInstance?.instancePrice == null ? '平台未返回' : `¥ ${computeInstance.instancePrice}/小时` }}</b><small>费用以优云智算实际账单为准</small></div></article></div><div class="account-actions"><button class="btn primary" type="button" @click="computeOpen=true"><Wallet :size="19"/>{{ computeConfigured ? '管理算力账户' : '配置算力账户' }}</button><button class="btn" type="button" :disabled="!computeConfigured" @click="refreshCompute"><FileTextIcon/>刷新余额与实例</button></div></section>
@@ -281,11 +228,11 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute()]));
 
       <section class="panel shutdown"><div class="panel-title"><h2>自动关机</h2><span class="switch on"></span></div><div class="setting-row"><Timer :size="25"/><div><b>空闲 3 分钟后关机</b><span>实例在设定的空闲时间后自动关机，节省费用。</span></div></div><div class="setting-row"><ClockIcon/><div><b>本次运行上限</b><span>达到时长后自动关机，避免超额费用。</span></div><button>60 分钟　⌄</button></div><div class="setting-row"><CalendarClock :size="24"/><div><b>平台定时关机</b></div><strong class="success-text">已设置　›</strong></div></section>
 
-      <section class="panel environment"><div class="panel-title"><h2>环境检查</h2><button class="btn link" type="button" :disabled="busy || !connectionInfo?.configured" @click="refreshConnection"><RefreshCw :size="15"/>重新检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="24"/><b>远端磁盘</b><span>等待优云智算实例接口</span><div class="progress"><i style="width:0"></i></div><strong>未知</strong></div></section>
+      <section class="panel environment"><div class="panel-title"><h2>环境检查</h2><button class="btn link" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="15"/>连接并检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="24"/><b>远端磁盘</b><span>等待优云智算实例接口</span><div class="progress"><i style="width:0"></i></div><strong>未知</strong></div></section>
 
       <section class="panel retention"><div class="panel-title"><h2>实例保留期　ⓘ</h2></div><div class="setting-row"><CalendarClock :size="24"/><div><b>回收时间</b><span>由平台策略决定，可能在实例闲置后回收。</span></div><strong>未知</strong></div><div class="setting-row"><Wrench :size="24"/><div><b>软件运行时自动维护实例保留期</b><span>在软件运行时自动延长实例保留期。</span></div><span class="switch"></span></div><div class="warning-box"><b>尚未完成平台验证，当前不可开启</b><span>实例保留时长以优云智算平台规则为准。</span></div></section>
 
-      <section class="panel connection"><div class="panel-head"><h2>连接信息</h2><span :class="connected ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: !connected }"></span>{{ connectionLabel }}</span></div><div class="connection-cards"><article role="button" tabindex="0" @click="openConnection" @keydown.enter="openConnection"><KeyRound :size="31"/><div><b>知画服务凭据</b><span>{{ connectionInfo?.credentialStored ? '已保存到 Windows 凭据库' : '尚未保存' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="openConnection" @keydown.enter="openConnection"><Server :size="31"/><div><b>本机服务入口</b><span>{{ connectionInfo?.baseUrl ?? '通过 SSH 隧道连接' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><ShieldCheck :size="31"/><div><b>版本握手　<span :class="connected ? 'success-text' : 'waiting-text'">● {{ connectionLabel }}</span></b><span>{{ connected ? `API ${probe?.apiVersion} · 服务 ${probe?.serviceVersion}` : '点击检查服务身份与兼容性' }}</span></div><strong>›</strong></article></div></section>
+      <section class="panel connection"><div class="panel-head"><h2>连接信息</h2><span :class="connected ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: !connected }"></span>{{ connectionLabel }}</span></div><div class="connection-cards"><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><KeyRound :size="31"/><div><b>自动安全连接</b><span>{{ tunnelStatus.configured ? 'SSH 私钥已保存到 Windows 凭据库' : '等待实例连接配置' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><Server :size="31"/><div><b>本机服务入口</b><span>{{ tunnelStatus.localUrl ?? connectionInfo?.baseUrl ?? '启动时自动分配' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><ShieldCheck :size="31"/><div><b>版本握手　<span :class="connected ? 'success-text' : 'waiting-text'">● {{ connectionLabel }}</span></b><span>{{ connected ? `API ${probe?.apiVersion} · 服务 ${probe?.serviceVersion}` : connectionError || '点击建立连接并检查兼容性' }}</span></div><strong>›</strong></article></div></section>
     </div>
 
     <div v-if="computeOpen" class="connection-backdrop" role="presentation" @click.self="computeOpen=false">
@@ -310,18 +257,6 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute()]));
       </section>
     </div>
 
-    <div v-if="connectionOpen" class="connection-backdrop" role="presentation" @click.self="connectionOpen=false">
-      <section class="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-title">
-        <header><div><h2 id="connection-title">连接知画服务</h2><p>桌面端只连接本机 SSH 隧道，远端服务不会直接暴露到公网。</p></div><button type="button" aria-label="关闭" @click="connectionOpen=false"><X :size="20"/></button></header>
-        <div class="connection-form">
-          <label><span>实例标识</span><input v-model.trim="form.instanceId" autocomplete="off" placeholder="例如 uhost-xxxx"/></label>
-          <label><span>本机服务地址</span><input v-model.trim="form.baseUrl" autocomplete="off" inputmode="url" placeholder="http://127.0.0.1:18000"/><small>仅接受 127.0.0.1、localhost 或 ::1 的 HTTP 地址。</small></label>
-          <label><span>服务令牌</span><input v-model="form.token" type="password" autocomplete="new-password" :placeholder="connectionInfo?.credentialStored ? '已保存；重新保存时请再次输入' : '输入知画服务令牌'"/><small>保存后令牌进入 Windows 凭据管理器，配置文件中不写入明文。</small></label>
-          <p v-if="notice" class="connection-notice" :class="noticeTone">{{ notice }}</p>
-        </div>
-        <footer><button v-if="connectionInfo?.configured" class="btn danger" type="button" :disabled="busy" @click="clearConnection">删除连接</button><span></span><button class="btn" type="button" :disabled="busy || !form.baseUrl" @click="testAddress">测试地址</button><button class="btn primary" type="button" :disabled="busy" @click="saveConnection">保存并验证</button></footer>
-      </section>
-    </div>
   </section>
 </template>
 
