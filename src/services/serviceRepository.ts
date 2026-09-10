@@ -118,14 +118,11 @@ export const serviceRepository = {
 };
 
 export class ComfyUiH3Provider implements VideoProvider {
-  private capabilities?: RuntimeCapabilities;
-
   async getCapabilities(): Promise<RuntimeCapabilities> {
-    if (this.capabilities) return this.capabilities;
     const probe = await serviceRepository.probe();
     if (!probe) throw new Error("知画服务仅可在桌面客户端中使用");
     if (!probe.compatible) throw new Error(probe.detail);
-    this.capabilities = {
+    return {
       serviceVersion: probe.serviceVersion,
       apiVersion: probe.apiVersion ?? "v1",
       workflowVersion: probe.workflowManifestVersion,
@@ -141,10 +138,17 @@ export class ComfyUiH3Provider implements VideoProvider {
         probe.availableWorkflows.some((item) => item.startsWith("seedvr2-")) && "seedvr2",
       ].filter((item): item is RuntimeCapabilities["workflows"][number] => Boolean(item)),
     };
-    return this.capabilities;
   }
 
   async submit(request: VideoGenerationRequest): Promise<GenerationJob> {
+    const capabilities = await this.getCapabilities();
+    const workflowId = workflowFor(request);
+    if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
+      throw new Error(`知画服务不接受工作流 ${workflowId}，请先更新服务。`);
+    }
+    if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
+      throw new Error(`工作流 ${workflowId} 尚未安装，当前不会启动 GPU。`);
+    }
     const job = await invokeNative<NativeServiceJob>("submit_service_job", {
       input: {
         clientRequestId: request.clientRequestId,
@@ -154,7 +158,7 @@ export class ComfyUiH3Provider implements VideoProvider {
           request.mode === "r2v"
             ? "video_reference_remake"
             : "video_candidate",
-        workflowId: workflowFor(request),
+        workflowId,
         parameters: {
           mode: request.mode,
           quality: request.quality,
