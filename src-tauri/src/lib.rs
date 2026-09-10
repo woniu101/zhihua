@@ -1,6 +1,7 @@
 mod service;
 mod source;
 mod storage;
+mod storyboard;
 
 use service::{
     SaveServiceConnectionInput, ServiceClient, ServiceConnectionError, ServiceConnectionInfo,
@@ -10,6 +11,7 @@ use source::{
     CreatePastedSourceInput, ImportSourceFileInput, SetSourceEnabledInput, Source, SourceStorage,
 };
 use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
+use storyboard::{ReorderScenesInput, SceneDraft, StoryboardStorage};
 use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
@@ -129,6 +131,41 @@ fn delete_source(storage: State<'_, SourceStorage>, id: String) -> Result<(), St
 }
 
 #[tauri::command]
+fn list_storyboard_scenes(
+    storage: State<'_, StoryboardStorage>,
+    project_id: String,
+) -> Result<Vec<SceneDraft>, String> {
+    storage.list(&project_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn upsert_storyboard_scene(
+    storage: State<'_, StoryboardStorage>,
+    scene: SceneDraft,
+) -> Result<SceneDraft, String> {
+    storage.upsert(scene).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_storyboard_scene(
+    storage: State<'_, StoryboardStorage>,
+    project_id: String,
+    id: String,
+) -> Result<(), String> {
+    storage
+        .delete(&project_id, &id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn reorder_storyboard_scenes(
+    storage: State<'_, StoryboardStorage>,
+    input: ReorderScenesInput,
+) -> Result<Vec<SceneDraft>, String> {
+    storage.reorder(input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn test_service_connection(
     service: State<'_, ServiceClient>,
     base_url: String,
@@ -210,6 +247,8 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let source_storage = SourceStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let storyboard_storage = StoryboardStorage::initialize(storage.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let service = ServiceClient::new(
                 app.handle()
                     .path()
@@ -219,6 +258,7 @@ pub fn run() {
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             app.manage(storage);
             app.manage(source_storage);
+            app.manage(storyboard_storage);
             app.manage(service);
             Ok(())
         })
@@ -237,6 +277,10 @@ pub fn run() {
             read_source_text,
             set_source_enabled,
             delete_source,
+            list_storyboard_scenes,
+            upsert_storyboard_scene,
+            delete_storyboard_scene,
+            reorder_storyboard_scenes,
             test_service_connection,
             get_service_connection_info,
             save_service_connection,
