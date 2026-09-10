@@ -3,8 +3,10 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { AlertTriangle, Check, ChevronRight, Clock3, FileText, Pencil, Plus, Sparkles, Trash2, Upload, X } from "lucide-vue-next";
 import type { KnowledgePoint, SourceDocument, SourceKind } from "../domain/sources";
 import { useSourceStore } from "../stores/sources";
+import { useRouter } from "vue-router";
 
 const store = useSourceStore();
+const router = useRouter();
 const inputRef = ref<HTMLInputElement>();
 const dragging = ref(false);
 const pasteDialog = ref(false);
@@ -39,7 +41,7 @@ async function importFiles(files: FileList | File[]) {
   const accepted = Array.from(files);
   if (!accepted.length) return;
   await store.importFiles(accepted);
-  notice.value = accepted.some((file) => /\.(pdf|pptx|docx)$/i.test(file.name)) ? "文件已加入资料列表；PDF/PPTX/DOCX 的真实解析器将在 Rust command 接入后执行。" : `已导入 ${accepted.length} 份资料`;
+  notice.value = `已导入并解析 ${accepted.length} 份资料`;
 }
 function onDrop(event: DragEvent) {
   dragging.value = false;
@@ -54,13 +56,34 @@ async function submitText() {
 }
 async function extractKnowledge() {
   if (!activeSources.value.length) { notice.value = "请先启用至少一份已解析完成的资料"; return; }
-  notice.value = await store.extractKnowledge() ? "知识点已从 DeepSeek 返回并保存" : "DeepSeek 提取 command 尚未接入；当前保留可编辑演示知识点，不会伪造新的提取结果。";
+  try {
+    notice.value = "DeepSeek 正在分析资料……";
+    notice.value = await store.extractKnowledge() ? "知识点已从 DeepSeek 返回并保存" : "请在设置与算力中配置 DeepSeek API Key";
+  } catch (error) {
+    const value = error as { message?: string };
+    notice.value = value?.message ?? String(error);
+  }
 }
 function commitPoint(point: KnowledgePoint) {
   store.updatePoint(point.id, { title: point.title.trim(), detail: point.detail.trim(), confirmed: point.confirmed, needsConfirmation: point.needsConfirmation });
 }
 function focusPoint(id: string) {
   window.document.getElementById(`point-${id}`)?.focus();
+}
+async function createStoryboard() {
+  if (store.unresolvedCount.value) return;
+  try {
+    notice.value = "DeepSeek 正在生成分镜初稿……";
+    const count = await store.createStoryboard();
+    if (!count) {
+      notice.value = "桌面端分镜生成尚不可用";
+      return;
+    }
+    await router.push("/storyboard");
+  } catch (error) {
+    const value = error as { message?: string };
+    notice.value = value?.message ?? String(error);
+  }
 }
 </script>
 
@@ -102,7 +125,7 @@ function focusPoint(id: string) {
           <div class="subhead"><h3>来源引用</h3><span>{{ activeSources.length }} 份已启用资料</span></div>
           <p v-for="source in activeSources.slice(0,4)" :key="source.id" class="citation" :class="{active:source.id===store.selected.value?.id}" @click="store.selectedId.value=source.id">{{ source.name }}　{{ source.pageCount ? `${source.pageCount} 页` : '全文' }}</p>
         </div>
-        <button class="btn primary generate" :disabled="store.unresolvedCount.value>0">确认内容并生成分镜 <ChevronRight :size="20"/></button>
+        <button class="btn primary generate" :disabled="store.unresolvedCount.value>0 || !store.points.value.length" @click="createStoryboard">确认内容并生成分镜 <ChevronRight :size="20"/></button>
         <p v-if="store.unresolvedCount.value" class="confirm-hint">还有 {{ store.unresolvedCount.value }} 条内容需要确认</p>
       </aside>
     </div>

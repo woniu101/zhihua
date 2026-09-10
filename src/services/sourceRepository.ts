@@ -1,4 +1,5 @@
 import type { KnowledgePoint, SourceDocument, SourceKind } from "../domain/sources";
+import type { SceneDraft } from "../domain/storyboard";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invokeNative, invokeOptional, isNativeRuntime, readLocal, writeLocal } from "./nativeBridge";
 
@@ -92,7 +93,12 @@ export const sourceRepository = {
     return readLocal(SOURCE_KEY, demoSources);
   },
   async listKnowledgePoints(): Promise<KnowledgePoint[]> {
-    return (await invokeOptional<KnowledgePoint[]>("knowledge_point_list")) ?? readLocal(POINT_KEY, demoPoints);
+    if (isNativeRuntime()) {
+      const projectId = activeProjectId();
+      if (!projectId) return [];
+      return (await invokeNative<KnowledgePoint[]>("knowledge_point_list", { projectId })) ?? [];
+    }
+    return readLocal(POINT_KEY, demoPoints);
   },
   async pickNative(): Promise<SourceDocument[] | undefined> {
     if (!isNativeRuntime()) return undefined;
@@ -156,10 +162,31 @@ export const sourceRepository = {
     return source;
   },
   save(sources: SourceDocument[]): void { writeLocal(SOURCE_KEY, sources); },
-  savePoints(points: KnowledgePoint[]): void { writeLocal(POINT_KEY, points); },
+  async savePoints(points: KnowledgePoint[]): Promise<void> {
+    if (isNativeRuntime()) {
+      const projectId = activeProjectId();
+      if (!projectId) throw new Error("请先在项目页创建或打开一个项目");
+      await invokeNative<KnowledgePoint[]>("knowledge_points_replace", { projectId, points });
+      return;
+    }
+    writeLocal(POINT_KEY, points);
+  },
   async remove(id: string): Promise<void> { await invokeOptional("delete_source", { id }); },
   async setEnabled(id: string, enabled: boolean): Promise<void> { await invokeOptional("set_source_enabled", { input: { id, enabled } }); },
   async extractKnowledge(sourceIds: string[]): Promise<KnowledgePoint[] | undefined> {
-    return invokeOptional<KnowledgePoint[]>("knowledge_extract", { sourceIds });
+    if (!isNativeRuntime()) return undefined;
+    const projectId = activeProjectId();
+    if (!projectId) throw new Error("请先在项目页创建或打开一个项目");
+    return invokeNative<KnowledgePoint[]>("knowledge_extract", {
+      input: { projectId, sourceIds, targetAudience: "小学高年级", targetDurationSec: 42 },
+    });
+  },
+  async createStoryboard(): Promise<SceneDraft[] | undefined> {
+    if (!isNativeRuntime()) return undefined;
+    const projectId = activeProjectId();
+    if (!projectId) throw new Error("请先在项目页创建或打开一个项目");
+    return invokeNative<SceneDraft[]>("storyboard_generate_from_knowledge", {
+      input: { projectId, targetAudience: "小学高年级", targetDurationSec: 42 },
+    });
   },
 };

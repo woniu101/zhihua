@@ -64,12 +64,12 @@ export function useSourceStore() {
     points.value = points.value.map((point) => ({ ...point, sourceRefs: point.sourceRefs.filter((ref) => ref.sourceId !== id) }));
     if (selectedId.value === id) selectedId.value = items.value[0]?.id;
     persist();
-    persistPoints();
+    void persistPoints();
   };
 
   const updatePoint = (id: string, patch: Partial<KnowledgePoint>) => {
     points.value = points.value.map((point) => point.id === id ? { ...point, ...patch } : point);
-    persistPoints();
+    void persistPoints();
   };
 
   const addPoint = () => {
@@ -79,7 +79,7 @@ export function useSourceStore() {
       needsConfirmation: true, confirmed: false,
       sourceRefs: source ? [{ sourceId: source.id, sourceName: source.name, location: "手动添加" }] : [],
     });
-    persistPoints();
+    void persistPoints();
   };
 
   const extractKnowledge = async () => {
@@ -87,9 +87,13 @@ export function useSourceStore() {
     const extracted = await sourceRepository.extractKnowledge(sourceIds);
     if (!extracted) return false;
     points.value = extracted;
-    persistPoints();
     return true;
   };
 
-  return { items, points, selectedId, selected, filter, loading, visibleSources, enabledReadyCount, unresolvedCount, load, importFiles, importNative, pasteText, toggle, remove, updatePoint, addPoint, extractKnowledge };
+  const createStoryboard = async () => {
+    const created = await sourceRepository.createStoryboard();
+    return created?.length ?? 0;
+  };
+
+  return { items, points, selectedId, selected, filter, loading, visibleSources, enabledReadyCount, unresolvedCount, load, importFiles, importNative, pasteText, toggle, remove, updatePoint, addPoint, extractKnowledge, createStoryboard };
 }

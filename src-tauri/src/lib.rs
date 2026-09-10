@@ -1,5 +1,6 @@
 mod asset;
 mod comp_share;
+mod deepseek;
 mod generation;
 mod service;
 mod source;
@@ -16,6 +17,11 @@ use comp_share::{
     CompShareConnectionTest, CompShareError, CompShareInstance, CompSharePowerState,
     CompShareProvider, CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode,
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
+};
+use deepseek::{
+    AnalyzeSourcesInput, CreateStoryboardInput, DeepSeekConfiguration, DeepSeekConnectionTest,
+    DeepSeekError, DeepSeekProvider, DeepSeekSource, KnowledgePoint,
+    SaveDeepSeekConfigurationInput,
 };
 use generation::{
     CandidateVersion, FinalVersion, GenerationError, GenerationStorage, RecordCandidateInput,
@@ -38,7 +44,10 @@ use std::{
     time::Duration,
 };
 use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
-use storyboard::{ReorderScenesInput, SceneDraft, StoryboardStorage};
+use storyboard::{
+    CandidateQuality, GenerationMode, ReorderScenesInput, SceneDraft, SceneStatus, SourceReference,
+    StoryboardStorage,
+};
 use tauri::{AppHandle, Manager, State};
 
 #[derive(Debug, serde::Deserialize)]
@@ -449,6 +458,161 @@ fn set_source_enabled(
 #[tauri::command]
 fn delete_source(storage: State<'_, SourceStorage>, id: String) -> Result<(), String> {
     storage.delete(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_deepseek_configuration(
+    provider: State<'_, DeepSeekProvider>,
+) -> Result<DeepSeekConfiguration, DeepSeekError> {
+    provider.configuration()
+}
+
+#[tauri::command]
+fn save_deepseek_configuration(
+    provider: State<'_, DeepSeekProvider>,
+    input: SaveDeepSeekConfigurationInput,
+) -> Result<DeepSeekConfiguration, DeepSeekError> {
+    provider.save_configuration(input)
+}
+
+#[tauri::command]
+fn clear_deepseek_api_key(provider: State<'_, DeepSeekProvider>) -> Result<(), DeepSeekError> {
+    provider.clear_api_key()
+}
+
+#[tauri::command]
+async fn test_deepseek_connection(
+    provider: State<'_, DeepSeekProvider>,
+) -> Result<DeepSeekConnectionTest, DeepSeekError> {
+    provider.test_connection().await
+}
+
+#[tauri::command]
+fn knowledge_point_list(
+    provider: State<'_, DeepSeekProvider>,
+    project_id: String,
+) -> Result<Vec<KnowledgePoint>, DeepSeekError> {
+    provider.list_knowledge_points(&project_id)
+}
+
+#[tauri::command]
+fn knowledge_points_replace(
+    provider: State<'_, DeepSeekProvider>,
+    project_id: String,
+    points: Vec<KnowledgePoint>,
+) -> Result<Vec<KnowledgePoint>, DeepSeekError> {
+    provider.replace_knowledge_points(&project_id, &points)
+}
+
+#[tauri::command]
+async fn knowledge_extract(
+    provider: State<'_, DeepSeekProvider>,
+    source_storage: State<'_, SourceStorage>,
+    input: AnalyzeSourcesInput,
+) -> Result<Vec<KnowledgePoint>, DeepSeekError> {
+    let available = source_storage
+        .list_sources(&input.project_id)
+        .map_err(|error| DeepSeekError {
+            code: "SOURCE_ERROR".to_owned(),
+            message: error.to_string(),
+        })?;
+    let requested = input
+        .source_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut sources = Vec::new();
+    for source in available {
+        if !requested.contains(&source.id) || !source.enabled || source.extracted_char_count == 0 {
+            continue;
+        }
+        let text = source_storage
+            .read_text(&source.id)
+            .map_err(|error| DeepSeekError {
+                code: "SOURCE_ERROR".to_owned(),
+                message: error.to_string(),
+            })?;
+        sources.push(DeepSeekSource {
+            id: source.id,
+            name: source.name,
+            text,
+        });
+    }
+    provider.analyze_sources(input, sources).await
+}
+
+#[tauri::command]
+async fn storyboard_generate_from_knowledge(
+    provider: State<'_, DeepSeekProvider>,
+    storyboard: State<'_, StoryboardStorage>,
+    input: CreateStoryboardInput,
+) -> Result<Vec<SceneDraft>, DeepSeekError> {
+    if !storyboard
+        .list(&input.project_id)
+        .map_err(|error| DeepSeekError {
+            code: "STORYBOARD_ERROR".to_owned(),
+            message: error.to_string(),
+        })?
+        .is_empty()
+    {
+        return Err(DeepSeekError {
+            code: "STORYBOARD_NOT_EMPTY".to_owned(),
+            message: "当前项目已有分镜，为避免覆盖，请先在分镜页处理现有内容。".to_owned(),
+        });
+    }
+    let points = provider.list_knowledge_points(&input.project_id)?;
+    let plans = provider.create_storyboard(&input).await?;
+    let mut saved = Vec::with_capacity(plans.len());
+    for (order, plan) in plans.into_iter().enumerate() {
+        let mut seen_sources = std::collections::HashSet::new();
+        let source_refs = plan
+            .knowledge_point_ids
+            .iter()
+            .filter_map(|id| points.iter().find(|point| &point.id == id))
+            .flat_map(|point| point.source_refs.iter())
+            .filter(|reference| seen_sources.insert(reference.source_id.clone()))
+            .map(|reference| SourceReference {
+                source_id: reference.source_id.clone(),
+                page: None,
+                paragraph: None,
+                quote: None,
+            })
+            .collect();
+        let scene = SceneDraft {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: input.project_id.clone(),
+            order: order as u32,
+            title: plan.title,
+            purpose: plan.purpose,
+            source_refs,
+            narration: plan.narration,
+            on_screen_text: plan.on_screen_text,
+            visual_plan: plan.visual_plan,
+            generation_mode: GenerationMode::T2v,
+            target_duration_ms: plan.target_duration_sec * 1_000,
+            asset_ids: Vec::new(),
+            selected_version_id: None,
+            last_job_id: None,
+            last_upscale_job_id: None,
+            pending_request_id: None,
+            generation_stage: None,
+            status: SceneStatus::Draft,
+            quality: CandidateQuality::Fast,
+            updated_at: String::new(),
+        };
+        match storyboard.upsert(scene) {
+            Ok(scene) => saved.push(scene),
+            Err(error) => {
+                for inserted in &saved {
+                    let _ = storyboard.delete(&input.project_id, &inserted.id);
+                }
+                return Err(DeepSeekError {
+                    code: "STORYBOARD_ERROR".to_owned(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -958,32 +1122,26 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let generation_storage = GenerationStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
-            let service = ServiceClient::new(
-                app.handle()
-                    .path()
-                    .app_data_dir()
-                    .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
-            )
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            let comp_share = CompShareProvider::new(
-                app.handle()
-                    .path()
-                    .app_data_dir()
-                    .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
-            )
-            .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
-            let ssh_tunnel = SshTunnelManager::new(
-                app.handle()
-                    .path()
-                    .app_data_dir()
-                    .map_err(|error| format!("无法确定应用数据目录：{error}"))?,
-            )
-            .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let app_data_dir = app
+                .handle()
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("无法确定应用数据目录：{error}"))?;
+            let deepseek =
+                DeepSeekProvider::initialize(app_data_dir.clone(), storage.info().database_path)
+                    .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let service = ServiceClient::new(app_data_dir.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let comp_share = CompShareProvider::new(app_data_dir.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let ssh_tunnel = SshTunnelManager::new(app_data_dir)
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             app.manage(storage);
             app.manage(source_storage);
             app.manage(storyboard_storage);
             app.manage(asset_storage);
             app.manage(generation_storage);
+            app.manage(deepseek);
             app.manage(ComputeLifecycle::default());
             app.manage(service);
             app.manage(comp_share);
@@ -1019,6 +1177,14 @@ pub fn run() {
             read_source_text,
             set_source_enabled,
             delete_source,
+            get_deepseek_configuration,
+            save_deepseek_configuration,
+            clear_deepseek_api_key,
+            test_deepseek_connection,
+            knowledge_point_list,
+            knowledge_points_replace,
+            knowledge_extract,
+            storyboard_generate_from_knowledge,
             list_storyboard_scenes,
             upsert_storyboard_scene,
             delete_storyboard_scene,
