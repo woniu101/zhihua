@@ -1,5 +1,6 @@
 mod asset;
 mod comp_share;
+mod generation;
 mod service;
 mod source;
 mod ssh_tunnel;
@@ -13,6 +14,7 @@ use comp_share::{
     CompShareProvider, CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode,
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
+use generation::{CandidateVersion, GenerationError, GenerationStorage, RecordCandidateInput};
 use service::{
     DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceArtifactDownload,
     ServiceClient, ServiceConnectionError, ServiceConnectionInfo, ServiceConnectionResult,
@@ -22,10 +24,53 @@ use source::{
     CreatePastedSourceInput, ImportSourceFileInput, SetSourceEnabledInput, Source, SourceStorage,
 };
 use ssh_tunnel::{SaveTunnelConfigurationInput, SshTunnelManager, TunnelError, TunnelStatus};
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
 use storyboard::{ReorderScenesInput, SceneDraft, StoryboardStorage};
 use tauri::{AppHandle, Manager, State};
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadCompletedJobInput {
+    project_id: String,
+    job_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateVersionsInput {
+    project_id: String,
+    scene_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectCandidateVersionInput {
+    project_id: String,
+    scene_id: String,
+    version_id: String,
+}
+
+#[derive(Clone, Default)]
+struct ComputeLifecycle {
+    revision: Arc<AtomicU64>,
+}
+
+impl ComputeLifecycle {
+    fn invalidate_idle_shutdown(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_current(&self, revision: u64) -> bool {
+        self.revision.load(Ordering::SeqCst) == revision
+    }
+}
 
 #[tauri::command]
 fn get_compshare_configuration(
@@ -185,7 +230,9 @@ async fn prepare_generation_service(
     manager: State<'_, SshTunnelManager>,
     service: State<'_, ServiceClient>,
     comp_share: State<'_, CompShareProvider>,
+    lifecycle: State<'_, ComputeLifecycle>,
 ) -> Result<ServiceProbe, String> {
+    lifecycle.invalidate_idle_shutdown();
     let mut instance = comp_share
         .bound_instance()
         .await
@@ -216,12 +263,19 @@ async fn prepare_generation_service(
         Duration::from_secs(180),
     )
     .await?;
-    let _ = comp_share
+    if let Err(error) = comp_share
         .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
             stop_time: chrono::Utc::now().timestamp() + 60 * 60,
             project_id: None,
         })
-        .await;
+        .await
+    {
+        let _ = comp_share.stop_instance().await;
+        return Err(format!(
+            "GPU 已启动，但无法设置 60 分钟定时关机保障，已请求关机且任务未提交：{}",
+            error.message
+        ));
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {
@@ -504,6 +558,170 @@ async fn download_service_artifact(
 }
 
 #[tauri::command]
+fn list_candidate_versions(
+    storage: State<'_, GenerationStorage>,
+    input: CandidateVersionsInput,
+) -> Result<Vec<CandidateVersion>, GenerationError> {
+    storage.list(&input.project_id, &input.scene_id)
+}
+
+#[tauri::command]
+fn select_candidate_version(
+    storage: State<'_, GenerationStorage>,
+    input: SelectCandidateVersionInput,
+) -> Result<CandidateVersion, GenerationError> {
+    storage.select(&input.project_id, &input.scene_id, &input.version_id)
+}
+
+#[tauri::command]
+async fn download_completed_job(
+    app: AppHandle,
+    projects: State<'_, ProjectStorage>,
+    storyboards: State<'_, StoryboardStorage>,
+    generations: State<'_, GenerationStorage>,
+    service: State<'_, ServiceClient>,
+    lifecycle: State<'_, ComputeLifecycle>,
+    input: DownloadCompletedJobInput,
+) -> Result<Vec<CandidateVersion>, String> {
+    let project = projects
+        .get_project(&input.project_id)
+        .map_err(|error| error.to_string())?;
+    let job = service
+        .get_job(&input.job_id)
+        .await
+        .map_err(|error| error.message)?;
+    if job.project_id != project.id {
+        return Err("远端任务不属于当前项目，已停止下载。".to_owned());
+    }
+    if !storyboards
+        .list(&project.id)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|scene| scene.id == job.scene_id)
+    {
+        return Err("远端任务对应的本地分镜不存在，已停止下载。".to_owned());
+    }
+    if job.status != "completed" {
+        return Err("远端任务尚未完成，暂时不能下载候选视频。".to_owned());
+    }
+    let manifest = job
+        .result_manifest
+        .ok_or_else(|| "远端任务已完成，但没有返回成品清单。".to_owned())?;
+    if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
+        return Err("远端成品清单与任务不匹配，已停止下载。".to_owned());
+    }
+    let artifacts = manifest
+        .artifacts
+        .into_iter()
+        .filter(|artifact| artifact.kind == "video")
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        return Err("远端任务没有生成可下载的视频。".to_owned());
+    }
+    if artifacts.len() > 8 {
+        return Err("远端任务返回的视频数量异常，已停止自动下载。".to_owned());
+    }
+
+    let mut candidates = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
+        let destination = project
+            .project_dir
+            .join("cache")
+            .join("drafts")
+            .join(safe_path_component(&job.scene_id)?)
+            .join(safe_path_component(&job.id)?)
+            .join(&filename);
+        let downloaded = service
+            .download_artifact(DownloadServiceArtifactInput {
+                job_id: job.id.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256.clone(),
+            })
+            .await
+            .map_err(|error| error.message)?;
+        candidates.push(
+            generations
+                .record(RecordCandidateInput {
+                    project_id: project.id.clone(),
+                    scene_id: job.scene_id.clone(),
+                    job_id: job.id.clone(),
+                    workflow_id: job.workflow_id.clone(),
+                    prompt_id: job.prompt_id.clone(),
+                    artifact_id: artifact.artifact_id,
+                    filename,
+                    media_type: artifact.media_type,
+                    local_path: downloaded.destination_path.into(),
+                    size_bytes: downloaded.size_bytes,
+                    sha256: downloaded.sha256,
+                })
+                .map_err(|error| error.message)?,
+        );
+    }
+    let revision = lifecycle.invalidate_idle_shutdown();
+    schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
+    Ok(candidates)
+}
+
+fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revision: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        if !lifecycle.is_current(revision) {
+            return;
+        }
+        let service = app.state::<ServiceClient>();
+        let Ok(probe) = service.probe().await else {
+            return;
+        };
+        if probe.queue_active > 0 || probe.queue_queued > 0 || !lifecycle.is_current(revision) {
+            return;
+        }
+        let provider = app.state::<CompShareProvider>();
+        let Ok(instance) = provider.bound_instance().await else {
+            return;
+        };
+        if instance.state == CompSharePowerState::Running
+            && instance.running_mode == CompShareRunningMode::Gpu
+            && lifecycle.is_current(revision)
+        {
+            let _ = provider.stop_instance().await;
+        }
+    });
+}
+
+fn safe_artifact_filename(artifact_id: &str, original_filename: &str) -> Result<String, String> {
+    let extension = std::path::Path::new(original_filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "mp4" | "mov" | "webm") {
+        return Err("远端视频的文件格式不受支持。".to_owned());
+    }
+    let stem = safe_path_component(artifact_id)?;
+    Ok(format!("{stem}.{extension}"))
+}
+
+fn safe_path_component(value: &str) -> Result<String, String> {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() || sanitized.len() > 128 || sanitized == "." || sanitized == ".." {
+        return Err("远端任务返回的文件标识无效。".to_owned());
+    }
+    Ok(sanitized)
+}
+
+#[tauri::command]
 fn list_assets(
     storage: State<'_, AssetStorage>,
     project_id: String,
@@ -550,6 +768,8 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let asset_storage = AssetStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let generation_storage = GenerationStorage::initialize(storage.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let service = ServiceClient::new(
                 app.handle()
                     .path()
@@ -575,6 +795,8 @@ pub fn run() {
             app.manage(source_storage);
             app.manage(storyboard_storage);
             app.manage(asset_storage);
+            app.manage(generation_storage);
+            app.manage(ComputeLifecycle::default());
             app.manage(service);
             app.manage(comp_share);
             app.manage(ssh_tunnel);
@@ -624,6 +846,9 @@ pub fn run() {
             upload_service_input,
             delete_service_input,
             download_service_artifact,
+            list_candidate_versions,
+            select_candidate_version,
+            download_completed_job,
             list_assets,
             import_asset_files,
             get_compshare_configuration,

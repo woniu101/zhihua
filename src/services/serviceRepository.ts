@@ -50,6 +50,7 @@ interface NativeServiceJob {
   progress: number;
   errorCode?: string;
   errorMessage?: string;
+  statusDetail?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -61,7 +62,7 @@ function mapJob(job: NativeServiceJob): GenerationJob {
     remotePromptId: job.promptId,
     status: job.status,
     progress: job.progress,
-    stageMessage: job.errorMessage ?? job.status,
+    stageMessage: job.errorMessage ?? job.statusDetail ?? job.status,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     errorCode: job.errorCode,

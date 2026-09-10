@@ -122,9 +122,33 @@ pub struct ServiceJob {
     pub progress: f64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub status_detail: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    pub result_manifest: Option<Value>,
+    pub result_manifest: Option<ServiceResultManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceArtifactManifest {
+    pub artifact_id: String,
+    pub kind: String,
+    pub filename: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub download_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceResultManifest {
+    pub schema_version: String,
+    pub job_id: String,
+    pub workflow_id: String,
+    pub prompt_id: Option<String>,
+    pub created_at: String,
+    pub artifacts: Vec<ServiceArtifactManifest>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -224,9 +248,10 @@ struct JobWire {
     progress: f64,
     error_code: Option<String>,
     error_message: Option<String>,
+    status_detail: Option<String>,
     created_at: String,
     updated_at: String,
-    result_manifest: Option<Value>,
+    result_manifest: Option<ServiceResultManifest>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +278,7 @@ impl From<JobWire> for ServiceJob {
             progress: job.progress,
             error_code: job.error_code,
             error_message: job.error_message,
+            status_detail: job.status_detail,
             created_at: job.created_at,
             updated_at: job.updated_at,
             result_manifest: job.result_manifest,
@@ -587,6 +613,19 @@ impl ServiceClient {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|_| service_error("download_io", "无法创建成品目录。"))?;
+        }
+        if tokio::fs::metadata(&destination)
+            .await
+            .map(|value| value.is_file() && value.len() == input.expected_size_bytes)
+            .unwrap_or(false)
+            && sha256_file(&destination).await? == expected_sha256
+        {
+            return Ok(ServiceArtifactDownload {
+                destination_path: destination.to_string_lossy().into_owned(),
+                size_bytes: input.expected_size_bytes,
+                sha256: expected_sha256,
+                resumed: false,
+            });
         }
         let partial = partial_path(&destination);
         let mut existing = tokio::fs::metadata(&partial)

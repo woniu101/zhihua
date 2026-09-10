@@ -1,0 +1,370 @@
+use crate::storage::ProjectStorage;
+use chrono::{SecondsFormat, Utc};
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use std::{fmt, path::PathBuf, time::Duration};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationError {
+    pub code: String,
+    pub message: String,
+}
+
+impl GenerationError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for GenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+type GenerationResult<T> = Result<T, GenerationError>;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateVersion {
+    pub id: String,
+    pub project_id: String,
+    pub scene_id: String,
+    pub job_id: String,
+    pub workflow_id: String,
+    pub prompt_id: Option<String>,
+    pub artifact_id: String,
+    pub filename: String,
+    pub media_type: String,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub selected: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordCandidateInput {
+    pub project_id: String,
+    pub scene_id: String,
+    pub job_id: String,
+    pub workflow_id: String,
+    pub prompt_id: Option<String>,
+    pub artifact_id: String,
+    pub filename: String,
+    pub media_type: String,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone)]
+pub struct GenerationStorage {
+    database_path: PathBuf,
+    project_storage: ProjectStorage,
+}
+
+impl GenerationStorage {
+    pub fn initialize(project_storage: ProjectStorage) -> GenerationResult<Self> {
+        let storage = Self {
+            database_path: project_storage.info().database_path,
+            project_storage,
+        };
+        storage
+            .connection()?
+            .execute_batch(
+                "
+            CREATE TABLE IF NOT EXISTS candidate_versions (
+                id          TEXT PRIMARY KEY NOT NULL,
+                project_id  TEXT NOT NULL,
+                scene_id    TEXT NOT NULL,
+                job_id      TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                prompt_id   TEXT,
+                artifact_id TEXT NOT NULL,
+                filename    TEXT NOT NULL,
+                media_type  TEXT NOT NULL,
+                local_path  TEXT NOT NULL UNIQUE,
+                size_bytes  INTEGER NOT NULL,
+                sha256      TEXT NOT NULL,
+                selected    INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(job_id, artifact_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_versions_scene
+                ON candidate_versions(project_id, scene_id, created_at DESC);
+            ",
+            )
+            .map_err(database_error)?;
+        Ok(storage)
+    }
+
+    fn connection(&self) -> GenerationResult<Connection> {
+        let connection = Connection::open(&self.database_path).map_err(database_error)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(database_error)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(database_error)?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(database_error)?;
+        Ok(connection)
+    }
+
+    pub fn list(
+        &self,
+        project_id: &str,
+        scene_id: &str,
+    ) -> GenerationResult<Vec<CandidateVersion>> {
+        self.project_storage
+            .get_project(project_id)
+            .map_err(|error| GenerationError::new("project_unavailable", error.to_string()))?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
+                        artifact_id, filename, media_type, local_path, size_bytes,
+                        sha256, selected, created_at
+                 FROM candidate_versions
+                 WHERE project_id = ?1 AND scene_id = ?2
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![project_id, scene_id], candidate_from_row)
+            .map_err(database_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
+    }
+
+    pub fn record(&self, input: RecordCandidateInput) -> GenerationResult<CandidateVersion> {
+        self.project_storage
+            .get_project(&input.project_id)
+            .map_err(|error| GenerationError::new("project_unavailable", error.to_string()))?;
+        if !input.local_path.is_absolute() || !input.local_path.is_file() {
+            return Err(GenerationError::new(
+                "candidate_file_unavailable",
+                "候选视频尚未完整保存到项目目录",
+            ));
+        }
+        let id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO candidate_versions (
+                    id, project_id, scene_id, job_id, workflow_id, prompt_id,
+                    artifact_id, filename, media_type, local_path, size_bytes,
+                    sha256, selected, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13)
+                 ON CONFLICT(job_id, artifact_id) DO UPDATE SET
+                    local_path = excluded.local_path,
+                    size_bytes = excluded.size_bytes,
+                    sha256 = excluded.sha256",
+                params![
+                    id,
+                    input.project_id,
+                    input.scene_id,
+                    input.job_id,
+                    input.workflow_id,
+                    input.prompt_id,
+                    input.artifact_id,
+                    input.filename,
+                    input.media_type,
+                    input.local_path.to_string_lossy(),
+                    input.size_bytes,
+                    input.sha256,
+                    created_at,
+                ],
+            )
+            .map_err(database_error)?;
+        self.find_by_job_artifact(&input.job_id, &input.artifact_id)
+    }
+
+    pub fn select(
+        &self,
+        project_id: &str,
+        scene_id: &str,
+        version_id: &str,
+    ) -> GenerationResult<CandidateVersion> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(database_error)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM candidate_versions
+                    WHERE id = ?1 AND project_id = ?2 AND scene_id = ?3
+                 )",
+                params![version_id, project_id, scene_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if !exists {
+            return Err(GenerationError::new(
+                "candidate_not_found",
+                "找不到要设为正式版本的候选视频",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE candidate_versions SET selected = CASE WHEN id = ?1 THEN 1 ELSE 0 END
+                 WHERE project_id = ?2 AND scene_id = ?3",
+                params![version_id, project_id, scene_id],
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE storyboard_scenes
+                 SET selected_version_id = ?1, status = 'approved', updated_at = ?2
+                 WHERE id = ?3 AND project_id = ?4",
+                params![version_id, Utc::now().to_rfc3339(), scene_id, project_id],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+        self.find(version_id)
+    }
+
+    fn find(&self, id: &str) -> GenerationResult<CandidateVersion> {
+        self.connection()?
+            .query_row(
+                "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
+                        artifact_id, filename, media_type, local_path, size_bytes,
+                        sha256, selected, created_at
+                 FROM candidate_versions WHERE id = ?1",
+                [id],
+                candidate_from_row,
+            )
+            .map_err(database_error)
+    }
+
+    fn find_by_job_artifact(
+        &self,
+        job_id: &str,
+        artifact_id: &str,
+    ) -> GenerationResult<CandidateVersion> {
+        self.connection()?
+            .query_row(
+                "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
+                        artifact_id, filename, media_type, local_path, size_bytes,
+                        sha256, selected, created_at
+                 FROM candidate_versions WHERE job_id = ?1 AND artifact_id = ?2",
+                params![job_id, artifact_id],
+                candidate_from_row,
+            )
+            .map_err(database_error)
+    }
+}
+
+fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateVersion> {
+    Ok(CandidateVersion {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        scene_id: row.get(2)?,
+        job_id: row.get(3)?,
+        workflow_id: row.get(4)?,
+        prompt_id: row.get(5)?,
+        artifact_id: row.get(6)?,
+        filename: row.get(7)?,
+        media_type: row.get(8)?,
+        local_path: PathBuf::from(row.get::<_, String>(9)?),
+        size_bytes: row.get(10)?,
+        sha256: row.get(11)?,
+        selected: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
+fn database_error(error: rusqlite::Error) -> GenerationError {
+    GenerationError::new(
+        "generation_database_error",
+        format!("候选版本数据库操作失败：{error}"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        storage::CreateProjectInput,
+        storyboard::{
+            CandidateQuality, GenerationMode, SceneDraft, SceneStatus, StoryboardStorage,
+        },
+    };
+
+    #[test]
+    fn records_and_selects_candidate_without_removing_older_versions() {
+        let directory = tempfile::tempdir().expect("temporary storage");
+        let projects = ProjectStorage::initialize(
+            directory.path().join("zhihua.sqlite3"),
+            directory.path().join("projects"),
+        )
+        .expect("project storage");
+        let project = projects
+            .create_project(CreateProjectInput {
+                title: "候选版本测试".to_owned(),
+                audience: None,
+                target_duration_sec: Some(30),
+            })
+            .expect("project");
+        let storyboards = StoryboardStorage::initialize(projects.clone()).expect("storyboards");
+        let scene = storyboards
+            .upsert(SceneDraft {
+                id: Uuid::new_v4().to_string(),
+                project_id: project.id.clone(),
+                order: 0,
+                title: "镜头".to_owned(),
+                purpose: String::new(),
+                source_refs: vec![],
+                narration: String::new(),
+                on_screen_text: vec![],
+                visual_plan: "闪电".to_owned(),
+                generation_mode: GenerationMode::T2v,
+                target_duration_ms: 5_000,
+                asset_ids: vec![],
+                selected_version_id: None,
+                last_job_id: None,
+                pending_request_id: None,
+                generation_stage: None,
+                status: SceneStatus::Generated,
+                quality: CandidateQuality::Fast,
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .expect("scene");
+        let storage = GenerationStorage::initialize(projects).expect("generation storage");
+        let path = project.project_dir.join("cache/drafts/clip.mp4");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("candidate directory");
+        std::fs::write(&path, b"video").expect("candidate");
+        let candidate = storage
+            .record(RecordCandidateInput {
+                project_id: project.id.clone(),
+                scene_id: scene.id.clone(),
+                job_id: "job-1".to_owned(),
+                workflow_id: "h3-t2v-turbo-v1".to_owned(),
+                prompt_id: Some("prompt-1".to_owned()),
+                artifact_id: "video-0".to_owned(),
+                filename: "clip.mp4".to_owned(),
+                media_type: "video/mp4".to_owned(),
+                local_path: path,
+                size_bytes: 5,
+                sha256: "a".repeat(64),
+            })
+            .expect("record");
+        storage
+            .select(&project.id, &scene.id, &candidate.id)
+            .expect("select");
+        let versions = storage.list(&project.id, &scene.id).expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].selected);
+        assert_eq!(
+            storyboards.list(&project.id).expect("scenes")[0].selected_version_id,
+            Some(candidate.id)
+        );
+    }
+}
