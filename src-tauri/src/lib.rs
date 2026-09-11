@@ -813,46 +813,63 @@ async fn probe_service(
 
 #[tauri::command]
 async fn submit_service_job(
+    app: AppHandle,
     service: State<'_, ServiceClient>,
     queue: State<'_, JobQueueStorage>,
+    lifecycle: State<'_, ComputeLifecycle>,
     input: SubmitServiceJobInput,
 ) -> Result<ServiceJob, ServiceConnectionError> {
     let request_id = input.client_request_id.clone();
-    queue.stage(&input).map_err(queue_service_error)?;
-    queue
-        .claim_for_worker(&request_id, "primary-worker", 300)
-        .map_err(queue_service_error)?;
-    match service.submit_job(input).await {
-        Ok(job) => {
-            queue.record_remote(&job).map_err(queue_service_error)?;
-            Ok(job)
-        }
-        Err(error) => {
-            let _ = queue.record_submit_failure(&request_id, error.code, &error.message);
-            Err(error)
+    let result = async {
+        queue.stage(&input).map_err(queue_service_error)?;
+        queue
+            .claim_for_worker(&request_id, "primary-worker", 300)
+            .map_err(queue_service_error)?;
+        match service.submit_job(input).await {
+            Ok(job) => {
+                queue.record_remote(&job).map_err(queue_service_error)?;
+                Ok(job)
+            }
+            Err(error) => {
+                let _ = queue.record_submit_failure(&request_id, error.code, &error.message);
+                Err(error)
+            }
         }
     }
+    .await;
+    if result.is_err() {
+        restart_idle_gpu_shutdown(&app, &lifecycle);
+    }
+    result
 }
 
 #[tauri::command]
 async fn get_service_job(
+    app: AppHandle,
     service: State<'_, ServiceClient>,
     queue: State<'_, JobQueueStorage>,
+    lifecycle: State<'_, ComputeLifecycle>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
     let job = service.get_job(&job_id).await?;
     queue.sync(&job).map_err(queue_service_error)?;
+    if is_terminal_service_job(&job) {
+        restart_idle_gpu_shutdown(&app, &lifecycle);
+    }
     Ok(job)
 }
 
 #[tauri::command]
 async fn cancel_service_job(
+    app: AppHandle,
     service: State<'_, ServiceClient>,
     queue: State<'_, JobQueueStorage>,
+    lifecycle: State<'_, ComputeLifecycle>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
     let job = service.cancel_job(&job_id).await?;
     queue.sync(&job).map_err(queue_service_error)?;
+    restart_idle_gpu_shutdown(&app, &lifecycle);
     Ok(job)
 }
 
@@ -1319,6 +1336,18 @@ fn get_frame_composition(
     input: GetFrameCompositionInput,
 ) -> Result<Option<FrameComposition>, FrameCompositionError> {
     storage.get(input)
+}
+
+fn restart_idle_gpu_shutdown(app: &AppHandle, lifecycle: &ComputeLifecycle) {
+    let revision = lifecycle.invalidate_idle_shutdown();
+    schedule_idle_gpu_shutdown(app.clone(), lifecycle.clone(), revision);
+}
+
+fn is_terminal_service_job(job: &ServiceJob) -> bool {
+    matches!(
+        job.status.as_str(),
+        "completed" | "failed" | "cancelled" | "interrupted"
+    )
 }
 
 #[derive(Debug, serde::Deserialize)]
