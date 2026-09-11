@@ -60,7 +60,9 @@ use std::{
     },
     time::Duration,
 };
-use storage::{CreateProjectInput, Project, ProjectStorage, StorageInfo, UpdateProjectInput};
+use storage::{
+    CreateProjectInput, Project, ProjectStatus, ProjectStorage, StorageInfo, UpdateProjectInput,
+};
 use storyboard::{
     CandidateQuality, GenerationMode, ReorderScenesInput, SceneDraft, SceneStatus, SourceReference,
     StoryboardStorage,
@@ -750,25 +752,38 @@ fn inspect_export_capability(exporter: State<'_, FfmpegExporter>) -> ExportCapab
 #[tauri::command]
 async fn export_project_video(
     exporter: State<'_, FfmpegExporter>,
+    projects: State<'_, ProjectStorage>,
     storyboard: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
     assets: State<'_, AssetStorage>,
     tts: State<'_, SystemTtsProvider>,
     input: ExportProjectInput,
 ) -> Result<ProjectExport, ExportError> {
+    let project_id = input.project_id.clone();
     let exporter = exporter.inner().clone();
     let storyboard = storyboard.inner().clone();
     let generations = generations.inner().clone();
     let assets = assets.inner().clone();
     let tts = tts.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         exporter.export(&storyboard, &generations, &assets, &tts, input)
     })
     .await
     .map_err(|error| ExportError {
         code: "EXPORT_TASK_ERROR".to_owned(),
         message: format!("导出任务异常结束：{error}"),
-    })?
+    })??;
+    let _ = projects.update_project(UpdateProjectInput {
+        id: project_id,
+        title: None,
+        audience: None,
+        clear_audience: false,
+        target_duration_sec: None,
+        clear_target_duration: false,
+        status: Some(ProjectStatus::Completed),
+        style_profile: None,
+    });
+    Ok(result)
 }
 
 #[tauri::command]

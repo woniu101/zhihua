@@ -84,7 +84,7 @@ async function duplicateProject(id: string) {
 }
 async function deleteProject(project: ZhihuaProject) {
   menuId.value = undefined;
-  if (window.confirm(`确定删除项目“${project.title}”吗？此操作只删除当前本地项目记录。`)) await store.remove(project.id);
+  if (window.confirm(`确定删除项目“${project.title}”吗？将删除该项目的本地资料、素材、候选视频和导出文件，无法撤销。`)) await store.remove(project.id);
 }
 </script>
 

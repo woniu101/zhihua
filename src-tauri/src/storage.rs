@@ -194,7 +194,9 @@ impl ProjectStorage {
     pub fn usage(&self) -> Result<StorageUsage, StorageError> {
         Ok(StorageUsage {
             project_bytes: directory_size(&self.projects_root)?,
-            database_bytes: fs::metadata(&self.database_path).map(|value| value.len()).unwrap_or(0),
+            database_bytes: fs::metadata(&self.database_path)
+                .map(|value| value.len())
+                .unwrap_or(0),
             available_bytes: fs2::available_space(&self.projects_root)?,
             total_bytes: fs2::total_space(&self.projects_root)?,
         })
