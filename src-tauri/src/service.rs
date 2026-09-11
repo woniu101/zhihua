@@ -109,7 +109,7 @@ pub struct SubmitServiceJobInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ServiceJob {
     pub id: String,
     pub client_request_id: String,
@@ -129,7 +129,7 @@ pub struct ServiceJob {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ServiceArtifactManifest {
     pub artifact_id: String,
     pub kind: String,
@@ -141,7 +141,7 @@ pub struct ServiceArtifactManifest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ServiceResultManifest {
     pub schema_version: String,
     pub job_id: String,
@@ -1114,6 +1114,47 @@ mod tests {
         ] {
             assert!(validate_base_url(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn decodes_service_result_manifest_and_serializes_it_for_the_frontend() {
+        let wire: JobWire = serde_json::from_value(serde_json::json!({
+            "id": "job-1",
+            "client_request_id": "request-1",
+            "project_id": "project-1",
+            "scene_id": "scene-1",
+            "kind": "video_candidate",
+            "workflow_id": "h3-t2v-turbo-v1",
+            "status": "completed",
+            "prompt_id": "prompt-1",
+            "progress": 1.0,
+            "error_code": null,
+            "error_message": null,
+            "status_detail": "done",
+            "created_at": "2026-09-11T00:00:00Z",
+            "updated_at": "2026-09-11T00:01:00Z",
+            "result_manifest": {
+                "schema_version": "1",
+                "job_id": "job-1",
+                "workflow_id": "h3-t2v-turbo-v1",
+                "prompt_id": "prompt-1",
+                "created_at": "2026-09-11T00:01:00Z",
+                "artifacts": [{
+                    "artifact_id": "video-0",
+                    "kind": "video",
+                    "filename": "clip.mp4",
+                    "media_type": "video/mp4",
+                    "size_bytes": 42,
+                    "sha256": "a".repeat(64),
+                    "download_path": "/api/v1/jobs/job-1/artifacts/video-0"
+                }]
+            }
+        }))
+        .expect("decode completed job");
+
+        let frontend = serde_json::to_value(ServiceJob::from(wire)).expect("serialize job");
+        assert_eq!(frontend["resultManifest"]["jobId"], "job-1");
+        assert_eq!(frontend["resultManifest"]["artifacts"][0]["sizeBytes"], 42);
     }
 
     #[test]
