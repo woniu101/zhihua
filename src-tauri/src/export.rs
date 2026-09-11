@@ -1,5 +1,6 @@
 use crate::{
     asset::AssetStorage,
+    frame_profile::{FrameAspectRatio, FrameSize},
     generation::GenerationStorage,
     storage::ProjectStorage,
     storyboard::StoryboardStorage,
@@ -62,6 +63,13 @@ pub enum SubtitleMode {
     Srt,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputRendition {
+    Candidate,
+    Enhanced1080p,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportProjectInput {
@@ -69,6 +77,8 @@ pub struct ExportProjectInput {
     pub output_directory: PathBuf,
     pub frame_rate: u32,
     pub subtitle_mode: SubtitleMode,
+    pub aspect_ratio: FrameAspectRatio,
+    pub rendition: OutputRendition,
     pub narration_volume: u32,
     pub music_asset_id: Option<String>,
     pub music_volume: u32,
@@ -84,6 +94,10 @@ pub struct ProjectExport {
     pub size_bytes: u64,
     pub sha256: String,
     pub created_at: String,
+    pub width: u32,
+    pub height: u32,
+    pub enhanced_scene_count: u32,
+    pub scaled_scene_count: u32,
 }
 
 #[derive(Clone)]
@@ -96,6 +110,7 @@ struct ExportScene {
     duration_ms: u32,
     video_path: PathBuf,
     audio_path: PathBuf,
+    uses_enhanced_source: bool,
 }
 
 impl FfmpegExporter {
@@ -172,22 +187,50 @@ impl FfmpegExporter {
                     format!("分镜“{}”尚未选择正式版本", scene.title),
                 )
             })?;
-            let final_version = generations
-                .list_finals(&input.project_id, &scene.id)
+            let candidate = generations
+                .list(&input.project_id, &scene.id)
                 .map_err(|error| ExportError::new("GENERATION_ERROR", error.message))?
                 .into_iter()
-                .rev()
-                .find(|item| item.source_candidate_id == selected_id)
+                .find(|item| item.id == selected_id)
                 .ok_or_else(|| {
                     ExportError::new(
-                        "MISSING_1080P_VERSION",
-                        format!("分镜“{}”尚未制作 1080p 成片", scene.title),
+                        "MISSING_OFFICIAL_VERSION",
+                        format!("分镜“{}”选择的正式版本不存在", scene.title),
                     )
                 })?;
-            if !final_version.local_path.is_file() {
+            let candidate_dimensions = input.aspect_ratio.profile().visible;
+            if candidate.aspect_ratio != input.aspect_ratio.label()
+                || candidate.visible_width != candidate_dimensions.width
+                || candidate.visible_height != candidate_dimensions.height
+            {
+                return Err(ExportError::new(
+                    "CANDIDATE_FRAME_MISMATCH",
+                    format!(
+                        "分镜“{}”的正式版本画幅与当前项目不一致，请按 {} 重新生成或重新选择",
+                        scene.title,
+                        input.aspect_ratio.label()
+                    ),
+                ));
+            }
+            let enhanced = if matches!(input.rendition, OutputRendition::Enhanced1080p) {
+                generations
+                    .list_enhanced(&input.project_id, &scene.id)
+                    .map_err(|error| ExportError::new("GENERATION_ERROR", error.message))?
+                    .into_iter()
+                    .rev()
+                    .find(|item| {
+                        item.source_candidate_id == selected_id && item.local_path.is_file()
+                    })
+            } else {
+                None
+            };
+            let (video_path, uses_enhanced_source) = enhanced
+                .map(|item| (item.local_path, true))
+                .unwrap_or((candidate.local_path, false));
+            if !video_path.is_file() {
                 return Err(ExportError::new(
                     "MISSING_VIDEO_FILE",
-                    format!("分镜“{}”的 1080p 文件已丢失", scene.title),
+                    format!("分镜“{}”的正式版本文件已丢失", scene.title),
                 ));
             }
             let narration = tts
@@ -225,8 +268,9 @@ impl FfmpegExporter {
             export_scenes.push(ExportScene {
                 narration: scene.narration.clone(),
                 duration_ms: scene.target_duration_ms,
-                video_path: final_version.local_path,
+                video_path,
                 audio_path: narration.local_path,
+                uses_enhanced_source,
             });
         }
         let music_path = input
@@ -290,13 +334,21 @@ impl FfmpegExporter {
         input: &ExportProjectInput,
     ) -> ExportResult<ProjectExport> {
         let mut normalized = Vec::with_capacity(scenes.len());
+        let profile = input.aspect_ratio.profile();
+        let dimensions: FrameSize = if matches!(input.rendition, OutputRendition::Enhanced1080p) {
+            profile.full_hd
+        } else {
+            profile.visible
+        };
         for (index, scene) in scenes.iter().enumerate() {
             let path = workspace.join(format!("scene-{index:03}.mp4"));
             let duration = format!("{:.3}", scene.duration_ms as f64 / 1000.0);
             let volume = format!("{:.2}", input.narration_volume as f64 / 100.0);
             let frame_rate = input.frame_rate.to_string();
             let filters = format!(
-                "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={frame_rate},tpad=stop_mode=clone:stop_duration=15,trim=duration={duration}[v];[1:a]volume={volume},apad,atrim=0:{duration}[a]"
+                "[0:v]scale={}:{}:flags=lanczos,setsar=1,fps={frame_rate},tpad=stop_mode=clone:stop_duration=15,trim=duration={duration}[v];[1:a]volume={volume},apad,atrim=0:{duration}[a]",
+                dimensions.width,
+                dimensions.height,
             );
             run_ffmpeg(&[
                 "-y",
@@ -463,6 +515,16 @@ impl FfmpegExporter {
             size_bytes: bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            width: dimensions.width,
+            height: dimensions.height,
+            enhanced_scene_count: scenes
+                .iter()
+                .filter(|scene| scene.uses_enhanced_source)
+                .count() as u32,
+            scaled_scene_count: scenes
+                .iter()
+                .filter(|scene| !scene.uses_enhanced_source)
+                .count() as u32,
         })
     }
 }
@@ -587,12 +649,14 @@ mod tests {
                 duration_ms: 5_000,
                 video_path: "a".into(),
                 audio_path: "b".into(),
+                uses_enhanced_source: false,
             },
             ExportScene {
                 narration: "第二句 <b>".into(),
                 duration_ms: 10_000,
                 video_path: "c".into(),
                 audio_path: "d".into(),
+                uses_enhanced_source: false,
             },
         ];
         let srt = build_srt(&scenes);
@@ -675,6 +739,7 @@ mod tests {
                     duration_ms: 1_000,
                     video_path: video,
                     audio_path: audio,
+                    uses_enhanced_source: false,
                 }],
                 Some(&music),
                 &ExportProjectInput {
@@ -682,6 +747,8 @@ mod tests {
                     output_directory: output.clone(),
                     frame_rate: 24,
                     subtitle_mode: SubtitleMode::BurnAndSrt,
+                    aspect_ratio: FrameAspectRatio::Landscape,
+                    rendition: OutputRendition::Enhanced1080p,
                     narration_volume: 80,
                     music_asset_id: Some("unused-in-render".into()),
                     music_volume: 60,

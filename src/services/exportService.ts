@@ -1,5 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invokeNative } from "./nativeBridge";
+import type { ConcreteAspectRatio, OutputRendition } from "../domain/frameProfiles";
+import { renditionDimensions } from "../domain/frameProfiles";
 
 export type ExportStatus = "idle" | "checking" | "blocked" | "exporting" | "succeeded" | "failed";
 
@@ -8,8 +10,8 @@ export interface ExportSettings {
   videoCodec: "H.264";
   audioCodec: "AAC";
   frameRate: 24 | 25 | 30;
-  ratio: "16:9";
-  resolution: "1920 × 1080";
+  ratio: ConcreteAspectRatio;
+  rendition: OutputRendition;
   subtitleMode: "burn-and-srt" | "burn" | "srt";
   musicAssetId: string;
   outputDirectory: string;
@@ -47,6 +49,10 @@ export interface ProjectExport {
   sizeBytes: number;
   sha256: string;
   createdAt: string;
+  width: number;
+  height: number;
+  enhancedSceneCount: number;
+  scaledSceneCount: number;
 }
 
 export const defaultExportSettings = (): ExportSettings => ({
@@ -55,7 +61,7 @@ export const defaultExportSettings = (): ExportSettings => ({
   audioCodec: "AAC",
   frameRate: 24,
   ratio: "16:9",
-  resolution: "1920 × 1080",
+  rendition: "candidate",
   subtitleMode: "burn-and-srt",
   musicAssetId: "",
   outputDirectory: "",
@@ -66,7 +72,7 @@ export function inspectIntegrity(input: IntegrityInput): IntegrityCheckItem[] {
   return [
     {
       id: "shots",
-      label: "正式 1080p 分镜",
+      label: "已选择正式版本",
       detail: `${readyCount}/${input.totalShots} 就绪`,
       passed: input.totalShots > 0 && readyCount === input.totalShots,
     },
@@ -127,6 +133,8 @@ export async function requestNativeExport(
       outputDirectory: settings.outputDirectory,
       frameRate: settings.frameRate,
       subtitleMode: settings.subtitleMode,
+      aspectRatio: settings.ratio,
+      rendition: settings.rendition,
       narrationVolume,
       musicAssetId: settings.musicAssetId || undefined,
       musicVolume,
@@ -135,4 +143,9 @@ export async function requestNativeExport(
   });
   if (!result) throw new Error("视频只能在知画桌面客户端中导出");
   return result;
+}
+
+export function exportResolution(settings: Pick<ExportSettings, "ratio" | "rendition">): string {
+  const { width, height } = renditionDimensions(settings.ratio, settings.rendition);
+  return `${width} × ${height}`;
 }

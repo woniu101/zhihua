@@ -2,10 +2,11 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, LoaderCircle, Maximize2, Music2, Pause, Play, Plus, RotateCcw, Sparkles, Star, Subtitles, Trash2, Volume2, X } from "lucide-vue-next";
 import type { GenerationJob } from "../domain/providers";
-import type { CandidateQuality, GenerationMode } from "../domain/storyboard";
+import type { AspectRatio, CandidateQuality, GenerationMode } from "../domain/storyboard";
+import { frameProfile } from "../domain/frameProfiles";
 import type { AssetItem, AssetMediaType } from "../domain/assets";
 import { assetRepository } from "../services/assetRepository";
-import { generationRepository, type CandidateVersion, type FinalVersion } from "../services/generationRepository";
+import { generationRepository, type CandidateVersion, type EnhancedVersion } from "../services/generationRepository";
 import { ComfyUiH3Provider, normalizeConnectionFailure, serviceRepository } from "../services/serviceRepository";
 import { ttsRepository, type NarrationArtifact, type SystemVoice } from "../services/ttsRepository";
 import { useStoryboardStore } from "../stores/storyboard";
@@ -15,13 +16,13 @@ const provider = new ComfyUiH3Provider();
 const task = ref<GenerationJob>();
 const referenceAssets = ref<AssetItem[]>([]);
 const candidateVersions = ref<CandidateVersion[]>([]);
-const finalVersions = ref<FinalVersion[]>([]);
+const enhancedVersions = ref<EnhancedVersion[]>([]);
 const previewVersionId = ref("");
-const previewFinalId = ref("");
+const previewEnhancedId = ref("");
 const taskError = ref("");
 const submitting = ref(false);
-const upscaling = ref(false);
-const taskKind = ref<"candidate" | "upscale">("candidate");
+const enhancing = ref(false);
+const taskKind = ref<"candidate" | "enhancement">("candidate");
 const systemVoices = ref<SystemVoice[]>([]);
 const selectedVoiceId = ref("");
 const narrationArtifact = ref<NarrationArtifact>();
@@ -51,7 +52,7 @@ const taskStatusLabel = computed(() => {
     preparing: "准备环境",
     uploading: "上传素材",
     running: "生成中",
-    upscaling: "制作 1080p",
+    upscaling: "制作 1080p 增强版",
     downloading: "下载结果",
     completed: "已完成",
     failed: "失败",
@@ -72,18 +73,28 @@ const videoAssets = computed(() => referenceAssets.value.filter((asset) => asset
 const audioAssets = computed(() => referenceAssets.value.filter((asset) => asset.mediaType === "audio"));
 const latestCandidate = <T,>(items: T[]): T | undefined => items[items.length - 1];
 const previewVersion = computed(() => candidateVersions.value.find((item) => item.id === previewVersionId.value) ?? latestCandidate(candidateVersions.value));
-const finalForOfficial = computed(() => latestCandidate(finalVersions.value.filter((item) => item.sourceCandidateId === selectedScene.value?.selectedVersionId)));
-const previewFinal = computed(() => finalVersions.value.find((item) => item.id === previewFinalId.value));
-const previewMedia = computed(() => previewFinal.value ?? previewVersion.value);
-const canSelectOfficial = computed(() => Boolean(previewVersion.value && selectedScene.value?.selectedVersionId !== previewVersion.value.id));
+const enhancedForOfficial = computed(() => latestCandidate(enhancedVersions.value.filter((item) => item.sourceCandidateId === selectedScene.value?.selectedVersionId)));
+const previewEnhanced = computed(() => enhancedVersions.value.find((item) => item.id === previewEnhancedId.value));
+const previewMedia = computed(() => previewEnhanced.value ?? previewVersion.value);
+const activeFrameProfile = computed(() => frameProfile(settings.value.aspectRatio));
+const canSelectOfficial = computed(() => Boolean(
+  previewVersion.value
+  && previewVersion.value.aspectRatio === activeFrameProfile.value.aspectRatio
+  && selectedScene.value?.selectedVersionId !== previewVersion.value.id,
+));
 const isTaskActive = computed(() => Boolean(task.value && !["completed", "failed", "cancelled", "interrupted"].includes(task.value.status)));
-const canMake1080p = computed(() => Boolean(
+const canMakeEnhancement = computed(() => Boolean(
   selectedScene.value?.selectedVersionId
   && settings.value.aspectRatio === "16:9"
   && !submitting.value
-  && !upscaling.value
+  && !enhancing.value
   && !isTaskActive.value,
 ));
+
+function setProjectAspect(event: Event) {
+  settings.value.aspectRatio = (event.target as HTMLSelectElement).value as AspectRatio;
+  previewEnhancedId.value = "";
+}
 
 async function ensureSystemVoices() {
   if (systemVoices.value.length) return;
@@ -203,17 +214,17 @@ async function loadReferenceAssets(projectId?: string) {
 async function loadCandidateVersions(projectId?: string, sceneId?: string) {
   if (!projectId || !sceneId) {
     candidateVersions.value = [];
-    finalVersions.value = [];
+    enhancedVersions.value = [];
     previewVersionId.value = "";
-    previewFinalId.value = "";
+    previewEnhancedId.value = "";
     return;
   }
   candidateVersions.value = await generationRepository.list(projectId, sceneId).catch(() => []);
-  finalVersions.value = await generationRepository.listFinals(projectId, sceneId).catch(() => []);
+  enhancedVersions.value = await generationRepository.listEnhanced(projectId, sceneId).catch(() => []);
   previewVersionId.value = selectedScene.value?.selectedVersionId
     ?? latestCandidate(candidateVersions.value)?.id
     ?? "";
-  previewFinalId.value = finalForOfficial.value?.id ?? "";
+  previewEnhancedId.value = enhancedForOfficial.value?.id ?? "";
 }
 
 function setReferenceSlot(slot: number, mediaType: AssetMediaType, event: Event) {
@@ -258,7 +269,11 @@ async function refreshTask(sceneId: string, jobId: string) {
         if (selectedSceneId.value === sceneId) {
           task.value = { ...latest, status: "downloading", progress: null, stageMessage: "正在校验并保存候选视频" };
         }
-        const downloaded = await generationRepository.downloadCompletedJob(scene.projectId, jobId);
+        const downloaded = await generationRepository.downloadCompletedJob(
+          scene.projectId,
+          jobId,
+          frameProfile(settings.value.aspectRatio),
+        );
         if (selectedSceneId.value === sceneId) {
           candidateVersions.value = await generationRepository.list(scene.projectId, sceneId);
           previewVersionId.value = latestCandidate(downloaded)?.id ?? latestCandidate(candidateVersions.value)?.id ?? "";
@@ -282,41 +297,41 @@ async function refreshTask(sceneId: string, jobId: string) {
   }
 }
 
-async function refreshUpscaleTask(sceneId: string, jobId: string, sourceCandidateId: string) {
+async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCandidateId: string) {
   clearPoll();
-  taskKind.value = "upscale";
+  taskKind.value = "enhancement";
   try {
     const latest = await provider.getStatus(jobId);
     if (selectedSceneId.value === sceneId) task.value = latest;
     const scene = scenes.value.find((item) => item.id === sceneId);
     if (latest.status === "completed" && scene) {
-      const existing = finalVersions.value.some((item) => item.jobId === jobId);
+      const existing = enhancedVersions.value.some((item) => item.jobId === jobId);
       if (!existing) {
         if (selectedSceneId.value === sceneId) {
-          task.value = { ...latest, status: "downloading", progress: null, stageMessage: "正在校验并保存 1080p 成片" };
+          task.value = { ...latest, status: "downloading", progress: null, stageMessage: "正在校验并保存 1080p 增强版" };
         }
-        const downloaded = await generationRepository.downloadCompletedUpscale(
+        const downloaded = await generationRepository.downloadCompletedEnhancement(
           scene.projectId,
           jobId,
           sourceCandidateId,
         );
         if (selectedSceneId.value === sceneId) {
-          finalVersions.value = await generationRepository.listFinals(scene.projectId, sceneId);
-          previewFinalId.value = latestCandidate(downloaded)?.id ?? finalForOfficial.value?.id ?? "";
+          enhancedVersions.value = await generationRepository.listEnhanced(scene.projectId, sceneId);
+          previewEnhancedId.value = latestCandidate(downloaded)?.id ?? enhancedForOfficial.value?.id ?? "";
           task.value = latest;
         }
       }
-      update(sceneId, { status: "approved", generationStage: "1080p 成片已就绪" });
+      update(sceneId, { status: "approved", generationStage: "1080p 增强版已就绪" });
     } else if (scene) {
       const retainsOfficial = ["failed", "cancelled", "interrupted"].includes(latest.status);
       update(sceneId, {
         status: retainsOfficial ? "approved" : "generating",
-        generationStage: latest.status === "running" ? "正在制作 1080p 成片" : latest.stageMessage,
+        generationStage: latest.status === "running" ? "正在制作 1080p 增强版" : latest.stageMessage,
       });
     }
     if (!["completed", "failed", "cancelled", "interrupted"].includes(latest.status)) {
       pollTimer = window.setTimeout(
-        () => refreshUpscaleTask(sceneId, jobId, sourceCandidateId),
+        () => refreshEnhancementTask(sceneId, jobId, sourceCandidateId),
         2500,
       );
     }
@@ -331,6 +346,10 @@ async function selectOfficialVersion() {
   const scene = selectedScene.value;
   const version = previewVersion.value;
   if (!scene || !version) return;
+  if (version.aspectRatio !== activeFrameProfile.value.aspectRatio) {
+    taskError.value = `该候选是 ${version.aspectRatio}，当前项目画幅为 ${activeFrameProfile.value.aspectRatio}，请按当前画幅重新生成。`;
+    return;
+  }
   try {
     await generationRepository.select(scene.projectId, scene.id, version.id);
     candidateVersions.value = candidateVersions.value.map((item) => ({
@@ -358,7 +377,7 @@ async function generateSelected() {
   }
   submitting.value = true;
   taskKind.value = "candidate";
-  previewFinalId.value = "";
+  previewEnhancedId.value = "";
   const requestId = scene.pendingRequestId ?? crypto.randomUUID();
   await save(scene.id, { pendingRequestId: requestId, status: "generating", generationStage: "正在提交任务" });
   try {
@@ -392,17 +411,17 @@ async function generateSelected() {
   }
 }
 
-async function make1080p() {
+async function makeEnhancement() {
   const scene = selectedScene.value;
   const source = candidateVersions.value.find((item) => item.id === scene?.selectedVersionId);
-  if (!scene || !source || upscaling.value) return;
+  if (!scene || !source || enhancing.value) return;
   taskError.value = "";
   if (settings.value.aspectRatio !== "16:9") {
-    taskError.value = "当前已验证的 SeedVR2 成片流程仅支持 16:9；其他画幅验证完成后再开放。";
+    taskError.value = "当前已验证的 SeedVR2 增强流程仅支持 16:9；其他画幅验证完成后再开放。";
     return;
   }
-  upscaling.value = true;
-  taskKind.value = "upscale";
+  enhancing.value = true;
+  taskKind.value = "enhancement";
   const requestId = scene.pendingRequestId ?? crypto.randomUUID();
   await save(scene.id, {
     pendingRequestId: requestId,
@@ -422,26 +441,26 @@ async function make1080p() {
       lastUpscaleJobId: submitted.id,
       pendingRequestId: undefined,
       status: "generating",
-      generationStage: "正在制作 1080p 成片",
+      generationStage: "正在制作 1080p 增强版",
     });
-    await refreshUpscaleTask(scene.id, submitted.id, source.id);
+    await refreshEnhancementTask(scene.id, submitted.id, source.id);
   } catch (error) {
     taskError.value = normalizeConnectionFailure(error).message;
     await save(scene.id, { status: "approved", generationStage: taskError.value });
   } finally {
-    upscaling.value = false;
+    enhancing.value = false;
   }
 }
 
 async function cancelTask() {
   const scene = selectedScene.value;
   if (!scene || !task.value) return;
-  const jobId = taskKind.value === "upscale" ? scene.lastUpscaleJobId : scene.lastJobId;
+  const jobId = taskKind.value === "enhancement" ? scene.lastUpscaleJobId : scene.lastJobId;
   if (!jobId) return;
   try {
     await provider.cancel(jobId);
-    if (taskKind.value === "upscale" && scene.selectedVersionId) {
-      await refreshUpscaleTask(scene.id, jobId, scene.selectedVersionId);
+    if (taskKind.value === "enhancement" && scene.selectedVersionId) {
+      await refreshEnhancementTask(scene.id, jobId, scene.selectedVersionId);
     } else {
       await refreshTask(scene.id, jobId);
     }
@@ -463,16 +482,16 @@ async function recoverPendingSceneJob(sceneId: string): Promise<boolean> {
       return true;
     }
     if (!queued.remoteJobId) return false;
-    const upscale = queued.kind === "video_upscale";
+    const enhancement = queued.kind === "video_upscale";
     await save(scene.id, {
       pendingRequestId: undefined,
-      lastJobId: upscale ? scene.lastJobId : queued.remoteJobId,
-      lastUpscaleJobId: upscale ? queued.remoteJobId : scene.lastUpscaleJobId,
+      lastJobId: enhancement ? scene.lastJobId : queued.remoteJobId,
+      lastUpscaleJobId: enhancement ? queued.remoteJobId : scene.lastUpscaleJobId,
       status: "generating",
       generationStage: "已从本地任务队列恢复远端任务",
     });
-    if (upscale && scene.selectedVersionId) {
-      await refreshUpscaleTask(scene.id, queued.remoteJobId, scene.selectedVersionId);
+    if (enhancement && scene.selectedVersionId) {
+      await refreshEnhancementTask(scene.id, queued.remoteJobId, scene.selectedVersionId);
     } else {
       await refreshTask(scene.id, queued.remoteJobId);
     }
@@ -494,7 +513,7 @@ watch(selectedSceneId, (sceneId) => {
     if (!scene) return;
     if (await recoverPendingSceneJob(scene.id)) return;
     if (scene.lastUpscaleJobId && scene.selectedVersionId) {
-      await refreshUpscaleTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
+      await refreshEnhancementTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
     } else if (scene.lastJobId) {
       await refreshTask(scene.id, scene.lastJobId);
     }
@@ -512,7 +531,7 @@ const confirmRemove = () => {
   <section class="page storyboard-page">
     <header class="story-head">
       <div><p class="breadcrumb">为什么会打雷？　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><span class="status-line"><span class="dot gray"></span><strong>优云智算</strong><b>无卡模式</b><span>|</span><span>提交生成时自动切换 GPU</span></span></div></div>
-      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><b>{{ settings.aspectRatio }}</b><i></i><span>成片</span><b>{{ settings.outputWidth }}×{{ settings.outputHeight }}</b><a>修改</a></div><button class="btn primary" :disabled="submitting || upscaling || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" disabled title="全片预览将在全部镜头准备完成后开放"><Play :size="18"/>预览全片</button></div>
+      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" disabled title="全片预览将在全部镜头准备完成后开放"><Play :size="18"/>预览全片</button></div>
     </header>
 
     <div class="story-workspace">
@@ -531,7 +550,7 @@ const confirmRemove = () => {
         <div class="video-card panel">
           <div class="video-preview" :class="{ 'lightning-image': !previewMedia }">
             <video v-if="previewMedia" :key="previewMedia.id" :src="previewMedia.previewUrl" controls preload="metadata"></video>
-            <span class="video-label">{{ settings.aspectRatio }} · {{ previewFinal ? '1080p 成片' : previewVersion ? previewVersion.workflowId : '候选预览' }}</span>
+            <span class="video-label">{{ settings.aspectRatio }} · {{ previewEnhanced ? '1080p 增强版' : previewVersion ? previewVersion.workflowId : '候选预览' }}</span>
             <span v-if="!previewMedia" class="timecode">等待生成</span>
             <div v-if="!previewMedia" class="caption">{{ selectedScene?.narration || '生成完成后在这里预览候选视频。' }}</div>
           </div>
@@ -539,13 +558,13 @@ const confirmRemove = () => {
         </div>
         <div class="version-row">
           <div class="version-strip">
-            <button v-for="(version,index) in candidateVersions" :key="version.id" class="version" :class="{ active: !previewFinal && previewVersion?.id === version.id }" @click="previewVersionId=version.id; previewFinalId='' "><b>V{{ index + 1 }}</b><span>{{ version.selected ? '正式版本' : '候选版本' }}</span></button>
-            <button v-if="finalForOfficial" class="version final-version" :class="{ active: previewFinal?.id === finalForOfficial.id }" @click="previewFinalId=finalForOfficial.id"><b>1080p</b><span>成片已就绪</span></button>
+            <button v-for="(version,index) in candidateVersions" :key="version.id" class="version" :class="{ active: !previewEnhanced && previewVersion?.id === version.id }" @click="previewVersionId=version.id; previewEnhancedId='' "><b>V{{ index + 1 }}</b><span>{{ version.selected ? '正式版本' : '候选版本' }}</span></button>
+            <button v-if="enhancedForOfficial" class="version final-version" :class="{ active: previewEnhanced?.id === enhancedForOfficial.id }" @click="previewEnhancedId=enhancedForOfficial.id"><b>1080p</b><span>增强版已就绪</span></button>
             <button v-if="!candidateVersions.length" class="version" disabled><b>V1</b><span>等待候选</span></button>
           </div>
-          <button class="btn" :disabled="submitting || upscaling || isTaskActive" @click="generateSelected"><Plus :size="16"/>重新生成候选</button>
+          <button class="btn" :disabled="submitting || enhancing || isTaskActive" @click="generateSelected"><Plus :size="16"/>重新生成候选</button>
           <button class="btn" :disabled="!canSelectOfficial" @click="selectOfficialVersion"><Star :size="16"/>设为正式版本</button>
-          <button class="btn primary" :disabled="!canMake1080p" :title="settings.aspectRatio === '16:9' ? '使用正式版本制作并保存 1920×1080 成片' : '当前仅开放已验证的 16:9 SeedVR2 成片流程'" @click="make1080p"><LoaderCircle v-if="upscaling" class="spin" :size="16"/>{{ finalForOfficial ? '重新制作 1080p' : upscaling ? '正在提交' : '制作 1080p 成片' }}</button>
+          <button class="btn primary" :disabled="!canMakeEnhancement" :title="settings.aspectRatio === '16:9' ? '为正式版本制作可选的 1920×1080 AI 增强文件' : '当前仅开放已验证的 16:9 SeedVR2 增强流程'" @click="makeEnhancement"><LoaderCircle v-if="enhancing" class="spin" :size="16"/>{{ enhancedForOfficial ? '重新制作 1080p 增强版' : enhancing ? '正在提交' : '制作 1080p 增强版' }}</button>
         </div>
       </section>
 
@@ -576,7 +595,7 @@ const confirmRemove = () => {
           <div class="field-head"><label class="section-label">生成设置</label><span class="warning-text">预计生成约 3 分钟</span></div>
           <div class="quality-grid"><button :class="{active:selectedScene?.quality==='fast'}" @click="setQuality('fast')"><b>快速 8 步</b><span>约 3 分钟，适合快速预览</span></button><button :class="{active:selectedScene?.quality==='high'}" @click="setQuality('high')"><b>高质量 20 步</b><span>约 5 分钟，会重新生成内容</span></button></div>
           <label class="section-label audio-label">音轨设置</label><div class="audio-setting"><span class="round filled"><Pause :size="13" fill="currentColor"/></span><div><b>不使用 H3 原生音轨</b><span>{{ narrationArtifact ? `系统旁白已生成 · ${(narrationArtifact.durationMs / 1000).toFixed(1)} 秒` : '正式旁白使用系统 TTS' }}</span></div><a>修改</a></div>
-          <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'upscale' ? '1080p 成片' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb lightning-image"></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
+          <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'enhancement' ? '1080p 增强版' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb lightning-image"></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
         </div>
       </aside>
     </div>
@@ -593,7 +612,7 @@ const confirmRemove = () => {
 </template>
 
 <style scoped>
-.storyboard-page{display:grid;grid-template-rows:90px minmax(0,1fr) 280px;gap:12px}.story-head{display:flex;align-items:center;justify-content:space-between;padding:0 4px}.breadcrumb{color:#54698e;margin-bottom:7px}.format-pill{height:49px;padding:0 14px;border:1px solid var(--line);border-radius:9px;background:#fff;display:flex;align-items:center;gap:8px;font-size:13px}.format-pill b{font-size:15px}.format-pill i{height:20px;width:1px;background:#dce4ef}.format-pill a{color:var(--blue);margin-left:3px;font-weight:700}.story-workspace{min-height:0;display:grid;grid-template-columns:345px minmax(500px,1fr) 405px;gap:14px}.shot-panel{overflow:hidden}.shot-panel .panel-head{height:50px}.shot-list{padding:0 8px}.shot-list article{height:99px;display:grid;grid-template-columns:20px 98px 1fr 39px;gap:8px;align-items:center;border-bottom:1px solid #e5ebf4;padding:8px 3px;border-radius:8px}.shot-list article.selected{border:2px solid var(--blue);background:#f1f6ff}.grab{color:#6a7c9a;font-size:20px}.shot-thumb{height:80px;border-radius:6px;position:relative}.shot-thumb b{position:absolute;top:5px;left:5px;color:#fff;background:rgba(7,19,38,.78);padding:3px 5px;border-radius:4px}.shot-copy{min-width:0}.shot-copy>strong{font-size:16px}.shot-copy p{margin:5px 0;font-size:12px;color:#617697;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.shot-copy span{font-size:12px;display:flex;align-items:center;gap:6px}.shot-copy .dot{width:8px;height:8px}.shot-copy .dot.primary{background:var(--blue)}.shot-copy .dot.warning{background:var(--orange)}.shot-copy .dot.muted{background:#9aaac1}.shot-list time{align-self:end;padding-bottom:8px;color:#657794;font-size:12px}.preview-column{min-width:0;display:flex;flex-direction:column;gap:12px}.video-card{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}.video-preview{flex:1;position:relative;min-height:280px;background:#0a1728}.video-preview video{width:100%;height:100%;object-fit:contain;background:#060d18}.video-label,.timecode{position:absolute;z-index:2;top:9px;color:#fff;background:rgba(5,16,35,.78);border-radius:5px;padding:6px 9px;font-size:12px}.video-label{left:9px}.timecode{right:9px}.caption{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);white-space:nowrap;background:rgba(3,14,29,.79);color:#fff;border-radius:5px;padding:7px 16px;font-size:19px;font-weight:650}.player{height:54px;display:flex;align-items:center;gap:13px;padding:0 16px}.player button{border:0;background:transparent;color:#142d57}.player span{color:#7082a0}.scrub,.volume{height:7px;border-radius:9px;background:#dce5f0;position:relative}.scrub{flex:1}.volume{width:62px}.scrub i,.volume i{position:absolute;height:100%;left:0;border-radius:inherit;background:var(--blue)}.version-row{height:58px;display:flex;gap:8px}.version-strip{display:flex;gap:6px;max-width:276px;overflow-x:auto}.version{width:86px;flex:0 0 86px;border:1px solid #d5e1ef;border-radius:9px;background:#fff;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;padding-left:13px}.version b{font-size:16px}.version span{font-size:11px;color:#677b9c}.version.active{border-color:var(--blue);background:#edf5ff;color:var(--blue)}.version.final-version{border-color:#8bd6b5;background:#f1fbf7;color:#11845d}.version-row>.btn{flex:1;padding:0 10px}.inspector{overflow:hidden}.inspector-tabs{height:44px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:repeat(3,1fr)}.inspector-tabs button{border:0;background:transparent;font-weight:700;font-size:15px;position:relative}.inspector-tabs .active{color:var(--blue)}.inspector-tabs .active:after{content:"";position:absolute;left:22%;right:22%;bottom:0;height:3px;background:var(--blue)}.inspector-body{height:calc(100% - 44px);overflow-y:auto;padding:13px 16px}.mode-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:9px 0 15px}.mode-grid button{height:65px;border:1px solid #d9e3f0;border-radius:7px;background:#fff;font-size:11px;color:#334b71}.mode-grid button span{display:block;font-size:19px;margin-bottom:5px}.mode-grid button.active{border-color:var(--blue);background:#edf5ff;color:var(--blue)}.field-head{display:flex;align-items:center;justify-content:space-between;margin:10px 0 7px}.field-head a{font-size:12px;color:var(--blue)}textarea{width:100%;height:73px;border:1px solid #d4dfef;border-radius:7px;resize:none;padding:11px;font-size:13px;line-height:1.6;background:#fff}.voice-row{display:flex;gap:7px}.segmented{gap:0;background:#eef3fa;border-radius:7px;padding:3px}.segmented button{height:35px;border:0;border-radius:6px;background:transparent;color:#53698d;font-size:12px}.segmented .active{background:#fff;color:var(--blue);font-weight:700}.select{flex:1;border:1px solid #d4dfef;border-radius:7px;background:#fff;display:flex;align-items:center;justify-content:center;gap:5px;font-size:12px}.round{width:38px;height:38px;border:1px solid #cfe0f5;border-radius:50%;display:grid;place-items:center;background:#fff;color:var(--blue)}.compact{min-height:38px;padding:0 8px;font-size:12px}.quality-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.quality-grid button{height:64px;border:1px solid #d8e2ef;border-radius:8px;background:#fff;text-align:left;padding:9px 12px}.quality-grid b,.quality-grid span{display:block}.quality-grid span{font-size:11px;color:#6c809f;margin-top:5px}.quality-grid .active{border-color:var(--blue);background:#eff6ff;color:var(--blue)}.audio-label{display:block;margin:13px 0 7px}.audio-setting{height:61px;border:1px solid #d8e2ef;border-radius:8px;display:flex;align-items:center;gap:10px;padding:8px 12px}.round.filled{width:27px;height:27px;background:var(--blue);color:#fff}.audio-setting>div{display:flex;flex-direction:column}.audio-setting span{font-size:11px;color:#7183a0;margin-top:3px}.audio-setting a{margin-left:auto;color:var(--blue);font-size:12px}.task-card{margin-top:16px;border:1px solid #dce5f0;border-radius:9px;padding:10px}.task-main{display:grid;grid-template-columns:72px 1fr 42px;gap:10px;align-items:center}.task-thumb{height:58px;border-radius:7px}.task-main b{font-size:12px}.task-main .progress{margin:7px 0}.task-main span{font-size:10px;color:#6c809d}.task-main>strong{color:#f25b20}.task-card footer{display:flex;gap:7px;align-items:center;border-top:1px solid #e8edf4;margin-top:9px;padding-top:8px;font-size:11px}.timeline{overflow:hidden}.timeline-toolbar{height:47px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;padding:0 18px}.timeline-toolbar>button{width:32px;height:32px;border:0;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:#fff}.shutdown{margin-left:auto;margin-right:auto;background:#e6f8ef;color:#158b60;padding:6px 12px;border-radius:7px;font-size:12px}.shutdown .dot{display:inline-block;width:8px;height:8px;margin-right:7px}.zoom{margin-left:auto}.zoom button{height:32px;border:1px solid #d6e1ef;background:#fff;border-radius:7px}.ruler{height:27px;margin-left:113px;display:flex;justify-content:space-between;align-items:end;padding:0 12px 3px;font-size:11px;color:#607598;border-bottom:1px solid #dfe7f2}.tracks{height:202px;display:grid;grid-template-columns:113px 1fr}.track-labels{display:grid;grid-template-rows:repeat(4,1fr);border-right:1px solid var(--line)}.track-labels span{display:flex;align-items:center;gap:9px;padding-left:15px;border-bottom:1px solid #e5ebf3;font-weight:700;font-size:13px}.track-content{position:relative;display:grid;grid-template-rows:repeat(4,1fr);padding:6px 8px}.video-track,.voice-track,.subtitle-track{display:flex;gap:4px;min-width:0}.video-track i,.voice-track i,.subtitle-track i{font-style:normal;flex:1;min-width:0;border-radius:6px;padding:8px;color:#fff;font-size:11px;white-space:nowrap;overflow:hidden}.voice-track i{background:#ddf4ea;color:#27886b;text-align:center}.subtitle-track i{background:#ede6ff;color:#4d45c9;text-align:center}.music-track{margin-top:3px;border-radius:6px;background:#fff1d9;color:#dc7116;padding:9px;font-size:11px;white-space:nowrap;overflow:hidden}.playhead{position:absolute;left:42%;top:0;bottom:0;width:2px;background:#ff384f}.playhead:before{content:"";position:absolute;top:-1px;left:-4px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:8px solid #ff384f}@media(max-width:1380px){.story-workspace{grid-template-columns:310px minmax(450px,1fr) 370px}.storyboard-page{grid-template-rows:84px minmax(0,1fr) 250px}.timeline{height:250px}.version-row .btn{font-size:12px}.format-pill{display:none}.shot-list article{grid-template-columns:17px 88px 1fr 34px}.shot-thumb{height:72px}.caption{font-size:16px}}
+.storyboard-page{display:grid;grid-template-rows:90px minmax(0,1fr) 280px;gap:12px}.story-head{display:flex;align-items:center;justify-content:space-between;padding:0 4px}.breadcrumb{color:#54698e;margin-bottom:7px}.format-pill{height:49px;padding:0 14px;border:1px solid var(--line);border-radius:9px;background:#fff;display:flex;align-items:center;gap:8px;font-size:13px}.format-pill b{font-size:15px}.format-pill select{border:1px solid #ccd9ea;border-radius:6px;background:#f7faff;color:#12335f;font-weight:750;padding:5px 24px 5px 8px}.format-pill i{height:20px;width:1px;background:#dce4ef}.story-workspace{min-height:0;display:grid;grid-template-columns:345px minmax(500px,1fr) 405px;gap:14px}.shot-panel{overflow:hidden}.shot-panel .panel-head{height:50px}.shot-list{padding:0 8px}.shot-list article{height:99px;display:grid;grid-template-columns:20px 98px 1fr 39px;gap:8px;align-items:center;border-bottom:1px solid #e5ebf4;padding:8px 3px;border-radius:8px}.shot-list article.selected{border:2px solid var(--blue);background:#f1f6ff}.grab{color:#6a7c9a;font-size:20px}.shot-thumb{height:80px;border-radius:6px;position:relative}.shot-thumb b{position:absolute;top:5px;left:5px;color:#fff;background:rgba(7,19,38,.78);padding:3px 5px;border-radius:4px}.shot-copy{min-width:0}.shot-copy>strong{font-size:16px}.shot-copy p{margin:5px 0;font-size:12px;color:#617697;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.shot-copy span{font-size:12px;display:flex;align-items:center;gap:6px}.shot-copy .dot{width:8px;height:8px}.shot-copy .dot.primary{background:var(--blue)}.shot-copy .dot.warning{background:var(--orange)}.shot-copy .dot.muted{background:#9aaac1}.shot-list time{align-self:end;padding-bottom:8px;color:#657794;font-size:12px}.preview-column{min-width:0;display:flex;flex-direction:column;gap:12px}.video-card{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}.video-preview{flex:1;position:relative;min-height:280px;background:#0a1728}.video-preview video{width:100%;height:100%;object-fit:contain;background:#060d18}.video-label,.timecode{position:absolute;z-index:2;top:9px;color:#fff;background:rgba(5,16,35,.78);border-radius:5px;padding:6px 9px;font-size:12px}.video-label{left:9px}.timecode{right:9px}.caption{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);white-space:nowrap;background:rgba(3,14,29,.79);color:#fff;border-radius:5px;padding:7px 16px;font-size:19px;font-weight:650}.player{height:54px;display:flex;align-items:center;gap:13px;padding:0 16px}.player button{border:0;background:transparent;color:#142d57}.player span{color:#7082a0}.scrub,.volume{height:7px;border-radius:9px;background:#dce5f0;position:relative}.scrub{flex:1}.volume{width:62px}.scrub i,.volume i{position:absolute;height:100%;left:0;border-radius:inherit;background:var(--blue)}.version-row{height:58px;display:flex;gap:8px}.version-strip{display:flex;gap:6px;max-width:276px;overflow-x:auto}.version{width:86px;flex:0 0 86px;border:1px solid #d5e1ef;border-radius:9px;background:#fff;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;padding-left:13px}.version b{font-size:16px}.version span{font-size:11px;color:#677b9c}.version.active{border-color:var(--blue);background:#edf5ff;color:var(--blue)}.version.final-version{border-color:#8bd6b5;background:#f1fbf7;color:#11845d}.version-row>.btn{flex:1;padding:0 10px}.inspector{overflow:hidden}.inspector-tabs{height:44px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:repeat(3,1fr)}.inspector-tabs button{border:0;background:transparent;font-weight:700;font-size:15px;position:relative}.inspector-tabs .active{color:var(--blue)}.inspector-tabs .active:after{content:"";position:absolute;left:22%;right:22%;bottom:0;height:3px;background:var(--blue)}.inspector-body{height:calc(100% - 44px);overflow-y:auto;padding:13px 16px}.mode-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:9px 0 15px}.mode-grid button{height:65px;border:1px solid #d9e3f0;border-radius:7px;background:#fff;font-size:11px;color:#334b71}.mode-grid button span{display:block;font-size:19px;margin-bottom:5px}.mode-grid button.active{border-color:var(--blue);background:#edf5ff;color:var(--blue)}.field-head{display:flex;align-items:center;justify-content:space-between;margin:10px 0 7px}.field-head a{font-size:12px;color:var(--blue)}textarea{width:100%;height:73px;border:1px solid #d4dfef;border-radius:7px;resize:none;padding:11px;font-size:13px;line-height:1.6;background:#fff}.voice-row{display:flex;gap:7px}.segmented{gap:0;background:#eef3fa;border-radius:7px;padding:3px}.segmented button{height:35px;border:0;border-radius:6px;background:transparent;color:#53698d;font-size:12px}.segmented .active{background:#fff;color:var(--blue);font-weight:700}.select{flex:1;border:1px solid #d4dfef;border-radius:7px;background:#fff;display:flex;align-items:center;justify-content:center;gap:5px;font-size:12px}.round{width:38px;height:38px;border:1px solid #cfe0f5;border-radius:50%;display:grid;place-items:center;background:#fff;color:var(--blue)}.compact{min-height:38px;padding:0 8px;font-size:12px}.quality-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.quality-grid button{height:64px;border:1px solid #d8e2ef;border-radius:8px;background:#fff;text-align:left;padding:9px 12px}.quality-grid b,.quality-grid span{display:block}.quality-grid span{font-size:11px;color:#6c809f;margin-top:5px}.quality-grid .active{border-color:var(--blue);background:#eff6ff;color:var(--blue)}.audio-label{display:block;margin:13px 0 7px}.audio-setting{height:61px;border:1px solid #d8e2ef;border-radius:8px;display:flex;align-items:center;gap:10px;padding:8px 12px}.round.filled{width:27px;height:27px;background:var(--blue);color:#fff}.audio-setting>div{display:flex;flex-direction:column}.audio-setting span{font-size:11px;color:#7183a0;margin-top:3px}.audio-setting a{margin-left:auto;color:var(--blue);font-size:12px}.task-card{margin-top:16px;border:1px solid #dce5f0;border-radius:9px;padding:10px}.task-main{display:grid;grid-template-columns:72px 1fr 42px;gap:10px;align-items:center}.task-thumb{height:58px;border-radius:7px}.task-main b{font-size:12px}.task-main .progress{margin:7px 0}.task-main span{font-size:10px;color:#6c809d}.task-main>strong{color:#f25b20}.task-card footer{display:flex;gap:7px;align-items:center;border-top:1px solid #e8edf4;margin-top:9px;padding-top:8px;font-size:11px}.timeline{overflow:hidden}.timeline-toolbar{height:47px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;padding:0 18px}.timeline-toolbar>button{width:32px;height:32px;border:0;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:#fff}.shutdown{margin-left:auto;margin-right:auto;background:#e6f8ef;color:#158b60;padding:6px 12px;border-radius:7px;font-size:12px}.shutdown .dot{display:inline-block;width:8px;height:8px;margin-right:7px}.zoom{margin-left:auto}.zoom button{height:32px;border:1px solid #d6e1ef;background:#fff;border-radius:7px}.ruler{height:27px;margin-left:113px;display:flex;justify-content:space-between;align-items:end;padding:0 12px 3px;font-size:11px;color:#607598;border-bottom:1px solid #dfe7f2}.tracks{height:202px;display:grid;grid-template-columns:113px 1fr}.track-labels{display:grid;grid-template-rows:repeat(4,1fr);border-right:1px solid var(--line)}.track-labels span{display:flex;align-items:center;gap:9px;padding-left:15px;border-bottom:1px solid #e5ebf3;font-weight:700;font-size:13px}.track-content{position:relative;display:grid;grid-template-rows:repeat(4,1fr);padding:6px 8px}.video-track,.voice-track,.subtitle-track{display:flex;gap:4px;min-width:0}.video-track i,.voice-track i,.subtitle-track i{font-style:normal;flex:1;min-width:0;border-radius:6px;padding:8px;color:#fff;font-size:11px;white-space:nowrap;overflow:hidden}.voice-track i{background:#ddf4ea;color:#27886b;text-align:center}.subtitle-track i{background:#ede6ff;color:#4d45c9;text-align:center}.music-track{margin-top:3px;border-radius:6px;background:#fff1d9;color:#dc7116;padding:9px;font-size:11px;white-space:nowrap;overflow:hidden}.playhead{position:absolute;left:42%;top:0;bottom:0;width:2px;background:#ff384f}.playhead:before{content:"";position:absolute;top:-1px;left:-4px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:8px solid #ff384f}@media(max-width:1380px){.story-workspace{grid-template-columns:310px minmax(450px,1fr) 370px}.storyboard-page{grid-template-rows:84px minmax(0,1fr) 250px}.timeline{height:250px}.version-row .btn{font-size:12px}.format-pill{display:none}.shot-list article{grid-template-columns:17px 88px 1fr 34px}.shot-thumb{height:72px}.caption{font-size:16px}}
 .shot-actions{display:flex;align-items:center;gap:3px}.shot-actions button{width:28px;height:28px;padding:0;border:0;border-radius:6px;display:grid;place-items:center;color:#506787;background:transparent}.shot-actions button:hover{color:var(--blue);background:#edf4ff}.shot-actions .add{width:34px;height:34px;margin-left:3px;border:1px solid #cfe0f3;background:#fff}
 .head-actions .btn:disabled,.version-row .btn:disabled,.version:disabled{opacity:.58;cursor:not-allowed}.spin{animation:spin .9s linear infinite}.task-cancel{border:0;background:transparent;color:#d6463c;display:flex;align-items:center;gap:4px;font-size:12px}.task-main .task-error{color:#c53d35}.task-main .progress i{display:block;height:100%;border-radius:inherit;background:var(--blue);transition:width .25s ease}@keyframes spin{to{transform:rotate(360deg)}}
 .empty-storyboard{height:calc(100% - 50px);padding:28px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;color:#617697}.empty-storyboard b{color:#29466f}.empty-storyboard span{max-width:245px;font-size:12px;line-height:1.6}.empty-storyboard .btn{margin-top:7px}

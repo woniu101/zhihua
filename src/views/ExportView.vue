@@ -8,6 +8,7 @@ import {
   inspectExportCapability,
   inspectIntegrity,
   requestNativeExport,
+  exportResolution,
   type ExportCapability,
   type ExportStatus,
 } from "../services/exportService";
@@ -37,6 +38,7 @@ const playhead = ref(18.4);
 const previewVolume = ref(62);
 const selectedShotId = ref("");
 const readyShotIds = ref<string[]>([]);
+const enhancedShotIds = ref<string[]>([]);
 const narrationShotIds = ref<string[]>([]);
 const narrationIssueCount = ref(0);
 const lastExportPath = ref("");
@@ -62,6 +64,7 @@ const integrityItems = computed(() => inspectIntegrity({
 const integrityPassed = computed(() => integrityItems.value.every((item) => item.passed));
 const readyCount = computed(() => integrityItems.value.find((item) => item.id === "shots")?.detail ?? "0/0 就绪");
 const estimatedSize = computed(() => estimateOutputSizeMb(totalDuration.value, settings.frameRate));
+const resolutionText = computed(() => exportResolution(settings));
 const playheadText = computed(() => formatTime(playhead.value));
 const statusTone = computed(() => exportStatus.value === "succeeded" ? "success" : exportStatus.value === "exporting" || exportStatus.value === "checking" ? "working" : "blocked");
 
@@ -94,6 +97,7 @@ function resetMix() {
 }
 function resetSettings() {
   Object.assign(settings, defaultExportSettings());
+  settings.ratio = storyboard.settings.value.aspectRatio === "auto" ? "16:9" : storyboard.settings.value.aspectRatio;
 }
 async function runChecks() {
   exportStatus.value = "checking";
@@ -103,7 +107,7 @@ async function runChecks() {
   lastCheckedAt.value = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date());
   if (!integrityPassed.value) {
     exportStatus.value = "blocked";
-    exportMessage.value = `当前仅 ${readyCount.value}，请先在分镜页为全部镜头制作正式 1080p 成片。`;
+    exportMessage.value = `当前仅 ${readyCount.value}，请先在分镜页为全部镜头选择正式版本。`;
   } else if (!capability.value.available) {
     exportStatus.value = "blocked";
     exportMessage.value = capability.value.reason;
@@ -131,7 +135,10 @@ async function beginExport() {
     );
     lastExportPath.value = result.outputPath;
     exportStatus.value = "succeeded";
-    exportMessage.value = `导出完成：${result.outputPath}`;
+    const sourceSummary = settings.rendition === "enhanced-1080p"
+      ? `增强源 ${result.enhancedSceneCount} 个，候选放大 ${result.scaledSceneCount} 个`
+      : "使用正式候选版本";
+    exportMessage.value = `导出完成（${result.width}×${result.height}，${sourceSummary}）：${result.outputPath}`;
   } catch (error) {
     exportStatus.value = "failed";
     exportMessage.value = error instanceof Error ? error.message : "导出失败。";
@@ -146,8 +153,9 @@ async function refreshProjectArtifacts() {
     ? (await assetRepository.list(projectId).catch(() => [])).filter((asset) => asset.mediaType === "audio")
     : [];
   const states = await Promise.all(scenes.value.map(async (scene) => {
-    const [finals, narration] = await Promise.all([
-      generationRepository.listFinals(scene.projectId, scene.id).catch(() => []),
+    const [candidates, enhancedVersions, narration] = await Promise.all([
+      generationRepository.list(scene.projectId, scene.id).catch(() => []),
+      generationRepository.listEnhanced(scene.projectId, scene.id).catch(() => []),
       ttsRepository.get(scene.projectId, scene.id).catch(() => undefined),
     ]);
     const narrationHash = narration
@@ -162,12 +170,16 @@ async function refreshProjectArtifacts() {
     );
     return {
       id: scene.id,
-      finalReady: Boolean(scene.selectedVersionId && finals.some((item) => item.sourceCandidateId === scene.selectedVersionId)),
+      candidateReady: Boolean(scene.selectedVersionId && candidates.some((item) => (
+        item.id === scene.selectedVersionId && item.aspectRatio === settings.ratio
+      ))),
+      enhancedReady: Boolean(scene.selectedVersionId && enhancedVersions.some((item) => item.sourceCandidateId === scene.selectedVersionId)),
       narrationReady,
       narrationIssue: Boolean(narration) && !narrationReady,
     };
   }));
-  readyShotIds.value = states.filter((item) => item.finalReady).map((item) => item.id);
+  readyShotIds.value = states.filter((item) => item.candidateReady).map((item) => item.id);
+  enhancedShotIds.value = states.filter((item) => item.enhancedReady).map((item) => item.id);
   narrationShotIds.value = states.filter((item) => item.narrationReady).map((item) => item.id);
   narrationIssueCount.value = states.filter((item) => item.narrationIssue).length;
 }
@@ -182,6 +194,7 @@ watch(mixTracks, savePreferences, { deep: true });
 onMounted(async () => {
   restorePreferences();
   await storyboard.load(true);
+  settings.ratio = storyboard.settings.value.aspectRatio === "auto" ? "16:9" : storyboard.settings.value.aspectRatio;
   selectedShotId.value = scenes.value[0]?.id ?? "";
   playhead.value = Math.min(playhead.value, totalDuration.value);
   await runChecks();
@@ -196,7 +209,7 @@ onMounted(async () => {
     </header>
     <div class="export-layout">
       <section class="export-left">
-        <div class="panel full-preview"><div class="export-video lightning-image"><span>1920 × 1080　16:9</span><time>{{ playheadText }} / {{ totalDurationText }}</time><div class="caption">{{ selectedShot?.narration || '等待项目分镜' }}</div></div><div class="player"><button aria-label="播放或暂停" @click="playing=!playing"><Pause v-if="playing" :size="20" fill="currentColor"/><Play v-else :size="20" fill="currentColor"/></button><span>Ⅰ◀</span><span>▶Ⅰ</span><b>{{ playheadText }}</b><span>/ {{ totalDurationText }}</span><input v-model.number="playhead" class="native-range scrub-range" type="range" min="0" :max="totalDuration" step="0.1"/><Volume2 :size="19"/><input v-model.number="previewVolume" aria-label="预览音量" class="native-range volume-range" type="range" min="0" max="100"/><Maximize2 :size="18"/></div></div>
+        <div class="panel full-preview"><div class="export-video lightning-image"><span>{{ resolutionText }}　{{ settings.ratio }}</span><time>{{ playheadText }} / {{ totalDurationText }}</time><div class="caption">{{ selectedShot?.narration || '等待项目分镜' }}</div></div><div class="player"><button aria-label="播放或暂停" @click="playing=!playing"><Pause v-if="playing" :size="20" fill="currentColor"/><Play v-else :size="20" fill="currentColor"/></button><span>Ⅰ◀</span><span>▶Ⅰ</span><b>{{ playheadText }}</b><span>/ {{ totalDurationText }}</span><input v-model.number="playhead" class="native-range scrub-range" type="range" min="0" :max="totalDuration" step="0.1"/><Volume2 :size="19"/><input v-model.number="previewVolume" aria-label="预览音量" class="native-range volume-range" type="range" min="0" max="100"/><Maximize2 :size="18"/></div></div>
         <div class="shot-strip"><article v-for="(shot,index) in scenes" :key="shot.id" :class="{active:selectedShotId===shot.id}" @click="selectedShotId=shot.id"><div class="lightning-image"><b>{{ String(index+1).padStart(2,'0') }}</b><time>{{ shot.targetDurationMs / 1000 }}秒</time></div><span>{{ shot.title }}</span></article><p v-if="!scenes.length" class="empty-export">当前项目还没有分镜</p></div>
         <div class="panel mix-panel"><div class="panel-head"><h2>音频混音</h2><button class="btn" @click="resetMix">恢复默认</button></div><div class="mix-row" v-for="track in mixTracks" :key="track.name"><span class="mix-icon">{{ track.icon }}</span><b>{{ track.name }}</b><input v-model.number="track.volume" :aria-label="`${track.name}音量`" class="native-range" type="range" min="0" max="100" :disabled="track.muted || track.name==='环境音'"/><span>{{ track.name==='环境音' ? '暂未启用' : track.muted ? '静音' : `${track.volume}%` }}</span><button class="mute-button" :disabled="track.name==='环境音'" :aria-label="`${track.name}${track.muted?'取消静音':'静音'}`" @click="track.muted=!track.muted"><VolumeX v-if="track.muted" :size="17"/><Volume2 v-else :size="17"/></button><label><input v-model="track.fade" type="checkbox" :disabled="track.name==='环境音'"/> 应用淡入淡出</label></div></div>
         <div class="panel final-timeline"><div class="panel-head"><h3>最终检查时间线</h3><span>{{ playheadText }}　　　　　　　　　总时长 {{ totalDurationText }}</span></div><div class="final-track"><i v-for="(shot,index) in scenes" :key="shot.id" :class="{notReady:!readyShotIds.includes(shot.id)}">{{ String(index+1).padStart(2,'0') }}<X v-if="!readyShotIds.includes(shot.id)" :size="12"/></i><span class="marker" :style="{left:`${totalDuration ? playhead/totalDuration*100 : 0}%`}"></span></div><div class="ticks"><span>0:00</span><span>25%</span><span>50%</span><span>75%</span><span>{{ totalDurationText }}</span></div></div>
@@ -204,8 +217,8 @@ onMounted(async () => {
 
       <aside class="export-right">
         <section class="panel checklist"><div class="panel-head"><h2><span class="check-big" :class="{failed:!integrityPassed}"><Check v-if="integrityPassed" :size="17"/><AlertTriangle v-else :size="16"/></span>完整性检查</h2><b :class="integrityPassed?'success-text':'warning-text'">{{ integrityPassed ? '全部通过' : '存在阻塞项' }}</b></div><p v-for="item in integrityItems" :key="item.id" :class="{failed:!item.passed}"><span class="check"><Check v-if="item.passed" :size="15"/><X v-else :size="15"/></span><b>{{ item.label }}</b><span>{{ item.detail }}</span></p><small v-if="lastCheckedAt">最近检查 {{ lastCheckedAt }}</small></section>
-        <section class="panel export-info"><div class="panel-head"><h2>导出信息</h2><b class="capability-badge" :class="{available:capability.available}">{{ capability.label }}</b></div><div><article><Monitor :size="31"/><span>分辨率</span><b>{{ settings.resolution }}</b><small>{{ settings.ratio }}</small></article><article><Clock3 :size="31"/><span>总时长</span><b>{{ totalDuration }} 秒</b></article><article><FileVideo2 :size="31"/><span>预计文件大小</span><b>约 {{ estimatedSize }} MB</b></article></div></section>
-        <section class="panel export-settings"><div class="panel-head"><h2>导出设置</h2><button class="btn" @click="resetSettings">恢复默认</button></div><div class="settings-list"><label><FileVideo2 :size="18"/><span>导出格式</span><select v-model="settings.videoCodec"><option value="H.264">MP4 · H.264（通用，推荐）</option></select></label><label><Music2 :size="18"/><span>背景音乐</span><select v-model="settings.musicAssetId"><option value="">不添加背景音乐</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label><label><Monitor :size="18"/><span>帧率</span><select v-model.number="settings.frameRate"><option :value="24">24 fps（电影感）</option><option :value="25">25 fps</option><option :value="30">30 fps（更流畅）</option></select></label><label><Monitor :size="18"/><span>画面比例</span><select v-model="settings.ratio"><option value="16:9">16:9（1920 × 1080）</option></select></label><label><Subtitles :size="18"/><span>字幕处理</span><select v-model="settings.subtitleMode"><option value="burn-and-srt">嵌入画面并保存 SRT</option><option value="burn">仅嵌入画面</option><option value="srt">仅保存 SRT</option></select></label><label class="path-row"><FolderOpen :size="18"/><span>保存位置</span><input v-model.trim="settings.outputDirectory" placeholder="留空保存到项目 exports 目录" aria-label="导出保存位置"/><button type="button" @click="browseOutputDirectory">浏览</button></label></div><button class="btn primary export-btn" :disabled="exportStatus==='checking'||exportStatus==='exporting'" @click="beginExport"><Upload :size="20"/>{{ exportStatus==='exporting' ? '正在导出' : '导出 MP4' }}</button><div class="export-state" :class="statusTone"><b>{{ capability.available ? (integrityPassed ? '可执行导出' : '等待分镜就绪') : 'FFmpeg 不可用' }}</b><span>{{ capability.available ? exportMessage : capability.reason }}</span></div><small>{{ lastExportPath ? `最近导出：${lastExportPath}` : '导出参数和音量设置会自动保存在本机。' }}</small></section>
+        <section class="panel export-info"><div class="panel-head"><h2>导出信息</h2><b class="capability-badge" :class="{available:capability.available}">{{ capability.label }}</b></div><div><article><Monitor :size="31"/><span>分辨率</span><b>{{ resolutionText }}</b><small>{{ settings.ratio }}</small></article><article><Clock3 :size="31"/><span>总时长</span><b>{{ totalDuration }} 秒</b></article><article><FileVideo2 :size="31"/><span>预计文件大小</span><b>约 {{ estimatedSize }} MB</b></article></div></section>
+        <section class="panel export-settings"><div class="panel-head"><h2>导出设置</h2><button class="btn" @click="resetSettings">恢复默认</button></div><div class="settings-list"><label><FileVideo2 :size="18"/><span>导出格式</span><select v-model="settings.videoCodec"><option value="H.264">MP4 · H.264（通用，推荐）</option></select></label><label><Monitor :size="18"/><span>输出清晰度</span><select v-model="settings.rendition"><option value="candidate">候选原清晰度（快速）</option><option value="enhanced-1080p">1080p（优先增强版，缺失时高质量放大）</option></select></label><label><Music2 :size="18"/><span>背景音乐</span><select v-model="settings.musicAssetId"><option value="">不添加背景音乐</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label><label><Monitor :size="18"/><span>帧率</span><select v-model.number="settings.frameRate"><option :value="24">24 fps（电影感）</option><option :value="25">25 fps</option><option :value="30">30 fps（更流畅）</option></select></label><label><Monitor :size="18"/><span>项目画幅</span><select :value="settings.ratio" disabled title="项目画幅请在分镜页修改"><option :value="settings.ratio">{{ settings.ratio }}（跟随项目）</option></select></label><label><Subtitles :size="18"/><span>字幕处理</span><select v-model="settings.subtitleMode"><option value="burn-and-srt">嵌入画面并保存 SRT</option><option value="burn">仅嵌入画面</option><option value="srt">仅保存 SRT</option></select></label><label class="path-row"><FolderOpen :size="18"/><span>保存位置</span><input v-model.trim="settings.outputDirectory" placeholder="留空保存到项目 exports 目录" aria-label="导出保存位置"/><button type="button" @click="browseOutputDirectory">浏览</button></label></div><button class="btn primary export-btn" :disabled="exportStatus==='checking'||exportStatus==='exporting'" @click="beginExport"><Upload :size="20"/>{{ exportStatus==='exporting' ? '正在导出' : '导出 MP4' }}</button><div class="export-state" :class="statusTone"><b>{{ capability.available ? (integrityPassed ? '可执行导出' : '等待分镜就绪') : 'FFmpeg 不可用' }}</b><span>{{ settings.rendition === 'enhanced-1080p' ? `已有 ${enhancedShotIds.length}/${scenes.length} 个镜头具备 AI 增强版；其余将从正式候选高质量放大。` : (capability.available ? exportMessage : capability.reason) }}</span></div><small>{{ lastExportPath ? `最近导出：${lastExportPath}` : '正式内容版本与输出清晰度相互独立，可随时重新导出。' }}</small></section>
       </aside>
     </div>
   </section>

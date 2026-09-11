@@ -1,5 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { invokeNative } from "./nativeBridge";
+import type { FrameProfile } from "../domain/frameProfiles";
 
 export interface CandidateVersion {
   id: string;
@@ -17,9 +18,16 @@ export interface CandidateVersion {
   sha256: string;
   selected: boolean;
   createdAt: string;
+  aspectRatio: string;
+  workWidth: number;
+  workHeight: number;
+  visibleWidth: number;
+  visibleHeight: number;
+  cropX: number;
+  cropY: number;
 }
 
-export interface FinalVersion {
+export interface EnhancedVersion {
   id: string;
   projectId: string;
   sceneId: string;
@@ -38,7 +46,7 @@ export interface FinalVersion {
 }
 
 interface NativeCandidateVersion extends Omit<CandidateVersion, "previewUrl"> {}
-interface NativeFinalVersion extends Omit<FinalVersion, "previewUrl"> {}
+interface NativeEnhancedVersion extends Omit<EnhancedVersion, "previewUrl"> {}
 
 function fromNative(value: NativeCandidateVersion): CandidateVersion {
   return {
@@ -47,7 +55,7 @@ function fromNative(value: NativeCandidateVersion): CandidateVersion {
   };
 }
 
-function finalFromNative(value: NativeFinalVersion): FinalVersion {
+function enhancedFromNative(value: NativeEnhancedVersion): EnhancedVersion {
   return {
     ...value,
     previewUrl: convertFileSrc(value.localPath),
@@ -63,10 +71,22 @@ export const generationRepository = {
     return result?.map(fromNative) ?? [];
   },
 
-  async downloadCompletedJob(projectId: string, jobId: string): Promise<CandidateVersion[]> {
+  async downloadCompletedJob(projectId: string, jobId: string, profile: FrameProfile): Promise<CandidateVersion[]> {
     const result = await invokeNative<NativeCandidateVersion[]>(
       "download_completed_job",
-      { input: { projectId, jobId } },
+      {
+        input: {
+          projectId,
+          jobId,
+          aspectRatio: profile.aspectRatio,
+          workWidth: profile.workWidth,
+          workHeight: profile.workHeight,
+          visibleWidth: profile.visibleWidth,
+          visibleHeight: profile.visibleHeight,
+          cropX: profile.cropX,
+          cropY: profile.cropY,
+        },
+      },
     );
     return result?.map(fromNative) ?? [];
   },
@@ -80,23 +100,23 @@ export const generationRepository = {
     return fromNative(result);
   },
 
-  async listFinals(projectId: string, sceneId: string): Promise<FinalVersion[]> {
-    const result = await invokeNative<NativeFinalVersion[]>(
-      "list_final_versions",
+  async listEnhanced(projectId: string, sceneId: string): Promise<EnhancedVersion[]> {
+    const result = await invokeNative<NativeEnhancedVersion[]>(
+      "list_enhanced_versions",
       { input: { projectId, sceneId } },
     );
-    return result?.map(finalFromNative) ?? [];
+    return result?.map(enhancedFromNative) ?? [];
   },
 
-  async downloadCompletedUpscale(
+  async downloadCompletedEnhancement(
     projectId: string,
     jobId: string,
     sourceCandidateId: string,
-  ): Promise<FinalVersion[]> {
-    const result = await invokeNative<NativeFinalVersion[]>(
-      "download_completed_upscale",
+  ): Promise<EnhancedVersion[]> {
+    const result = await invokeNative<NativeEnhancedVersion[]>(
+      "download_completed_enhancement",
       { input: { projectId, jobId, sourceCandidateId } },
     );
-    return result?.map(finalFromNative) ?? [];
+    return result?.map(enhancedFromNative) ?? [];
   },
 };

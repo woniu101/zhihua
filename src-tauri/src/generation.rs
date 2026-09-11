@@ -1,4 +1,4 @@
-use crate::storage::ProjectStorage;
+use crate::{frame_profile::FrameAspectRatio, storage::ProjectStorage};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -46,11 +46,18 @@ pub struct CandidateVersion {
     pub sha256: String,
     pub selected: bool,
     pub created_at: String,
+    pub aspect_ratio: String,
+    pub work_width: u32,
+    pub work_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub crop_x: u32,
+    pub crop_y: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FinalVersion {
+pub struct EnhancedVersion {
     pub id: String,
     pub project_id: String,
     pub scene_id: String,
@@ -80,10 +87,17 @@ pub struct RecordCandidateInput {
     pub local_path: PathBuf,
     pub size_bytes: u64,
     pub sha256: String,
+    pub aspect_ratio: String,
+    pub work_width: u32,
+    pub work_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub crop_x: u32,
+    pub crop_y: u32,
 }
 
 #[derive(Clone, Debug)]
-pub struct RecordFinalInput {
+pub struct RecordEnhancedInput {
     pub project_id: String,
     pub scene_id: String,
     pub source_candidate_id: String,
@@ -134,7 +148,18 @@ impl GenerationStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_candidate_versions_scene
                 ON candidate_versions(project_id, scene_id, created_at DESC);
-            CREATE TABLE IF NOT EXISTS final_versions (
+            CREATE TABLE IF NOT EXISTS candidate_frame_profiles (
+                candidate_id   TEXT PRIMARY KEY NOT NULL,
+                aspect_ratio   TEXT NOT NULL,
+                work_width     INTEGER NOT NULL,
+                work_height    INTEGER NOT NULL,
+                visible_width  INTEGER NOT NULL,
+                visible_height INTEGER NOT NULL,
+                crop_x         INTEGER NOT NULL,
+                crop_y         INTEGER NOT NULL,
+                FOREIGN KEY(candidate_id) REFERENCES candidate_versions(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS enhanced_versions (
                 id                  TEXT PRIMARY KEY NOT NULL,
                 project_id          TEXT NOT NULL,
                 scene_id            TEXT NOT NULL,
@@ -153,8 +178,8 @@ impl GenerationStorage {
                 FOREIGN KEY(source_candidate_id) REFERENCES candidate_versions(id),
                 UNIQUE(job_id, artifact_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_final_versions_scene
-                ON final_versions(project_id, scene_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_enhanced_versions_scene
+                ON enhanced_versions(project_id, scene_id, created_at DESC);
             ",
             )
             .map_err(database_error)?;
@@ -186,12 +211,14 @@ impl GenerationStorage {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
-                        artifact_id, filename, media_type, local_path, size_bytes,
-                        sha256, selected, created_at
-                 FROM candidate_versions
-                 WHERE project_id = ?1 AND scene_id = ?2
-                 ORDER BY created_at ASC, id ASC",
+                "SELECT c.id, c.project_id, c.scene_id, c.job_id, c.workflow_id, c.prompt_id,
+                        c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
+                        c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
+                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
+                 FROM candidate_versions c
+                 JOIN candidate_frame_profiles f ON f.candidate_id = c.id
+                 WHERE c.project_id = ?1 AND c.scene_id = ?2
+                 ORDER BY c.created_at ASC, c.id ASC",
             )
             .map_err(database_error)?;
         let rows = statement
@@ -200,11 +227,11 @@ impl GenerationStorage {
         rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
     }
 
-    pub fn list_finals(
+    pub fn list_enhanced(
         &self,
         project_id: &str,
         scene_id: &str,
-    ) -> GenerationResult<Vec<FinalVersion>> {
+    ) -> GenerationResult<Vec<EnhancedVersion>> {
         self.project_storage
             .get_project(project_id)
             .map_err(|error| GenerationError::new("project_unavailable", error.to_string()))?;
@@ -214,13 +241,13 @@ impl GenerationStorage {
                 "SELECT id, project_id, scene_id, source_candidate_id, job_id,
                         workflow_id, prompt_id, artifact_id, filename, media_type,
                         local_path, size_bytes, sha256, created_at
-                 FROM final_versions
+                 FROM enhanced_versions
                  WHERE project_id = ?1 AND scene_id = ?2
                  ORDER BY created_at ASC, id ASC",
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map(params![project_id, scene_id], final_from_row)
+            .query_map(params![project_id, scene_id], enhanced_from_row)
             .map_err(database_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
     }
@@ -235,10 +262,27 @@ impl GenerationStorage {
                 "候选视频尚未完整保存到项目目录",
             ));
         }
+        let profile = FrameAspectRatio::from_label(&input.aspect_ratio)
+            .map(FrameAspectRatio::profile)
+            .ok_or_else(|| GenerationError::new("invalid_frame_profile", "候选视频画幅无效"))?;
+        if input.aspect_ratio != profile.aspect_ratio.label()
+            || input.work_width != profile.work.width
+            || input.work_height != profile.work.height
+            || input.visible_width != profile.visible.width
+            || input.visible_height != profile.visible.height
+            || input.crop_x != profile.crop_x
+            || input.crop_y != profile.crop_y
+        {
+            return Err(GenerationError::new(
+                "invalid_frame_profile",
+                "候选视频尺寸与知画画幅契约不一致",
+            ));
+        }
         let id = Uuid::new_v4().to_string();
         let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let connection = self.connection()?;
-        connection
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction
             .execute(
                 "INSERT INTO candidate_versions (
                     id, project_id, scene_id, job_id, workflow_id, prompt_id,
@@ -266,6 +310,40 @@ impl GenerationStorage {
                 ],
             )
             .map_err(database_error)?;
+        let candidate_id: String = transaction
+            .query_row(
+                "SELECT id FROM candidate_versions WHERE job_id = ?1 AND artifact_id = ?2",
+                params![input.job_id, input.artifact_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO candidate_frame_profiles (
+                    candidate_id, aspect_ratio, work_width, work_height,
+                    visible_width, visible_height, crop_x, crop_y
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(candidate_id) DO UPDATE SET
+                    aspect_ratio=excluded.aspect_ratio,
+                    work_width=excluded.work_width,
+                    work_height=excluded.work_height,
+                    visible_width=excluded.visible_width,
+                    visible_height=excluded.visible_height,
+                    crop_x=excluded.crop_x,
+                    crop_y=excluded.crop_y",
+                params![
+                    candidate_id,
+                    input.aspect_ratio,
+                    input.work_width,
+                    input.work_height,
+                    input.visible_width,
+                    input.visible_height,
+                    input.crop_x,
+                    input.crop_y,
+                ],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
         self.find_by_job_artifact(&input.job_id, &input.artifact_id)
     }
 
@@ -315,10 +393,13 @@ impl GenerationStorage {
     pub fn find(&self, id: &str) -> GenerationResult<CandidateVersion> {
         self.connection()?
             .query_row(
-                "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
-                        artifact_id, filename, media_type, local_path, size_bytes,
-                        sha256, selected, created_at
-                 FROM candidate_versions WHERE id = ?1",
+                "SELECT c.id, c.project_id, c.scene_id, c.job_id, c.workflow_id, c.prompt_id,
+                        c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
+                        c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
+                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
+                 FROM candidate_versions c
+                 JOIN candidate_frame_profiles f ON f.candidate_id = c.id
+                 WHERE c.id = ?1",
                 [id],
                 candidate_from_row,
             )
@@ -332,17 +413,20 @@ impl GenerationStorage {
     ) -> GenerationResult<CandidateVersion> {
         self.connection()?
             .query_row(
-                "SELECT id, project_id, scene_id, job_id, workflow_id, prompt_id,
-                        artifact_id, filename, media_type, local_path, size_bytes,
-                        sha256, selected, created_at
-                 FROM candidate_versions WHERE job_id = ?1 AND artifact_id = ?2",
+                "SELECT c.id, c.project_id, c.scene_id, c.job_id, c.workflow_id, c.prompt_id,
+                        c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
+                        c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
+                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
+                 FROM candidate_versions c
+                 JOIN candidate_frame_profiles f ON f.candidate_id = c.id
+                 WHERE c.job_id = ?1 AND c.artifact_id = ?2",
                 params![job_id, artifact_id],
                 candidate_from_row,
             )
             .map_err(database_error)
     }
 
-    pub fn record_final(&self, input: RecordFinalInput) -> GenerationResult<FinalVersion> {
+    pub fn record_enhanced(&self, input: RecordEnhancedInput) -> GenerationResult<EnhancedVersion> {
         self.project_storage
             .get_project(&input.project_id)
             .map_err(|error| GenerationError::new("project_unavailable", error.to_string()))?;
@@ -350,19 +434,19 @@ impl GenerationStorage {
         if source.project_id != input.project_id || source.scene_id != input.scene_id {
             return Err(GenerationError::new(
                 "source_candidate_mismatch",
-                "1080p 成片的来源候选不属于当前分镜",
+                "1080p 增强版的来源候选不属于当前分镜",
             ));
         }
         if !source.selected {
             return Err(GenerationError::new(
                 "source_candidate_not_selected",
-                "只有正式版本才能制作 1080p 成片",
+                "只有正式版本才能制作 1080p 增强版",
             ));
         }
         if !input.local_path.is_absolute() || !input.local_path.is_file() {
             return Err(GenerationError::new(
-                "final_file_unavailable",
-                "1080p 成片尚未完整保存到项目目录",
+                "enhanced_file_unavailable",
+                "1080p 增强版尚未完整保存到项目目录",
             ));
         }
         let id = Uuid::new_v4().to_string();
@@ -370,7 +454,7 @@ impl GenerationStorage {
         let connection = self.connection()?;
         connection
             .execute(
-                "INSERT INTO final_versions (
+                "INSERT INTO enhanced_versions (
                     id, project_id, scene_id, source_candidate_id, job_id,
                     workflow_id, prompt_id, artifact_id, filename, media_type,
                     local_path, size_bytes, sha256, created_at
@@ -397,22 +481,22 @@ impl GenerationStorage {
                 ],
             )
             .map_err(database_error)?;
-        self.find_final_by_job_artifact(&input.job_id, &input.artifact_id)
+        self.find_enhanced_by_job_artifact(&input.job_id, &input.artifact_id)
     }
 
-    fn find_final_by_job_artifact(
+    fn find_enhanced_by_job_artifact(
         &self,
         job_id: &str,
         artifact_id: &str,
-    ) -> GenerationResult<FinalVersion> {
+    ) -> GenerationResult<EnhancedVersion> {
         self.connection()?
             .query_row(
                 "SELECT id, project_id, scene_id, source_candidate_id, job_id,
                         workflow_id, prompt_id, artifact_id, filename, media_type,
                         local_path, size_bytes, sha256, created_at
-                 FROM final_versions WHERE job_id = ?1 AND artifact_id = ?2",
+                 FROM enhanced_versions WHERE job_id = ?1 AND artifact_id = ?2",
                 params![job_id, artifact_id],
-                final_from_row,
+                enhanced_from_row,
             )
             .map_err(database_error)
     }
@@ -434,11 +518,18 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateVers
         sha256: row.get(11)?,
         selected: row.get(12)?,
         created_at: row.get(13)?,
+        aspect_ratio: row.get(14)?,
+        work_width: row.get(15)?,
+        work_height: row.get(16)?,
+        visible_width: row.get(17)?,
+        visible_height: row.get(18)?,
+        crop_x: row.get(19)?,
+        crop_y: row.get(20)?,
     })
 }
 
-fn final_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FinalVersion> {
-    Ok(FinalVersion {
+fn enhanced_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnhancedVersion> {
+    Ok(EnhancedVersion {
         id: row.get(0)?,
         project_id: row.get(1)?,
         scene_id: row.get(2)?,
@@ -530,6 +621,13 @@ mod tests {
                 local_path: path,
                 size_bytes: 5,
                 sha256: "a".repeat(64),
+                aspect_ratio: "16:9".to_owned(),
+                work_width: 1344,
+                work_height: 768,
+                visible_width: 1344,
+                visible_height: 756,
+                crop_x: 0,
+                crop_y: 6,
             })
             .expect("record");
         storage
@@ -543,11 +641,11 @@ mod tests {
             Some(candidate.id.clone())
         );
 
-        let final_path = project.project_dir.join("cache/final/clip-1080p.mp4");
-        std::fs::create_dir_all(final_path.parent().unwrap()).expect("final directory");
-        std::fs::write(&final_path, b"upscaled-video").expect("final video");
-        let final_version = storage
-            .record_final(RecordFinalInput {
+        let enhanced_path = project.project_dir.join("cache/enhanced/clip-1080p.mp4");
+        std::fs::create_dir_all(enhanced_path.parent().unwrap()).expect("enhanced directory");
+        std::fs::write(&enhanced_path, b"upscaled-video").expect("enhanced video");
+        let enhanced_version = storage
+            .record_enhanced(RecordEnhancedInput {
                 project_id: project.id.clone(),
                 scene_id: scene.id.clone(),
                 source_candidate_id: candidate.id.clone(),
@@ -557,15 +655,15 @@ mod tests {
                 artifact_id: "video-1080p".to_owned(),
                 filename: "clip-1080p.mp4".to_owned(),
                 media_type: "video/mp4".to_owned(),
-                local_path: final_path.clone(),
+                local_path: enhanced_path.clone(),
                 size_bytes: 14,
                 sha256: "b".repeat(64),
             })
-            .expect("record final");
-        assert_eq!(final_version.source_candidate_id, candidate.id);
+            .expect("record enhanced");
+        assert_eq!(enhanced_version.source_candidate_id, candidate.id);
         assert_eq!(storage.list(&project.id, &scene.id).unwrap().len(), 1);
-        let finals = storage.list_finals(&project.id, &scene.id).unwrap();
-        assert_eq!(finals.len(), 1);
-        assert_eq!(finals[0].local_path, final_path);
+        let enhanced = storage.list_enhanced(&project.id, &scene.id).unwrap();
+        assert_eq!(enhanced.len(), 1);
+        assert_eq!(enhanced[0].local_path, enhanced_path);
     }
 }

@@ -3,6 +3,7 @@ mod comp_share;
 mod compute_pool;
 mod deepseek;
 mod export;
+mod frame_profile;
 mod generation;
 mod job_queue;
 mod service;
@@ -30,8 +31,8 @@ use deepseek::{
 };
 use export::{ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, ProjectExport};
 use generation::{
-    CandidateVersion, FinalVersion, GenerationError, GenerationStorage, RecordCandidateInput,
-    RecordFinalInput,
+    CandidateVersion, EnhancedVersion, GenerationError, GenerationStorage, RecordCandidateInput,
+    RecordEnhancedInput,
 };
 use job_queue::{JobQueueError, JobQueueStorage, LocalJob};
 use service::{
@@ -66,6 +67,13 @@ use tts::{
 struct DownloadCompletedJobInput {
     project_id: String,
     job_id: String,
+    aspect_ratio: String,
+    work_width: u32,
+    work_height: u32,
+    visible_width: u32,
+    visible_height: u32,
+    crop_x: u32,
+    crop_y: u32,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -882,11 +890,11 @@ fn list_candidate_versions(
 }
 
 #[tauri::command]
-fn list_final_versions(
+fn list_enhanced_versions(
     storage: State<'_, GenerationStorage>,
     input: CandidateVersionsInput,
-) -> Result<Vec<FinalVersion>, GenerationError> {
-    storage.list_finals(&input.project_id, &input.scene_id)
+) -> Result<Vec<EnhancedVersion>, GenerationError> {
+    storage.list_enhanced(&input.project_id, &input.scene_id)
 }
 
 #[tauri::command]
@@ -987,6 +995,13 @@ async fn download_completed_job(
                     local_path: downloaded.destination_path.into(),
                     size_bytes: downloaded.size_bytes,
                     sha256: downloaded.sha256,
+                    aspect_ratio: input.aspect_ratio.clone(),
+                    work_width: input.work_width,
+                    work_height: input.work_height,
+                    visible_width: input.visible_width,
+                    visible_height: input.visible_height,
+                    crop_x: input.crop_x,
+                    crop_y: input.crop_y,
                 })
                 .map_err(|error| error.message)?,
         );
@@ -1000,7 +1015,7 @@ async fn download_completed_job(
 }
 
 #[tauri::command]
-async fn download_completed_upscale(
+async fn download_completed_enhancement(
     app: AppHandle,
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
@@ -1009,7 +1024,7 @@ async fn download_completed_upscale(
     service: State<'_, ServiceClient>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: DownloadCompletedUpscaleInput,
-) -> Result<Vec<FinalVersion>, String> {
+) -> Result<Vec<EnhancedVersion>, String> {
     let project = projects
         .get_project(&input.project_id)
         .map_err(|error| error.to_string())?;
@@ -1017,35 +1032,35 @@ async fn download_completed_upscale(
         .find(&input.source_candidate_id)
         .map_err(|error| error.message)?;
     if source.project_id != project.id || !source.selected {
-        return Err("1080p 任务的来源不是当前项目的正式版本。".to_owned());
+        return Err("1080p 增强任务的来源不是当前项目的正式版本。".to_owned());
     }
     let scene = storyboards
         .list(&project.id)
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|scene| scene.id == source.scene_id)
-        .ok_or_else(|| "1080p 任务对应的本地分镜不存在。".to_owned())?;
+        .ok_or_else(|| "1080p 增强任务对应的本地分镜不存在。".to_owned())?;
     if scene.selected_version_id.as_deref() != Some(source.id.as_str()) {
-        return Err("正式版本已经变化，已停止保存旧任务的 1080p 成片。".to_owned());
+        return Err("正式版本已经变化，已停止保存旧任务的 1080p 增强版。".to_owned());
     }
     let job = service
         .get_job(&input.job_id)
         .await
         .map_err(|error| error.message)?;
     if job.project_id != project.id || job.scene_id != scene.id || job.kind != "video_upscale" {
-        return Err("远端 1080p 任务与当前正式版本不匹配。".to_owned());
+        return Err("远端 1080p 增强任务与当前正式版本不匹配。".to_owned());
     }
     if job.workflow_id != "seedvr2-1080p-v1" {
-        return Err("远端任务没有使用已验证的 SeedVR2 1080p 工作流。".to_owned());
+        return Err("远端任务没有使用 SeedVR2 1080p 增强工作流。".to_owned());
     }
     if job.status != "completed" {
-        return Err("1080p 任务尚未完成，暂时不能下载成片。".to_owned());
+        return Err("1080p 增强任务尚未完成，暂时不能下载。".to_owned());
     }
     let manifest = job
         .result_manifest
-        .ok_or_else(|| "1080p 任务已完成，但没有返回成品清单。".to_owned())?;
+        .ok_or_else(|| "1080p 增强任务已完成，但没有返回文件清单。".to_owned())?;
     if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
-        return Err("1080p 成品清单与任务不匹配，已停止下载。".to_owned());
+        return Err("1080p 增强文件清单与任务不匹配，已停止下载。".to_owned());
     }
     let artifacts = manifest
         .artifacts
@@ -1059,13 +1074,13 @@ async fn download_completed_upscale(
         return Err("SeedVR2 任务返回的视频数量异常，已停止自动下载。".to_owned());
     }
 
-    let mut finals = Vec::with_capacity(artifacts.len());
+    let mut enhanced_versions = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
         let destination = project
             .project_dir
             .join("cache")
-            .join("final")
+            .join("enhanced")
             .join(safe_path_component(&scene.id)?)
             .join(safe_path_component(&job.id)?)
             .join(&filename);
@@ -1079,9 +1094,9 @@ async fn download_completed_upscale(
             })
             .await
             .map_err(|error| error.message)?;
-        finals.push(
+        enhanced_versions.push(
             generations
-                .record_final(RecordFinalInput {
+                .record_enhanced(RecordEnhancedInput {
                     project_id: project.id.clone(),
                     scene_id: scene.id.clone(),
                     source_candidate_id: source.id.clone(),
@@ -1103,7 +1118,7 @@ async fn download_completed_upscale(
     queue
         .mark_local_complete(&job.id)
         .map_err(|error| error.message)?;
-    Ok(finals)
+    Ok(enhanced_versions)
 }
 
 fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revision: u64) {
@@ -1376,10 +1391,10 @@ pub fn run() {
             delete_service_input,
             download_service_artifact,
             list_candidate_versions,
-            list_final_versions,
+            list_enhanced_versions,
             select_candidate_version,
             download_completed_job,
-            download_completed_upscale,
+            download_completed_enhancement,
             list_assets,
             import_asset_files,
             import_asset_payload,

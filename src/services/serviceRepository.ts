@@ -7,6 +7,7 @@ import type {
 import { invokeNative } from "./nativeBridge";
 import { assetRepository } from "./assetRepository";
 import { currentAssetVersion } from "../domain/assets";
+import { frameProfile } from "../domain/frameProfiles";
 
 export interface ServiceConnectionResult {
   baseUrl: string;
@@ -158,14 +159,8 @@ function candidateDimensions(aspectRatio: VideoGenerationRequest["aspectRatio"])
   width: number;
   height: number;
 } {
-  return {
-    auto: { width: 1344, height: 768 },
-    "16:9": { width: 1344, height: 768 },
-    "9:16": { width: 768, height: 1344 },
-    "4:3": { width: 1152, height: 864 },
-    "3:4": { width: 864, height: 1152 },
-    "1:1": { width: 1024, height: 1024 },
-  }[aspectRatio];
+  const profile = frameProfile(aspectRatio);
+  return { width: profile.workWidth, height: profile.workHeight };
 }
 
 function frameLength(durationSec: 5 | 10 | 15): 124 | 243 | 362 {
@@ -297,6 +292,7 @@ export class ComfyUiH3Provider implements VideoProvider {
       }
     }
     const dimensions = candidateDimensions(request.aspectRatio);
+    const profile = frameProfile(request.aspectRatio);
     try {
       const probe = await serviceRepository.prepareGeneration();
       if (!probe?.comfyuiReady) {
@@ -322,6 +318,10 @@ export class ComfyUiH3Provider implements VideoProvider {
             discardH3Audio: request.discardH3Audio,
             width: dimensions.width,
             height: dimensions.height,
+            visibleWidth: profile.visibleWidth,
+            visibleHeight: profile.visibleHeight,
+            cropX: profile.cropX,
+            cropY: profile.cropY,
             length: frameLength(request.durationSec),
           },
         },

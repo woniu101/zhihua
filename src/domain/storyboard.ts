@@ -35,7 +35,5 @@ export interface SceneDraft {
 
 export interface StoryboardProjectSettings {
   aspectRatio: AspectRatio;
-  outputWidth: number;
-  outputHeight: number;
   discardH3Audio: boolean;
 }

@@ -10,16 +10,19 @@ import {
   storyboardRepository,
 } from "../services/storyboardRepository";
 
-const SETTINGS_KEY = "zhihua.storyboard.settings.v1";
-const scenes = ref<SceneDraft[]>([]);
-const settings = ref<StoryboardProjectSettings>(
-  readLocal<StoryboardProjectSettings>(SETTINGS_KEY, {
+function settingsKey(projectId: string): string {
+  return `zhihua.storyboard.settings.${projectId}.v2`;
+}
+
+function defaultSettings(): StoryboardProjectSettings {
+  return {
     aspectRatio: "16:9",
-    outputWidth: 1920,
-    outputHeight: 1080,
     discardH3Audio: true,
-  }),
-);
+  };
+}
+
+const scenes = ref<SceneDraft[]>([]);
+const settings = ref<StoryboardProjectSettings>(defaultSettings());
 const selectedSceneId = ref("");
 const currentProjectId = ref<string>();
 const loading = ref(false);
@@ -28,7 +31,11 @@ const persistTimers = new Map<string, number>();
 
 watch(
   settings,
-  () => writeLocal(SETTINGS_KEY, settings.value),
+  () => {
+    if (currentProjectId.value) {
+      writeLocal(settingsKey(currentProjectId.value), settings.value);
+    }
+  },
   { deep: true },
 );
 
@@ -69,6 +76,7 @@ async function load(force = false) {
     scenes.value = [];
     selectedSceneId.value = "";
     loadError.value = "请先在项目页打开一个项目。";
+    settings.value = defaultSettings();
     return;
   }
   if (!force && projectId === currentProjectId.value) return;
@@ -77,6 +85,7 @@ async function load(force = false) {
   try {
     const loaded = await storyboardRepository.list(projectId);
     currentProjectId.value = projectId;
+    settings.value = readLocal<StoryboardProjectSettings>(settingsKey(projectId), defaultSettings());
     scenes.value = loaded;
     selectedSceneId.value = loaded[0]?.id ?? "";
   } catch (error) {
