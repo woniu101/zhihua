@@ -6,7 +6,8 @@ import type { CandidateQuality, GenerationMode } from "../domain/storyboard";
 import type { AssetItem, AssetMediaType } from "../domain/assets";
 import { assetRepository } from "../services/assetRepository";
 import { generationRepository, type CandidateVersion, type FinalVersion } from "../services/generationRepository";
-import { ComfyUiH3Provider, normalizeConnectionFailure } from "../services/serviceRepository";
+import { ComfyUiH3Provider, normalizeConnectionFailure, serviceRepository } from "../services/serviceRepository";
+import { ttsRepository, type NarrationArtifact, type SystemVoice } from "../services/ttsRepository";
 import { useStoryboardStore } from "../stores/storyboard";
 
 const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, select, update, save, updateSelected, add, duplicateSelected, removeSelected, moveSelected } = useStoryboardStore();
@@ -21,6 +22,13 @@ const taskError = ref("");
 const submitting = ref(false);
 const upscaling = ref(false);
 const taskKind = ref<"candidate" | "upscale">("candidate");
+const systemVoices = ref<SystemVoice[]>([]);
+const selectedVoiceId = ref("");
+const narrationArtifact = ref<NarrationArtifact>();
+const narrationBusy = ref(false);
+const narrationError = ref("");
+const selectedNarrationAssetId = ref("");
+let narrationAudio: HTMLAudioElement | undefined;
 let pollTimer: number | undefined;
 const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
   { id: "t2v", label: "自由生成", symbol: "✦" },
@@ -61,6 +69,7 @@ const taskDescription = computed(() => {
 const selectedReferenceIds = computed(() => selectedScene.value?.assetIds ?? []);
 const imageAssets = computed(() => referenceAssets.value.filter((asset) => asset.mediaType === "image"));
 const videoAssets = computed(() => referenceAssets.value.filter((asset) => asset.mediaType === "video"));
+const audioAssets = computed(() => referenceAssets.value.filter((asset) => asset.mediaType === "audio"));
 const latestCandidate = <T,>(items: T[]): T | undefined => items[items.length - 1];
 const previewVersion = computed(() => candidateVersions.value.find((item) => item.id === previewVersionId.value) ?? latestCandidate(candidateVersions.value));
 const finalForOfficial = computed(() => latestCandidate(finalVersions.value.filter((item) => item.sourceCandidateId === selectedScene.value?.selectedVersionId)));
@@ -75,6 +84,109 @@ const canMake1080p = computed(() => Boolean(
   && !upscaling.value
   && !isTaskActive.value,
 ));
+
+async function ensureSystemVoices() {
+  if (systemVoices.value.length) return;
+  try {
+    systemVoices.value = await ttsRepository.listVoices();
+    selectedVoiceId.value ||= systemVoices.value.find((voice) => voice.locale.toLowerCase().startsWith("zh"))?.id
+      ?? systemVoices.value[0]?.id
+      ?? "";
+  } catch (error) {
+    narrationError.value = normalizeConnectionFailure(error).message;
+  }
+}
+
+async function loadNarration(projectId?: string, sceneId?: string) {
+  narrationAudio?.pause();
+  narrationArtifact.value = undefined;
+  selectedNarrationAssetId.value = "";
+  if (!projectId || !sceneId) return;
+  await ensureSystemVoices();
+  narrationArtifact.value = await ttsRepository.get(projectId, sceneId).catch(() => undefined);
+  if (narrationArtifact.value?.voiceId.startsWith("imported:")) {
+    selectedNarrationAssetId.value = narrationArtifact.value.voiceId.slice("imported:".length);
+  } else if (narrationArtifact.value?.voiceId && systemVoices.value.some((voice) => voice.id === narrationArtifact.value?.voiceId)) {
+    selectedVoiceId.value = narrationArtifact.value.voiceId;
+    selectedNarrationAssetId.value = "";
+  }
+}
+
+async function synthesizeNarration(playAfter = false) {
+  const scene = selectedScene.value;
+  if (!scene || !scene.narration.trim()) {
+    narrationError.value = "请先填写旁白文案";
+    return;
+  }
+  await ensureSystemVoices();
+  if (!selectedVoiceId.value) {
+    narrationError.value = "Windows 没有可用的系统语音";
+    return;
+  }
+  narrationBusy.value = true;
+  narrationError.value = "";
+  try {
+    await save(scene.id, { narration: scene.narration });
+    narrationArtifact.value = await ttsRepository.synthesize({
+      projectId: scene.projectId,
+      sceneId: scene.id,
+      voiceId: selectedVoiceId.value,
+      rate: 0,
+      volume: 100,
+    });
+    selectedNarrationAssetId.value = "";
+    if (playAfter) playNarration();
+  } catch (error) {
+    narrationError.value = normalizeConnectionFailure(error).message;
+  } finally {
+    narrationBusy.value = false;
+  }
+}
+
+async function importNarrationAudio() {
+  const scene = selectedScene.value;
+  if (!scene || !selectedNarrationAssetId.value) {
+    narrationError.value = "请先选择一段已导入素材库的录音";
+    return;
+  }
+  if (!scene.narration.trim()) {
+    narrationError.value = "请先填写与录音对应的旁白文案";
+    return;
+  }
+  narrationBusy.value = true;
+  narrationError.value = "";
+  try {
+    await save(scene.id, { narration: scene.narration });
+    narrationArtifact.value = await ttsRepository.importAudio(
+      scene.projectId,
+      scene.id,
+      selectedNarrationAssetId.value,
+    );
+  } catch (error) {
+    narrationError.value = normalizeConnectionFailure(error).message;
+  } finally {
+    narrationBusy.value = false;
+  }
+}
+
+function playNarration() {
+  if (!narrationArtifact.value) {
+    void synthesizeNarration(true);
+    return;
+  }
+  narrationAudio?.pause();
+  narrationAudio = new Audio(narrationArtifact.value.previewUrl);
+  void narrationAudio.play().catch((error) => {
+    narrationError.value = error instanceof Error ? error.message : "旁白预览失败";
+  });
+}
+
+function updateNarrationText(event: Event) {
+  narrationAudio?.pause();
+  narrationArtifact.value = undefined;
+  narrationError.value = "旁白文案已修改，请重新生成旁白。";
+  updateSelected({ narration: (event.target as HTMLTextAreaElement).value });
+}
 
 async function loadReferenceAssets(projectId?: string) {
   if (!projectId) {
@@ -338,22 +450,58 @@ async function cancelTask() {
   }
 }
 
+async function recoverPendingSceneJob(sceneId: string): Promise<boolean> {
+  const scene = scenes.value.find((item) => item.id === sceneId);
+  if (!scene?.pendingRequestId || scene.lastJobId || scene.lastUpscaleJobId) return false;
+  try {
+    const jobs = await serviceRepository.listLocalJobs(scene.projectId);
+    const queued = jobs?.find((item) => item.clientRequestId === scene.pendingRequestId);
+    if (!queued) return false;
+    if (queued.status === "submit_failed") {
+      taskError.value = queued.errorMessage ?? "任务提交失败，可重新生成并安全复用原请求。";
+      update(scene.id, { status: "failed", generationStage: taskError.value });
+      return true;
+    }
+    if (!queued.remoteJobId) return false;
+    const upscale = queued.kind === "video_upscale";
+    await save(scene.id, {
+      pendingRequestId: undefined,
+      lastJobId: upscale ? scene.lastJobId : queued.remoteJobId,
+      lastUpscaleJobId: upscale ? queued.remoteJobId : scene.lastUpscaleJobId,
+      status: "generating",
+      generationStage: "已从本地任务队列恢复远端任务",
+    });
+    if (upscale && scene.selectedVersionId) {
+      await refreshUpscaleTask(scene.id, queued.remoteJobId, scene.selectedVersionId);
+    } else {
+      await refreshTask(scene.id, queued.remoteJobId);
+    }
+    return true;
+  } catch (error) {
+    taskError.value = normalizeConnectionFailure(error).message;
+    return false;
+  }
+}
+
 watch(selectedSceneId, (sceneId) => {
   clearPoll();
   task.value = undefined;
   taskError.value = "";
   const scene = scenes.value.find((item) => item.id === sceneId);
+  void loadNarration(scene?.projectId, scene?.id);
   void loadReferenceAssets(scene?.projectId);
-  void loadCandidateVersions(scene?.projectId, scene?.id).then(() => {
-    if (scene?.lastUpscaleJobId && scene.selectedVersionId) {
-      void refreshUpscaleTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
-    } else if (scene?.lastJobId) {
-      void refreshTask(scene.id, scene.lastJobId);
+  void loadCandidateVersions(scene?.projectId, scene?.id).then(async () => {
+    if (!scene) return;
+    if (await recoverPendingSceneJob(scene.id)) return;
+    if (scene.lastUpscaleJobId && scene.selectedVersionId) {
+      await refreshUpscaleTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
+    } else if (scene.lastJobId) {
+      await refreshTask(scene.id, scene.lastJobId);
     }
   });
 }, { immediate: true });
 
-onBeforeUnmount(clearPoll);
+onBeforeUnmount(() => { clearPoll(); narrationAudio?.pause(); });
 const confirmRemove = () => {
   if (scenes.value.length <= 1) return;
   if (window.confirm(`删除分镜“${selectedScene.value?.title}”？此操作只删除当前本地草稿。`)) removeSelected();
@@ -420,12 +568,14 @@ const confirmRemove = () => {
             <p v-if="!referenceAssets.length">当前项目暂无可用素材，请先到素材页导入。</p>
           </div>
           <div class="field-head"><label class="section-label">系统旁白 / 解说文案</label><a>♟ 重写文案</a></div>
-          <textarea :value="selectedScene?.narration" @input="updateSelected({ narration: ($event.target as HTMLTextAreaElement).value })"></textarea>
+          <textarea :value="selectedScene?.narration" @input="updateNarrationText"></textarea>
           <div class="field-head"><label class="section-label">时长</label><label class="section-label">配音音色</label></div>
-          <div class="voice-row"><div class="segmented"><button v-for="seconds in [5,10,15] as const" :key="seconds" :class="{active:durationLabel===`${seconds}秒`}" @click="setDuration(seconds)">{{ seconds }}秒</button></div><button class="select">知知 · 科普女声 <ChevronDown :size="15"/></button><button class="round"><Play :size="15" fill="currentColor"/></button><button class="btn compact"><RotateCcw :size="15"/>重新生成</button></div>
+          <div class="voice-row"><div class="segmented"><button v-for="seconds in [5,10,15] as const" :key="seconds" :class="{active:durationLabel===`${seconds}秒`}" @click="setDuration(seconds)">{{ seconds }}秒</button></div><select v-model="selectedVoiceId" class="select" aria-label="系统旁白音色"><option v-for="voice in systemVoices" :key="voice.id" :value="voice.id">{{ voice.name }} · {{ voice.locale }}</option></select><button class="round" :disabled="narrationBusy" @click="playNarration"><LoaderCircle v-if="narrationBusy" class="spin" :size="15"/><Play v-else :size="15" fill="currentColor"/></button><button class="btn compact" :disabled="narrationBusy" @click="synthesizeNarration(false)"><RotateCcw :size="15"/>{{ narrationArtifact ? '重新生成' : '生成旁白' }}</button></div>
+          <div class="narration-import-row"><select v-model="selectedNarrationAssetId" class="select" aria-label="导入旁白录音"><option value="">从素材库选择已有录音</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select><button class="btn compact" :disabled="narrationBusy || !selectedNarrationAssetId" @click="importNarrationAudio"><Music2 :size="15"/>使用录音</button><RouterLink to="/assets">管理音频素材　›</RouterLink></div>
+          <p v-if="narrationError" class="task-error narration-error">{{ narrationError }}</p>
           <div class="field-head"><label class="section-label">生成设置</label><span class="warning-text">预计生成约 3 分钟</span></div>
           <div class="quality-grid"><button :class="{active:selectedScene?.quality==='fast'}" @click="setQuality('fast')"><b>快速 8 步</b><span>约 3 分钟，适合快速预览</span></button><button :class="{active:selectedScene?.quality==='high'}" @click="setQuality('high')"><b>高质量 20 步</b><span>约 5 分钟，会重新生成内容</span></button></div>
-          <label class="section-label audio-label">音轨设置</label><div class="audio-setting"><span class="round filled"><Pause :size="13" fill="currentColor"/></span><div><b>不使用 H3 原生音轨</b><span>正式旁白使用系统 TTS</span></div><a>修改</a></div>
+          <label class="section-label audio-label">音轨设置</label><div class="audio-setting"><span class="round filled"><Pause :size="13" fill="currentColor"/></span><div><b>不使用 H3 原生音轨</b><span>{{ narrationArtifact ? `系统旁白已生成 · ${(narrationArtifact.durationMs / 1000).toFixed(1)} 秒` : '正式旁白使用系统 TTS' }}</span></div><a>修改</a></div>
           <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'upscale' ? '1080p 成片' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb lightning-image"></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
         </div>
       </aside>
@@ -448,4 +598,5 @@ const confirmRemove = () => {
 .head-actions .btn:disabled,.version-row .btn:disabled,.version:disabled{opacity:.58;cursor:not-allowed}.spin{animation:spin .9s linear infinite}.task-cancel{border:0;background:transparent;color:#d6463c;display:flex;align-items:center;gap:4px;font-size:12px}.task-main .task-error{color:#c53d35}.task-main .progress i{display:block;height:100%;border-radius:inherit;background:var(--blue);transition:width .25s ease}@keyframes spin{to{transform:rotate(360deg)}}
 .empty-storyboard{height:calc(100% - 50px);padding:28px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;color:#617697}.empty-storyboard b{color:#29466f}.empty-storyboard span{max-width:245px;font-size:12px;line-height:1.6}.empty-storyboard .btn{margin-top:7px}
 .reference-inputs{margin:-3px 0 12px;padding:9px 10px;border:1px solid #d9e4f1;border-radius:8px;background:#f8fbff;display:grid;grid-template-columns:1fr 1fr;gap:7px}.reference-inputs .field-head{grid-column:1/-1;margin:0 0 2px}.reference-inputs .field-head a{color:var(--blue);font-size:12px}.reference-inputs label{display:flex;flex-direction:column;gap:4px;color:#52698c;font-size:11px}.reference-inputs select{height:34px;min-width:0;border:1px solid #cfdced;border-radius:6px;background:#fff;padding:0 8px;color:#203b65}.reference-inputs p{grid-column:1/-1;color:#7385a2;font-size:11px}
+.narration-import-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;margin-top:7px}.narration-import-row .select{height:34px}.narration-import-row a{color:var(--blue);font-size:11px;white-space:nowrap}
 </style>

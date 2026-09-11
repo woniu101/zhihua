@@ -1,12 +1,16 @@
 mod asset;
 mod comp_share;
+mod compute_pool;
 mod deepseek;
+mod export;
 mod generation;
+mod job_queue;
 mod service;
 mod source;
 mod ssh_tunnel;
 mod storage;
 mod storyboard;
+mod tts;
 
 use asset::{
     AssetError, AssetItem, AssetStorage, ImportAssetFilesInput, ImportAssetPayloadInput,
@@ -18,15 +22,18 @@ use comp_share::{
     CompShareProvider, CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode,
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
+use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
 use deepseek::{
     AnalyzeSourcesInput, CreateStoryboardInput, DeepSeekConfiguration, DeepSeekConnectionTest,
     DeepSeekError, DeepSeekProvider, DeepSeekSource, KnowledgePoint,
     SaveDeepSeekConfigurationInput,
 };
+use export::{ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, ProjectExport};
 use generation::{
     CandidateVersion, FinalVersion, GenerationError, GenerationStorage, RecordCandidateInput,
     RecordFinalInput,
 };
+use job_queue::{JobQueueError, JobQueueStorage, LocalJob};
 use service::{
     DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceArtifactDownload,
     ServiceClient, ServiceConnectionError, ServiceConnectionInfo, ServiceConnectionResult,
@@ -49,6 +56,10 @@ use storyboard::{
     StoryboardStorage,
 };
 use tauri::{AppHandle, Manager, State};
+use tts::{
+    ImportNarrationInput, NarrationArtifact, SynthesizeNarrationInput, SystemTtsProvider,
+    SystemVoice, TtsError,
+};
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -643,6 +654,85 @@ fn delete_storyboard_scene(
 }
 
 #[tauri::command]
+fn list_system_voices(
+    provider: State<'_, SystemTtsProvider>,
+) -> Result<Vec<SystemVoice>, TtsError> {
+    provider.list_voices()
+}
+
+#[tauri::command]
+fn get_scene_narration(
+    provider: State<'_, SystemTtsProvider>,
+    project_id: String,
+    scene_id: String,
+) -> Result<Option<NarrationArtifact>, TtsError> {
+    provider.get_artifact(&project_id, &scene_id)
+}
+
+#[tauri::command]
+async fn synthesize_scene_narration(
+    provider: State<'_, SystemTtsProvider>,
+    storyboard: State<'_, StoryboardStorage>,
+    input: SynthesizeNarrationInput,
+) -> Result<NarrationArtifact, TtsError> {
+    let provider = provider.inner().clone();
+    let storyboard = storyboard.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || provider.synthesize(&storyboard, input))
+        .await
+        .map_err(|error| TtsError {
+            code: "TTS_TASK_ERROR".to_owned(),
+            message: format!("系统旁白任务异常结束：{error}"),
+        })?
+}
+
+#[tauri::command]
+async fn import_scene_narration(
+    tts: State<'_, SystemTtsProvider>,
+    storyboard: State<'_, StoryboardStorage>,
+    assets: State<'_, AssetStorage>,
+    input: ImportNarrationInput,
+) -> Result<NarrationArtifact, TtsError> {
+    let tts = tts.inner().clone();
+    let storyboard = storyboard.inner().clone();
+    let assets = assets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || tts.import_audio(&storyboard, &assets, input))
+        .await
+        .map_err(|error| TtsError {
+            code: "TTS_TASK_ERROR".to_owned(),
+            message: format!("旁白录音导入任务异常结束：{error}"),
+        })?
+}
+
+#[tauri::command]
+fn inspect_export_capability(exporter: State<'_, FfmpegExporter>) -> ExportCapability {
+    exporter.capability()
+}
+
+#[tauri::command]
+async fn export_project_video(
+    exporter: State<'_, FfmpegExporter>,
+    storyboard: State<'_, StoryboardStorage>,
+    generations: State<'_, GenerationStorage>,
+    assets: State<'_, AssetStorage>,
+    tts: State<'_, SystemTtsProvider>,
+    input: ExportProjectInput,
+) -> Result<ProjectExport, ExportError> {
+    let exporter = exporter.inner().clone();
+    let storyboard = storyboard.inner().clone();
+    let generations = generations.inner().clone();
+    let assets = assets.inner().clone();
+    let tts = tts.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        exporter.export(&storyboard, &generations, &assets, &tts, input)
+    })
+    .await
+    .map_err(|error| ExportError {
+        code: "EXPORT_TASK_ERROR".to_owned(),
+        message: format!("导出任务异常结束：{error}"),
+    })?
+}
+
+#[tauri::command]
 fn reorder_storyboard_scenes(
     storage: State<'_, StoryboardStorage>,
     input: ReorderScenesInput,
@@ -690,25 +780,66 @@ async fn probe_service(
 #[tauri::command]
 async fn submit_service_job(
     service: State<'_, ServiceClient>,
+    queue: State<'_, JobQueueStorage>,
     input: SubmitServiceJobInput,
 ) -> Result<ServiceJob, ServiceConnectionError> {
-    service.submit_job(input).await
+    let request_id = input.client_request_id.clone();
+    queue.stage(&input).map_err(queue_service_error)?;
+    queue
+        .claim_for_worker(&request_id, "primary-worker", 300)
+        .map_err(queue_service_error)?;
+    match service.submit_job(input).await {
+        Ok(job) => {
+            queue.record_remote(&job).map_err(queue_service_error)?;
+            Ok(job)
+        }
+        Err(error) => {
+            let _ = queue.record_submit_failure(&request_id, error.code, &error.message);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 async fn get_service_job(
     service: State<'_, ServiceClient>,
+    queue: State<'_, JobQueueStorage>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
-    service.get_job(&job_id).await
+    let job = service.get_job(&job_id).await?;
+    queue.sync(&job).map_err(queue_service_error)?;
+    Ok(job)
 }
 
 #[tauri::command]
 async fn cancel_service_job(
     service: State<'_, ServiceClient>,
+    queue: State<'_, JobQueueStorage>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
-    service.cancel_job(&job_id).await
+    let job = service.cancel_job(&job_id).await?;
+    queue.sync(&job).map_err(queue_service_error)?;
+    Ok(job)
+}
+
+#[tauri::command]
+fn list_local_jobs(
+    queue: State<'_, JobQueueStorage>,
+    project_id: Option<String>,
+) -> Result<Vec<LocalJob>, JobQueueError> {
+    queue.list(project_id.as_deref())
+}
+
+fn queue_service_error(error: JobQueueError) -> ServiceConnectionError {
+    ServiceConnectionError {
+        code: "local_queue_error",
+        message: error.message,
+    }
+}
+
+#[tauri::command]
+fn plan_generation_compute_pool(input: ComputePoolPlanInput) -> ComputePoolPlan {
+    plan_compute_pool(input)
 }
 
 #[tauri::command]
@@ -765,6 +896,7 @@ async fn download_completed_job(
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
+    queue: State<'_, JobQueueStorage>,
     service: State<'_, ServiceClient>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: DownloadCompletedJobInput,
@@ -854,6 +986,9 @@ async fn download_completed_job(
     }
     let revision = lifecycle.invalidate_idle_shutdown();
     schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
+    queue
+        .mark_local_complete(&job.id)
+        .map_err(|error| error.message)?;
     Ok(candidates)
 }
 
@@ -863,6 +998,7 @@ async fn download_completed_upscale(
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
+    queue: State<'_, JobQueueStorage>,
     service: State<'_, ServiceClient>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: DownloadCompletedUpscaleInput,
@@ -957,6 +1093,9 @@ async fn download_completed_upscale(
     }
     let revision = lifecycle.invalidate_idle_shutdown();
     schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
+    queue
+        .mark_local_complete(&job.id)
+        .map_err(|error| error.message)?;
     Ok(finals)
 }
 
@@ -1122,6 +1261,11 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let generation_storage = GenerationStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let job_queue = JobQueueStorage::initialize(storage.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let tts = SystemTtsProvider::initialize(storage.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let exporter = FfmpegExporter::new(storage.clone());
             let app_data_dir = app
                 .handle()
                 .path()
@@ -1141,6 +1285,9 @@ pub fn run() {
             app.manage(storyboard_storage);
             app.manage(asset_storage);
             app.manage(generation_storage);
+            app.manage(job_queue);
+            app.manage(tts);
+            app.manage(exporter);
             app.manage(deepseek);
             app.manage(ComputeLifecycle::default());
             app.manage(service);
@@ -1189,6 +1336,12 @@ pub fn run() {
             upsert_storyboard_scene,
             delete_storyboard_scene,
             reorder_storyboard_scenes,
+            list_system_voices,
+            get_scene_narration,
+            synthesize_scene_narration,
+            import_scene_narration,
+            inspect_export_capability,
+            export_project_video,
             test_service_connection,
             get_service_connection_info,
             save_service_connection,
@@ -1197,6 +1350,8 @@ pub fn run() {
             submit_service_job,
             get_service_job,
             cancel_service_job,
+            list_local_jobs,
+            plan_generation_compute_pool,
             upload_service_input,
             delete_service_input,
             download_service_artifact,

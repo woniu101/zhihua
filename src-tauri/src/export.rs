@@ -1,0 +1,711 @@
+use crate::{
+    asset::AssetStorage,
+    generation::GenerationStorage,
+    storage::ProjectStorage,
+    storyboard::StoryboardStorage,
+    tts::{narration_text_sha256, SystemTtsProvider},
+};
+use chrono::{SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+use uuid::Uuid;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ExportError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ExportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+type ExportResult<T> = Result<T, ExportError>;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportCapability {
+    pub available: bool,
+    pub label: String,
+    pub reason: String,
+    pub ffmpeg_path: Option<PathBuf>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubtitleMode {
+    BurnAndSrt,
+    Burn,
+    Srt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProjectInput {
+    pub project_id: String,
+    pub output_directory: PathBuf,
+    pub frame_rate: u32,
+    pub subtitle_mode: SubtitleMode,
+    pub narration_volume: u32,
+    pub music_asset_id: Option<String>,
+    pub music_volume: u32,
+    pub music_fade: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExport {
+    pub output_path: PathBuf,
+    pub subtitle_path: Option<PathBuf>,
+    pub duration_ms: u64,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+#[derive(Clone)]
+pub struct FfmpegExporter {
+    projects: ProjectStorage,
+}
+
+struct ExportScene {
+    narration: String,
+    duration_ms: u32,
+    video_path: PathBuf,
+    audio_path: PathBuf,
+}
+
+impl FfmpegExporter {
+    pub fn new(projects: ProjectStorage) -> Self {
+        Self { projects }
+    }
+
+    pub fn capability(&self) -> ExportCapability {
+        match command_output("ffmpeg", &["-version"]) {
+            Ok(output) if output.status.success() => {
+                let first = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("FFmpeg")
+                    .trim()
+                    .to_owned();
+                ExportCapability {
+                    available: true,
+                    label: "FFmpeg 可用".to_owned(),
+                    reason: "可以在本机合成 H.264 + AAC MP4。".to_owned(),
+                    ffmpeg_path: find_executable("ffmpeg"),
+                    version: Some(first),
+                }
+            }
+            Ok(output) => ExportCapability {
+                available: false,
+                label: "FFmpeg 不可用".to_owned(),
+                reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ffmpeg_path: find_executable("ffmpeg"),
+                version: None,
+            },
+            Err(error) => ExportCapability {
+                available: false,
+                label: "FFmpeg 不可用".to_owned(),
+                reason: error.message,
+                ffmpeg_path: None,
+                version: None,
+            },
+        }
+    }
+
+    pub fn export(
+        &self,
+        storyboards: &StoryboardStorage,
+        generations: &GenerationStorage,
+        assets: &AssetStorage,
+        tts: &SystemTtsProvider,
+        input: ExportProjectInput,
+    ) -> ExportResult<ProjectExport> {
+        if !matches!(input.frame_rate, 24 | 25 | 30)
+            || input.narration_volume > 100
+            || input.music_volume > 100
+        {
+            return Err(ExportError::new(
+                "INVALID_EXPORT_SETTINGS",
+                "帧率或旁白音量无效",
+            ));
+        }
+        let project = self
+            .projects
+            .get_project(&input.project_id)
+            .map_err(|error| ExportError::new("PROJECT_ERROR", error.to_string()))?;
+        let scenes = storyboards
+            .list(&input.project_id)
+            .map_err(|error| ExportError::new("STORYBOARD_ERROR", error.to_string()))?;
+        if scenes.is_empty() {
+            return Err(ExportError::new("NO_SCENES", "当前项目没有分镜"));
+        }
+        let mut export_scenes = Vec::with_capacity(scenes.len());
+        for scene in &scenes {
+            let selected_id = scene.selected_version_id.as_deref().ok_or_else(|| {
+                ExportError::new(
+                    "MISSING_OFFICIAL_VERSION",
+                    format!("分镜“{}”尚未选择正式版本", scene.title),
+                )
+            })?;
+            let final_version = generations
+                .list_finals(&input.project_id, &scene.id)
+                .map_err(|error| ExportError::new("GENERATION_ERROR", error.message))?
+                .into_iter()
+                .rev()
+                .find(|item| item.source_candidate_id == selected_id)
+                .ok_or_else(|| {
+                    ExportError::new(
+                        "MISSING_1080P_VERSION",
+                        format!("分镜“{}”尚未制作 1080p 成片", scene.title),
+                    )
+                })?;
+            if !final_version.local_path.is_file() {
+                return Err(ExportError::new(
+                    "MISSING_VIDEO_FILE",
+                    format!("分镜“{}”的 1080p 文件已丢失", scene.title),
+                ));
+            }
+            let narration = tts
+                .get_artifact(&input.project_id, &scene.id)
+                .map_err(|error| ExportError::new("TTS_ERROR", error.message))?
+                .ok_or_else(|| {
+                    ExportError::new(
+                        "MISSING_NARRATION",
+                        format!("分镜“{}”尚未生成系统旁白", scene.title),
+                    )
+                })?;
+            if !narration.local_path.is_file() {
+                return Err(ExportError::new(
+                    "MISSING_NARRATION_FILE",
+                    format!("分镜“{}”的旁白文件已丢失", scene.title),
+                ));
+            }
+            if narration.text_sha256 != narration_text_sha256(&scene.narration) {
+                return Err(ExportError::new(
+                    "STALE_NARRATION",
+                    format!("分镜“{}”的旁白文案已修改，请重新生成旁白", scene.title),
+                ));
+            }
+            if narration.duration_ms > scene.target_duration_ms as u64 + 250 {
+                return Err(ExportError::new(
+                    "NARRATION_TOO_LONG",
+                    format!(
+                        "分镜“{}”的旁白为 {:.1} 秒，超过镜头时长 {:.1} 秒，请精简文案或延长镜头",
+                        scene.title,
+                        narration.duration_ms as f64 / 1000.0,
+                        scene.target_duration_ms as f64 / 1000.0
+                    ),
+                ));
+            }
+            export_scenes.push(ExportScene {
+                narration: scene.narration.clone(),
+                duration_ms: scene.target_duration_ms,
+                video_path: final_version.local_path,
+                audio_path: narration.local_path,
+            });
+        }
+        let music_path = input
+            .music_asset_id
+            .as_deref()
+            .map(|asset_id| {
+                let asset = assets
+                    .list(&input.project_id)
+                    .map_err(|error| ExportError::new("ASSET_ERROR", error.message))?
+                    .into_iter()
+                    .find(|asset| asset.id == asset_id && asset.media_type == "audio")
+                    .ok_or_else(|| {
+                        ExportError::new("MUSIC_ASSET_NOT_FOUND", "所选背景音乐不存在或不是音频")
+                    })?;
+                let version = asset
+                    .versions
+                    .into_iter()
+                    .find(|version| version.id == asset.current_version_id)
+                    .ok_or_else(|| ExportError::new("MUSIC_FILE_MISSING", "背景音乐版本不存在"))?;
+                if !version.stored_path.is_file() {
+                    return Err(ExportError::new("MUSIC_FILE_MISSING", "背景音乐文件已丢失"));
+                }
+                Ok(version.stored_path)
+            })
+            .transpose()?;
+        let output_directory = if input.output_directory.as_os_str().is_empty() {
+            project.project_dir.join("exports")
+        } else {
+            if !input.output_directory.is_absolute() {
+                return Err(ExportError::new(
+                    "INVALID_OUTPUT_DIRECTORY",
+                    "导出目录必须是绝对路径",
+                ));
+            }
+            input.output_directory.clone()
+        };
+        fs::create_dir_all(&output_directory).map_err(io_error)?;
+        let workspace_root = project.project_dir.join("exports");
+        fs::create_dir_all(&workspace_root).map_err(io_error)?;
+        let workspace = workspace_root.join(format!(".work-{}", Uuid::new_v4()));
+        fs::create_dir(&workspace).map_err(io_error)?;
+        let result = self.render(
+            &workspace,
+            &output_directory,
+            &project.title,
+            &export_scenes,
+            music_path.as_deref(),
+            &input,
+        );
+        let _ = fs::remove_dir_all(&workspace);
+        result
+    }
+
+    fn render(
+        &self,
+        workspace: &Path,
+        output_directory: &Path,
+        project_title: &str,
+        scenes: &[ExportScene],
+        music_path: Option<&Path>,
+        input: &ExportProjectInput,
+    ) -> ExportResult<ProjectExport> {
+        let mut normalized = Vec::with_capacity(scenes.len());
+        for (index, scene) in scenes.iter().enumerate() {
+            let path = workspace.join(format!("scene-{index:03}.mp4"));
+            let duration = format!("{:.3}", scene.duration_ms as f64 / 1000.0);
+            let volume = format!("{:.2}", input.narration_volume as f64 / 100.0);
+            let frame_rate = input.frame_rate.to_string();
+            let filters = format!(
+                "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={frame_rate},tpad=stop_mode=clone:stop_duration=15,trim=duration={duration}[v];[1:a]volume={volume},apad,atrim=0:{duration}[a]"
+            );
+            run_ffmpeg(&[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path_text(&scene.video_path)?,
+                "-i",
+                path_text(&scene.audio_path)?,
+                "-filter_complex",
+                &filters,
+                "-map",
+                "[v]",
+                "-map",
+                "[a]",
+                "-t",
+                &duration,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                path_text(&path)?,
+            ])?;
+            normalized.push(path);
+        }
+        let concat_path = workspace.join("concat.txt");
+        let concat = normalized
+            .iter()
+            .map(|path| {
+                let escaped = path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .replace('\u{27}', "'\\''");
+                format!("file '{escaped}'\n")
+            })
+            .collect::<String>();
+        fs::write(&concat_path, concat).map_err(io_error)?;
+        let base_path = workspace.join("combined.mp4");
+        run_ffmpeg(&[
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            path_text(&concat_path)?,
+            "-c",
+            "copy",
+            path_text(&base_path)?,
+        ])?;
+
+        let total_ms = scenes.iter().map(|scene| scene.duration_ms as u64).sum();
+        let delivery_input = if let Some(music_path) = music_path {
+            let mixed_path = workspace.join("mixed.mp4");
+            let total_seconds = total_ms as f64 / 1000.0;
+            let music_volume = input.music_volume as f64 / 100.0;
+            let fade = if input.music_fade && total_seconds > 1.0 {
+                format!(
+                    ",afade=t=in:st=0:d=1,afade=t=out:st={:.3}:d=1",
+                    (total_seconds - 1.0).max(0.0)
+                )
+            } else {
+                String::new()
+            };
+            let mix_filter = format!(
+                "[1:a]volume={music_volume:.2}{fade}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[a]"
+            );
+            let duration = format!("{total_seconds:.3}");
+            run_ffmpeg(&[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path_text(&base_path)?,
+                "-stream_loop",
+                "-1",
+                "-i",
+                path_text(music_path)?,
+                "-filter_complex",
+                &mix_filter,
+                "-map",
+                "0:v",
+                "-map",
+                "[a]",
+                "-t",
+                &duration,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                path_text(&mixed_path)?,
+            ])?;
+            mixed_path
+        } else {
+            base_path
+        };
+        let subtitle_path =
+            output_directory.join(format!("{}-{}.srt", safe_name(project_title), timestamp()));
+        fs::write(&subtitle_path, build_srt(scenes)).map_err(io_error)?;
+        let output_path = subtitle_path.with_extension("mp4");
+        if matches!(
+            input.subtitle_mode,
+            SubtitleMode::Burn | SubtitleMode::BurnAndSrt
+        ) {
+            let filter_path = subtitle_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace(':', "\\:")
+                .replace('\u{27}', "\\'");
+            run_ffmpeg(&[
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path_text(&delivery_input)?,
+                "-vf",
+                &format!("subtitles='{filter_path}'"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                path_text(&output_path)?,
+            ])?;
+        } else {
+            fs::copy(&delivery_input, &output_path).map_err(io_error)?;
+        }
+        let visible_subtitle = if matches!(input.subtitle_mode, SubtitleMode::Burn) {
+            let _ = fs::remove_file(&subtitle_path);
+            None
+        } else {
+            Some(subtitle_path)
+        };
+        let bytes = fs::read(&output_path).map_err(io_error)?;
+        Ok(ProjectExport {
+            output_path,
+            subtitle_path: visible_subtitle,
+            duration_ms: total_ms,
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        })
+    }
+}
+
+fn build_srt(scenes: &[ExportScene]) -> String {
+    let mut cursor = 0u64;
+    scenes
+        .iter()
+        .enumerate()
+        .map(|(index, scene)| {
+            let start = cursor;
+            cursor += scene.duration_ms as u64;
+            let text = scene
+                .narration
+                .replace(['\r', '\n'], " ")
+                .replace('<', "＜")
+                .replace('>', "＞");
+            format!(
+                "{}\n{} --> {}\n{}\n\n",
+                index + 1,
+                srt_time(start),
+                srt_time(cursor),
+                text.trim()
+            )
+        })
+        .collect()
+}
+
+fn srt_time(milliseconds: u64) -> String {
+    let hours = milliseconds / 3_600_000;
+    let minutes = milliseconds / 60_000 % 60;
+    let seconds = milliseconds / 1_000 % 60;
+    let millis = milliseconds % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
+}
+
+fn run_ffmpeg(args: &[&str]) -> ExportResult<()> {
+    let output = command_output("ffmpeg", args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let tail = detail
+        .lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("；");
+    Err(ExportError::new(
+        "FFMPEG_FAILED",
+        if tail.is_empty() {
+            "FFmpeg 合成失败".to_owned()
+        } else {
+            tail
+        },
+    ))
+}
+
+fn command_output(program: &str, args: &[&str]) -> ExportResult<std::process::Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.output().map_err(|error| {
+        ExportError::new("FFMPEG_UNAVAILABLE", format!("无法启动 FFmpeg：{error}"))
+    })
+}
+
+fn find_executable(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(format!("{name}.exe")))
+        .find(|path| path.is_file())
+}
+
+fn path_text(path: &Path) -> ExportResult<&str> {
+    path.to_str()
+        .ok_or_else(|| ExportError::new("INVALID_PATH", "FFmpeg 暂不支持该文件路径"))
+}
+
+fn safe_name(value: &str) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            ) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let value = value.trim().trim_end_matches(['.', ' ']);
+    if value.is_empty() {
+        "知画成片".to_owned()
+    } else {
+        value.chars().take(60).collect()
+    }
+}
+
+fn timestamp() -> String {
+    Utc::now().format("%Y%m%d-%H%M%S").to_string()
+}
+fn io_error(error: std::io::Error) -> ExportError {
+    ExportError::new("EXPORT_IO_ERROR", format!("导出文件操作失败：{error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_monotonic_srt_and_sanitizes_markup() {
+        let scenes = vec![
+            ExportScene {
+                narration: "第一句".into(),
+                duration_ms: 5_000,
+                video_path: "a".into(),
+                audio_path: "b".into(),
+            },
+            ExportScene {
+                narration: "第二句 <b>".into(),
+                duration_ms: 10_000,
+                video_path: "c".into(),
+                audio_path: "d".into(),
+            },
+        ];
+        let srt = build_srt(&scenes);
+        assert!(srt.contains("00:00:00,000 --> 00:00:05,000"));
+        assert!(srt.contains("00:00:05,000 --> 00:00:15,000"));
+        assert!(srt.contains("第二句 ＜b＞"));
+    }
+
+    #[test]
+    fn produces_windows_safe_output_names() {
+        assert_eq!(safe_name("雷电:为什么?/"), "雷电_为什么__");
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg with libx264, aac and subtitles filters"]
+    fn renders_h264_aac_video_with_burned_and_sidecar_subtitles() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("zhihua.sqlite3");
+        let projects = ProjectStorage::initialize(&database, directory.path().join("projects"))
+            .expect("projects");
+        let exporter = FfmpegExporter::new(projects);
+        let workspace = directory.path().join("work");
+        let output = directory.path().join("output");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&output).expect("output");
+        let video = directory.path().join("input.mp4");
+        let audio = directory.path().join("input.wav");
+        let music = directory.path().join("music.wav");
+        run_ffmpeg(&[
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            path_text(&video).expect("video path"),
+        ])
+        .expect("fixture video");
+        run_ffmpeg(&[
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:a",
+            "pcm_s16le",
+            path_text(&audio).expect("audio path"),
+        ])
+        .expect("fixture audio");
+        run_ffmpeg(&[
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=220:duration=1",
+            "-c:a",
+            "pcm_s16le",
+            path_text(&music).expect("music path"),
+        ])
+        .expect("fixture music");
+        let result = exporter
+            .render(
+                &workspace,
+                &output,
+                "导出测试",
+                &[ExportScene {
+                    narration: "这是字幕测试。".to_owned(),
+                    duration_ms: 1_000,
+                    video_path: video,
+                    audio_path: audio,
+                }],
+                Some(&music),
+                &ExportProjectInput {
+                    project_id: "unused".to_owned(),
+                    output_directory: output.clone(),
+                    frame_rate: 24,
+                    subtitle_mode: SubtitleMode::BurnAndSrt,
+                    narration_volume: 80,
+                    music_asset_id: Some("unused-in-render".into()),
+                    music_volume: 60,
+                    music_fade: true,
+                },
+            )
+            .expect("render export");
+        assert!(result.output_path.is_file());
+        assert!(result.subtitle_path.expect("subtitle path").is_file());
+        let probe = command_output(
+            "ffprobe",
+            &[
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                path_text(&result.output_path).expect("output path"),
+            ],
+        )
+        .expect("ffprobe");
+        let codecs = String::from_utf8_lossy(&probe.stdout);
+        assert!(codecs.contains("h264"));
+        assert!(codecs.contains("aac"));
+    }
+}

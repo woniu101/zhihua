@@ -82,6 +82,54 @@ function workflowFor(request: VideoGenerationRequest): string {
   return `h3-${family}-${quality}-v1`;
 }
 
+export interface LocalGenerationJob {
+  clientRequestId: string;
+  remoteJobId?: string;
+  projectId: string;
+  sceneId: string;
+  kind: string;
+  workflowId: string;
+  status: string;
+  progress: number;
+  workerId?: string;
+  leaseExpiresAt?: string;
+  attempt: number;
+  errorCode?: string;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ComputePoolPlanInput {
+  taskCount: number;
+  policy: {
+    mode: "single" | "elastic";
+    maxWorkers: number;
+    maxInstances: number;
+  };
+  readyWorkers: number;
+  activeInstances: number;
+  accountInstanceQuotaRemaining: number;
+  capacityAvailableInstances: number;
+  affordableNewInstances: number;
+  workersPerNewInstance: number;
+  hourlyCostMinorPerNewInstance?: number;
+  estimatedRuntimeSeconds?: number;
+  currency?: string;
+}
+
+export interface ComputePoolPlan {
+  taskCount: number;
+  plannedWorkers: number;
+  reusableWorkers: number;
+  instancesToCreate: number;
+  queuedTasks: number;
+  estimatedNewInstanceCostMinor?: number;
+  currency?: string;
+  requiresConfirmation: boolean;
+  limitingFactors: string[];
+}
+
 export interface ServiceInputUpload {
   inputId: string;
   remoteFile: string;
@@ -162,6 +210,10 @@ export const serviceRepository = {
   probe: () => invokeNative<ServiceProbe>("probe_service"),
   prepareGeneration: () =>
     invokeNative<ServiceProbe>("prepare_generation_service"),
+  listLocalJobs: (projectId?: string) =>
+    invokeNative<LocalGenerationJob[]>("list_local_jobs", { projectId }),
+  planComputePool: (input: ComputePoolPlanInput) =>
+    invokeNative<ComputePoolPlan>("plan_generation_compute_pool", { input }),
   uploadInput: (sourcePath: string) =>
     invokeNative<ServiceInputUpload>("upload_service_input", { sourcePath }),
   deleteInput: (inputId: string) =>
