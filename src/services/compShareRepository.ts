@@ -155,4 +155,11 @@ export const compShareRepository = {
       ),
       "优云智算接口仅可在桌面客户端中使用。",
     ),
+  clearStopDeadline: async () =>
+    required(
+      await invokeNative<{ deleted: boolean; instance: CompShareInstance }>(
+        "delete_compshare_stop_scheduler",
+      ),
+      "优云智算接口仅可在桌面客户端中使用。",
+    ),
 };

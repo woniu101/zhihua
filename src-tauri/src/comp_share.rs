@@ -191,6 +191,13 @@ pub struct CompShareSchedulerResult {
     pub instance: CompShareInstance,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompShareDeleteSchedulerResult {
+    pub deleted: bool,
+    pub instance: CompShareInstance,
+}
+
 struct CompShareApi {
     client: Client,
     base_url: Url,
@@ -463,7 +470,11 @@ impl CompShareProvider {
         let instance = self
             .describe_exact(&credentials, &instance_id, &region, &zone)
             .await?;
-        let project_id = normalize_optional(input.project_id).or(instance.project_id.clone());
+        let project_id = match normalize_optional(input.project_id).or(instance.project_id.clone())
+        {
+            Some(project_id) => Some(project_id),
+            None => Some(self.default_project_id(&credentials).await?),
+        };
         self.write_metadata(CompShareMetadata {
             bound_instance: Some(BoundInstance {
                 instance_id,
@@ -586,23 +597,23 @@ impl CompShareProvider {
         &self,
         input: UpdateCompShareStopSchedulerInput,
     ) -> CompShareResult<CompShareSchedulerResult> {
-        if input.stop_time <= chrono::Utc::now().timestamp() {
+        if input.stop_time < chrono::Utc::now().timestamp() + 300 {
             return Err(CompShareError::new(
                 "INVALID_STOP_TIME",
-                "定时关机时间必须晚于当前时间",
+                "定时关机时间必须至少晚于当前时间 5 分钟",
             ));
         }
         let credentials = self.credentials()?;
         let mut bound = self.required_bound_instance()?;
-        let project_id = normalize_optional(input.project_id)
-            .or_else(|| bound.project_id.clone())
-            .ok_or_else(|| {
-                CompShareError::new("PROJECT_ID_REQUIRED", "更新定时关机需要优云智算项目 ID")
-            })?;
+        let project_id = if let Some(project_id) =
+            normalize_optional(input.project_id).or_else(|| bound.project_id.clone())
+        {
+            project_id
+        } else {
+            self.default_project_id(&credentials).await?
+        };
         let _current = self.describe_bound(&credentials, &bound).await?;
-        let mut parameters = action_parameters(&bound);
-        parameters.insert("ProjectId".to_string(), project_id.clone());
-        parameters.insert("StopTime".to_string(), input.stop_time.to_string());
+        let parameters = stop_scheduler_parameters(&bound, &project_id, input.stop_time);
         let _: EmptyResponseWire = self
             .api
             .invoke(&credentials, "UpdateCompShareStopScheduler", parameters)
@@ -617,6 +628,44 @@ impl CompShareProvider {
         Ok(CompShareSchedulerResult {
             stop_time: input.stop_time,
             instance,
+        })
+    }
+
+    pub async fn delete_stop_scheduler(&self) -> CompShareResult<CompShareDeleteSchedulerResult> {
+        let credentials = self.credentials()?;
+        let mut bound = self.required_bound_instance()?;
+        let project_id = if let Some(project_id) = bound.project_id.clone() {
+            project_id
+        } else {
+            self.default_project_id(&credentials).await?
+        };
+        let _current = self.describe_bound(&credentials, &bound).await?;
+        let mut parameters = action_parameters(&bound);
+        parameters.insert("ProjectId".to_owned(), project_id.clone());
+        let _: EmptyResponseWire = self
+            .api
+            .invoke(&credentials, "DeleteCompShareStopScheduler", parameters)
+            .await?;
+        if bound.project_id.as_deref() != Some(project_id.as_str()) {
+            bound.project_id = Some(project_id);
+            self.write_metadata(CompShareMetadata {
+                bound_instance: Some(bound.clone()),
+            })?;
+        }
+        let instance = self.describe_bound(&credentials, &bound).await?;
+        Ok(CompShareDeleteSchedulerResult {
+            deleted: true,
+            instance,
+        })
+    }
+
+    async fn default_project_id(&self, credentials: &ApiCredentials) -> CompShareResult<String> {
+        let response: ProjectListResponseWire = self
+            .api
+            .invoke(credentials, "GetProjectList", BTreeMap::new())
+            .await?;
+        select_default_project_id(response.projects).ok_or_else(|| {
+            CompShareError::new("PROJECT_ID_UNAVAILABLE", "优云智算账号没有可用的项目")
         })
     }
 
@@ -779,6 +828,25 @@ fn action_parameters(bound: &BoundInstance) -> BTreeMap<String, String> {
         parameters.insert("ProjectId".to_string(), project_id.clone());
     }
     parameters
+}
+
+fn stop_scheduler_parameters(
+    bound: &BoundInstance,
+    project_id: &str,
+    stop_time: i64,
+) -> BTreeMap<String, String> {
+    let mut parameters = action_parameters(bound);
+    parameters.insert("ProjectId".to_string(), project_id.to_owned());
+    parameters.insert("SchedulerStopTime".to_string(), stop_time.to_string());
+    parameters
+}
+
+fn select_default_project_id(projects: Vec<ProjectWire>) -> Option<String> {
+    projects
+        .iter()
+        .find(|project| project.is_default)
+        .or_else(|| projects.first())
+        .map(|project| project.project_id.clone())
 }
 
 fn sign_parameters(private_key: &str, parameters: &BTreeMap<String, String>) -> String {
@@ -956,6 +1024,20 @@ struct CompShareInstanceWire {
 }
 
 #[derive(Deserialize)]
+struct ProjectListResponseWire {
+    #[serde(rename = "ProjectSet", default)]
+    projects: Vec<ProjectWire>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ProjectWire {
+    #[serde(rename = "ProjectId")]
+    project_id: String,
+    #[serde(rename = "IsDefault", default)]
+    is_default: bool,
+}
+
+#[derive(Deserialize)]
 struct InstanceActionResponseWire {
     #[serde(rename = "RetCode")]
     _ret_code: Value,
@@ -1072,6 +1154,41 @@ mod tests {
         assert_eq!(no_gpu.running_mode, CompShareRunningMode::NoGpu);
         assert_eq!(parse_power_state("Stopping"), CompSharePowerState::Stopping);
         assert_eq!(parse_power_state("surprise"), CompSharePowerState::Unknown);
+    }
+
+    #[test]
+    fn scheduler_uses_current_api_parameter_and_prefers_default_project() {
+        let bound = BoundInstance {
+            instance_id: "uhost-test".to_owned(),
+            region: "cn-test".to_owned(),
+            zone: "cn-test-01".to_owned(),
+            project_id: None,
+        };
+        let parameters = stop_scheduler_parameters(&bound, "org-default", 1_800_000_000);
+        assert_eq!(
+            parameters.get("SchedulerStopTime").map(String::as_str),
+            Some("1800000000")
+        );
+        assert!(!parameters.contains_key("StopTime"));
+        assert_eq!(
+            parameters.get("ProjectId").map(String::as_str),
+            Some("org-default")
+        );
+
+        assert_eq!(
+            select_default_project_id(vec![
+                ProjectWire {
+                    project_id: "org-first".to_owned(),
+                    is_default: false,
+                },
+                ProjectWire {
+                    project_id: "org-default".to_owned(),
+                    is_default: true,
+                },
+            ])
+            .as_deref(),
+            Some("org-default")
+        );
     }
 
     #[tokio::test]

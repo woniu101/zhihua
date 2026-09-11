@@ -189,6 +189,13 @@ async fn update_compshare_stop_scheduler(
 }
 
 #[tauri::command]
+async fn delete_compshare_stop_scheduler(
+    provider: State<'_, CompShareProvider>,
+) -> Result<comp_share::CompShareDeleteSchedulerResult, CompShareError> {
+    provider.delete_stop_scheduler().await
+}
+
+#[tauri::command]
 fn save_ssh_tunnel_configuration(
     manager: State<'_, SshTunnelManager>,
     input: SaveTunnelConfigurationInput,
@@ -1120,7 +1127,20 @@ fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revis
             && instance.running_mode == CompShareRunningMode::Gpu
             && lifecycle.is_current(revision)
         {
-            let _ = provider.stop_instance().await;
+            if provider.stop_instance().await.is_ok()
+                && wait_for_instance_state(
+                    &provider,
+                    CompSharePowerState::Stopped,
+                    None,
+                    Duration::from_secs(120),
+                )
+                .await
+                .is_ok()
+                && lifecycle.is_current(revision)
+            {
+                let _ = provider.delete_stop_scheduler().await;
+                let _ = provider.start_instance(CompShareStartMode::NoGpu).await;
+            }
         }
     });
 }
@@ -1379,6 +1399,7 @@ pub fn run() {
             start_compshare_instance,
             stop_compshare_instance,
             update_compshare_stop_scheduler,
+            delete_compshare_stop_scheduler,
             save_ssh_tunnel_configuration,
             start_ssh_tunnel,
             stop_ssh_tunnel,

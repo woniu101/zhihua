@@ -53,6 +53,16 @@ const computeModeLabel = computed(() => {
   if (mode === "transitioning") return "状态切换中";
   return "等待查询";
 });
+const stopSchedulerLabel = computed(() => {
+  const timestamp = computeInstance.value?.stopSchedulerTime;
+  if (!timestamp) return "当前未设置平台定时关机";
+  return `平台将在 ${new Date(timestamp * 1000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  })} 自动关机`;
+});
 
 const connected = computed(
   () => Boolean(connectionInfo.value?.configured && probe.value?.compatible),
@@ -202,6 +212,29 @@ async function changeComputeMode(mode: "gpu" | "noGpu" | "stop") {
   }
 }
 
+async function toggleStopDeadline() {
+  if (!computeInstance.value || computeInstance.value.state !== "running") return;
+  busy.value = true;
+  try {
+    if (computeInstance.value.stopSchedulerTime) {
+      const result = await compShareRepository.clearStopDeadline();
+      computeInstance.value = result.instance;
+      setComputeNotice("已取消平台定时关机。", "success");
+    } else {
+      const result = await compShareRepository.setStopDeadline(
+        Math.floor(Date.now() / 1000) + 60 * 60,
+        computeConfiguration.value?.projectId,
+      );
+      computeInstance.value = result.instance;
+      setComputeNotice("已设置 60 分钟平台定时关机保障。", "success");
+    }
+  } catch (error) {
+    setComputeNotice(normalizeCompShareError(error).message, "error");
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function refreshConnection() {
   try {
     tunnelStatus.value = await sshTunnelRepository.status();
@@ -285,7 +318,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
       <section class="panel instance"><div class="panel-head"><h2>绑定实例</h2><span :class="computeInstance?.state === 'running' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: computeInstance?.state !== 'running' }"></span>{{ computeModeLabel }}</span></div><div class="instance-main"><div class="server-art">▤</div><div><h2>⌖ {{ computeInstance?.name ?? '尚未绑定实例' }}</h2><p>{{ computeInstance?.gpuType ? `RTX ${computeInstance.gpuType}` : '等待实例信息' }}</p><span class="muted"><span class="dot gray"></span>{{ computeInstance ? `${computeInstance.cpu ?? '--'} 核 · ${computeInstance.memoryMb ? Math.round(computeInstance.memoryMb / 1024) : '--'} GB` : '配置账户后选择实例' }}</span></div><span class="muted"><span class="dot gray"></span>{{ probe?.comfyuiReady ? '可生成' : '生成服务待启动' }}</span></div><div class="instance-metrics"><div><span>当前模式</span><b>{{ computeModeLabel }}</b></div><div><span>GPU 规格</span><b>{{ computeInstance?.gpuType ? `RTX ${computeInstance.gpuType}` : '--' }}</b></div><div><span>区域/可用区</span><b>{{ computeInstance?.zone ?? '--' }}</b></div></div><div class="instance-actions"><button class="btn primary" type="button" :disabled="busy || computeInstance?.state !== 'stopped'" @click="changeComputeMode('gpu')"><Power :size="18"/>启动 GPU</button><button class="btn" type="button" :disabled="busy || !computeInstance || (computeInstance.state !== 'stopped' && computeInstance.state !== 'running')" @click="computeInstance?.state === 'running' ? changeComputeMode('stop') : changeComputeMode('noGpu')"><Wrench :size="18"/>{{ computeInstance?.state === 'running' ? '关机' : '无卡启动' }}</button><button class="btn" type="button" @click="computeOpen=true"><ExternalLink :size="17"/>选择实例</button></div></section>
 
-      <section class="panel shutdown"><div class="panel-title"><h2>自动关机</h2><span class="switch on"></span></div><div class="setting-row"><Timer :size="25"/><div><b>空闲 3 分钟后关机</b><span>实例在设定的空闲时间后自动关机，节省费用。</span></div></div><div class="setting-row"><ClockIcon/><div><b>本次运行上限</b><span>达到时长后自动关机，避免超额费用。</span></div><button>60 分钟　⌄</button></div><div class="setting-row"><CalendarClock :size="24"/><div><b>平台定时关机</b></div><strong class="success-text">已设置　›</strong></div></section>
+      <section class="panel shutdown"><div class="panel-title"><h2>自动关机</h2><span class="switch on"></span></div><div class="setting-row"><Timer :size="25"/><div><b>空闲 3 分钟后关机</b><span>实例在设定的空闲时间后自动关机，节省费用。</span></div></div><div class="setting-row"><ClockIcon/><div><b>本次运行上限</b><span>达到时长后自动关机，避免超额费用。</span></div><button>60 分钟　⌄</button></div><div class="setting-row"><CalendarClock :size="24"/><div><b>平台定时关机</b><span>{{ stopSchedulerLabel }}</span></div><button type="button" :disabled="busy || computeInstance?.state !== 'running'" @click="toggleStopDeadline">{{ computeInstance?.stopSchedulerTime ? '取消' : '设置 60 分钟' }}</button></div></section>
 
       <section class="panel environment"><div class="panel-title"><h2>环境检查</h2><button class="btn link" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="15"/>连接并检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="24"/><b>远端磁盘</b><span>等待优云智算实例接口</span><div class="progress"><i style="width:0"></i></div><strong>未知</strong></div></section>
 
