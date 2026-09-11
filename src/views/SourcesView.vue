@@ -4,6 +4,7 @@ import { AlertTriangle, Check, ChevronRight, Clock3, FileText, Pencil, Plus, Spa
 import type { KnowledgePoint, SourceDocument, SourceKind } from "../domain/sources";
 import { useSourceStore } from "../stores/sources";
 import { useRouter } from "vue-router";
+import ComputeStatus from "../components/ComputeStatus.vue";
 
 const store = useSourceStore();
 const router = useRouter();
@@ -91,7 +92,7 @@ async function createStoryboard() {
   <section class="page sources-page" @dragenter.prevent="dragging=true" @dragover.prevent @dragleave.self="dragging=false" @drop.prevent="onDrop">
     <header class="page-head">
       <div class="page-title-line"><h1>资料整理</h1><span class="subtitle">导入资料，核对原文与来源，再生成分镜脚本</span></div>
-      <div class="head-actions"><div class="status-line compute"><span class="dot gray"></span><strong>优云智算</strong><b>无卡模式</b><span>|</span><span>资料整理不使用 GPU</span></div><button class="btn" @click="chooseFiles"><Upload :size="19"/>导入资料</button><button class="btn" @click="pasteDialog=true"><FileText :size="18"/>粘贴文字</button><button class="btn primary" @click="extractKnowledge"><Sparkles :size="19"/>提取知识点</button></div>
+      <div class="head-actions"><ComputeStatus context="资料整理不使用 GPU" local-only/><button class="btn" @click="chooseFiles"><Upload :size="19"/>导入资料</button><button class="btn" @click="pasteDialog=true"><FileText :size="18"/>粘贴文字</button><button class="btn primary" @click="extractKnowledge"><Sparkles :size="19"/>提取知识点</button></div>
       <input ref="inputRef" class="hidden-input" type="file" multiple accept=".pdf,.pptx,.docx,.txt,image/*" @change="importFiles(($event.target as HTMLInputElement).files ?? [])"/>
     </header>
 
@@ -112,14 +113,14 @@ async function createStoryboard() {
       </aside>
 
       <section class="panel document-panel">
-        <template v-if="store.selected.value"><div class="doc-toolbar"><span class="file-icon" :class="iconColor(store.selected.value.kind)">{{ iconText(store.selected.value.kind) }}</span><strong>{{ store.selected.value.name }}</strong><span class="divider"></span><span>{{ store.selected.value.statusMessage }}</span><button class="plain-action" @click="chooseFiles"><Upload :size="16"/>替换文件</button></div><div class="paper" :class="{pending:store.selected.value.status!=='ready'}"><h2>{{ store.selected.value.name }}</h2><p v-for="(paragraph,index) in store.selected.value.extractedText.split(/\n+/).filter(Boolean)" :key="index" :class="{highlight:index===2}">{{ paragraph }}</p><div v-if="!store.selected.value.extractedText" class="no-preview"><FileText :size="40"/><strong>等待提取文本</strong><span>解析完成后可在这里查看和核对原文。</span></div></div></template>
+        <template v-if="store.selected.value"><div class="doc-toolbar"><span class="file-icon" :class="iconColor(store.selected.value.kind)">{{ iconText(store.selected.value.kind) }}</span><strong>{{ store.selected.value.name }}</strong><span class="divider"></span><span>{{ store.selected.value.statusMessage }}</span><button class="plain-action" @click="chooseFiles"><Upload :size="16"/>继续导入</button></div><div class="paper" :class="{pending:store.selected.value.status!=='ready'}"><h2>{{ store.selected.value.name }}</h2><p v-for="(paragraph,index) in store.selected.value.extractedText.split(/\n+/).filter(Boolean)" :key="index">{{ paragraph }}</p><div v-if="!store.selected.value.extractedText" class="no-preview"><FileText :size="40"/><strong>等待提取文本</strong><span>解析完成后可在这里查看和核对原文。</span></div></div></template>
         <div v-else class="no-preview full"><Upload :size="44"/><strong>导入第一份资料</strong><span>支持 PDF、PPTX、DOCX、TXT 和常见图片。</span><button class="btn primary" @click="chooseFiles">选择文件</button></div>
       </section>
 
       <aside class="panel insight-panel">
         <div class="ai-head"><span class="deepseek">鲸</span><span class="dot"></span><div><strong>DeepSeek 内容规划</strong><small>{{ store.enabledReadyCount.value }} 份资料可用于提取</small></div><button @click="extractKnowledge">重新提取</button></div>
         <div class="insight-scroll">
-          <div class="two-fields"><label>目标受众<span>小学高年级　⌄</span></label><label>建议时长<span><Clock3 :size="17"/>42 秒　⌄</span></label></div>
+          <div class="two-fields"><label>目标受众<span>{{ store.project.value?.audience || '未设置' }}</span></label><label>目标时长<span><Clock3 :size="17"/>{{ store.project.value?.targetDurationSeconds ? `${store.project.value.targetDurationSeconds} 秒` : '未设置' }}</span></label></div>
           <div class="subhead"><h3>核心知识点（{{ store.points.value.length }}）</h3><button @click="store.addPoint"><Plus :size="15"/>自定义添加</button></div>
           <div class="point-list"><button v-for="(point,index) in store.points.value" :key="point.id" :class="{warn:point.needsConfirmation&&!point.confirmed}" @click="focusPoint(point.id)"><b>{{ index+1 }}</b><span>{{ point.title }}</span><i>{{ point.needsConfirmation&&!point.confirmed?'!':'✓' }}</i></button></div>
           <div class="subhead"><h3>来源引用</h3><span>{{ activeSources.length }} 份已启用资料</span></div>

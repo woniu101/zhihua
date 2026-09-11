@@ -1,4 +1,12 @@
-import type { NewProjectInput, ZhihuaProject } from "../domain/projects";
+import {
+  defaultProjectStyleProfile,
+  normalizeProjectStyleProfile,
+  type NewProjectInput,
+  type ProjectStyleProfile,
+  type ZhihuaProject,
+} from "../domain/projects";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import type { SceneDraft } from "../domain/storyboard";
 import { invokeNative, isNativeRuntime, readLocal, writeLocal } from "./nativeBridge";
 
 const STORAGE_KEY = "zhihua.projects.v1";
@@ -22,6 +30,7 @@ const demoProjects: ZhihuaProject[] = [
   shotCount: shotCount as number,
   durationSeconds: durationSeconds as number,
   state: state as ZhihuaProject["state"],
+  styleProfile: defaultProjectStyleProfile(),
   cover: cover as string,
   createdAt: now,
   updatedAt: new Date(Date.now() - index * 3_600_000).toISOString(),
@@ -44,6 +53,7 @@ interface NativeProject {
   audience?: string | null;
   targetDurationSec?: number | null;
   status: NativeProjectStatus;
+  styleProfile?: Partial<ProjectStyleProfile> | null;
   projectDir: string;
   createdAt: string;
   updatedAt: string;
@@ -58,17 +68,34 @@ const stateFromNative: Record<NativeProjectStatus, ZhihuaProject["state"]> = {
   completed: "已完成",
 };
 
-function fromNative(project: NativeProject): ZhihuaProject {
+interface NativeCandidateCover {
+  localPath: string;
+  selected: boolean;
+  createdAt: string;
+}
+
+function projectState(project: NativeProject, scenes: SceneDraft[]): ZhihuaProject["state"] {
+  if (project.status === "completed") return "已完成";
+  if (scenes.some((scene) => scene.status === "generating" || Boolean(scene.pendingRequestId))) return "生成中";
+  if (scenes.length && scenes.every((scene) => Boolean(scene.selectedVersionId))) return "待导出";
+  if (scenes.length) return "编排中";
+  return "草稿";
+}
+
+function fromNative(project: NativeProject, scenes: SceneDraft[] = [], coverUrl?: string): ZhihuaProject {
+  const durationSeconds = Math.round(scenes.reduce((total, scene) => total + scene.targetDurationMs, 0) / 1000);
   return {
     id: project.id,
     title: project.title,
     description: project.audience ? `面向${project.audience}的科普视频项目。` : "本地科普视频项目。",
     audience: project.audience ?? "",
     targetDurationSeconds: project.targetDurationSec ?? null,
-    shotCount: 0,
-    durationSeconds: 0,
-    state: stateFromNative[project.status],
-    cover: "lightning",
+    shotCount: scenes.length,
+    durationSeconds,
+    state: scenes.length ? projectState(project, scenes) : stateFromNative[project.status],
+    styleProfile: normalizeProjectStyleProfile(project.styleProfile),
+    cover: "empty",
+    coverUrl,
     projectDir: project.projectDir,
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
@@ -79,7 +106,22 @@ function fromNative(project: NativeProject): ZhihuaProject {
 export const projectRepository = {
   async list(): Promise<ZhihuaProject[]> {
     const native = await invokeNative<NativeProject[]>("list_projects");
-    return native ? native.map(fromNative) : localList();
+    if (!native) return localList();
+    return Promise.all(native.map(async (project) => {
+      const scenes = (await invokeNative<SceneDraft[]>("list_storyboard_scenes", { projectId: project.id })) ?? [];
+      let coverUrl: string | undefined;
+      for (const scene of scenes) {
+        const candidates = (await invokeNative<NativeCandidateCover[]>("list_candidate_versions", {
+          input: { projectId: project.id, sceneId: scene.id },
+        })) ?? [];
+        const cover = candidates.find((item) => item.selected) ?? candidates[0];
+        if (cover?.localPath) {
+          coverUrl = convertFileSrc(cover.localPath);
+          break;
+        }
+      }
+      return fromNative(project, scenes, coverUrl);
+    }));
   },
 
   async create(input: NewProjectInput): Promise<ZhihuaProject> {
@@ -101,6 +143,7 @@ export const projectRepository = {
       shotCount: 0,
       durationSeconds: 0,
       state: "草稿",
+      styleProfile: defaultProjectStyleProfile(),
       cover: "lightning",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -144,5 +187,25 @@ export const projectRepository = {
     const timestamp = new Date().toISOString();
     persist(localList().map((item) => item.id === id ? { ...item, lastOpenedAt: timestamp, updatedAt: timestamp } : item));
     writeLocal("zhihua.activeProjectId", id);
+  },
+
+  async updateStyleProfile(id: string, styleProfile: ProjectStyleProfile): Promise<ZhihuaProject | undefined> {
+    const normalized = normalizeProjectStyleProfile(styleProfile);
+    const native = await invokeNative<NativeProject>("update_project", {
+      input: { id, styleProfile: normalized },
+    });
+    if (native) return fromNative(native);
+    const timestamp = new Date().toISOString();
+    const projects = localList().map((item) => item.id === id
+      ? { ...item, styleProfile: normalized, updatedAt: timestamp }
+      : item);
+    persist(projects);
+    return projects.find((item) => item.id === id);
+  },
+
+  async active(): Promise<ZhihuaProject | undefined> {
+    const id = readLocal<string | undefined>("zhihua.activeProjectId", undefined);
+    if (!id) return undefined;
+    return (await this.list()).find((project) => project.id === id);
   },
 };

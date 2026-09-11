@@ -1,12 +1,15 @@
 import { computed, ref } from "vue";
 import type { KnowledgePoint, SourceDocument, SourceKind } from "../domain/sources";
 import { sourceRepository } from "../services/sourceRepository";
+import { projectRepository } from "../services/projectRepository";
+import type { ZhihuaProject } from "../domain/projects";
 
 const items = ref<SourceDocument[]>([]);
 const points = ref<KnowledgePoint[]>([]);
 const selectedId = ref<string>();
 const filter = ref<"全部" | SourceKind>("全部");
 const loading = ref(false);
+const project = ref<ZhihuaProject>();
 
 export function useSourceStore() {
   const visibleSources = computed(() => filter.value === "全部" ? items.value : items.value.filter((item) => item.kind === filter.value));
@@ -20,7 +23,7 @@ export function useSourceStore() {
   const load = async () => {
     loading.value = true;
     try {
-      [items.value, points.value] = await Promise.all([sourceRepository.list(), sourceRepository.listKnowledgePoints()]);
+      [items.value, points.value, project.value] = await Promise.all([sourceRepository.list(), sourceRepository.listKnowledgePoints(), projectRepository.active()]);
       selectedId.value ||= items.value[0]?.id;
     } finally { loading.value = false; }
   };
@@ -84,16 +87,25 @@ export function useSourceStore() {
 
   const extractKnowledge = async () => {
     const sourceIds = items.value.filter((item) => item.enabled && item.status === "ready").map((item) => item.id);
-    const extracted = await sourceRepository.extractKnowledge(sourceIds);
+    if (!project.value) throw new Error("请先打开项目");
+    const extracted = await sourceRepository.extractKnowledge(
+      sourceIds,
+      project.value.audience || "通用受众",
+      project.value.targetDurationSeconds ?? 60,
+    );
     if (!extracted) return false;
     points.value = extracted;
     return true;
   };
 
   const createStoryboard = async () => {
-    const created = await sourceRepository.createStoryboard();
+    if (!project.value) throw new Error("请先打开项目");
+    const created = await sourceRepository.createStoryboard(
+      project.value.audience || "通用受众",
+      project.value.targetDurationSeconds ?? 60,
+    );
     return created?.length ?? 0;
   };
 
-  return { items, points, selectedId, selected, filter, loading, visibleSources, enabledReadyCount, unresolvedCount, load, importFiles, importNative, pasteText, toggle, remove, updatePoint, addPoint, extractKnowledge, createStoryboard };
+  return { items, points, project, selectedId, selected, filter, loading, visibleSources, enabledReadyCount, unresolvedCount, load, importFiles, importNative, pasteText, toggle, remove, updatePoint, addPoint, extractKnowledge, createStoryboard };
 }

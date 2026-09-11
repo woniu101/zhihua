@@ -12,16 +12,23 @@ import { ComfyUiH3Provider, normalizeConnectionFailure, serviceRepository } from
 import { ttsRepository, type NarrationArtifact, type SystemVoice } from "../services/ttsRepository";
 import { requestNativePreview } from "../services/exportService";
 import { useStoryboardStore } from "../stores/storyboard";
+import { useWorkspaceStore } from "../stores/workspace";
+import ComputeStatus from "../components/ComputeStatus.vue";
+import { projectStylePrompt } from "../domain/projects";
 
 const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, select, update, save, updateSelected, add, duplicateSelected, removeSelected, moveSelected } = useStoryboardStore();
+const workspace = useWorkspaceStore();
+void workspace.refresh();
 const provider = new ComfyUiH3Provider();
 const task = ref<GenerationJob>();
 const referenceAssets = ref<AssetItem[]>([]);
 const candidateVersions = ref<CandidateVersion[]>([]);
 const enhancedVersions = ref<EnhancedVersion[]>([]);
+const scenePreviewUrls = ref<Record<string, string>>({});
 const previewVersionId = ref("");
 const previewEnhancedId = ref("");
 const taskError = ref("");
+const activeInspector = ref<"content" | "visual" | "generation">("visual");
 const submitting = ref(false);
 const batchSubmitting = ref(false);
 const batchNotice = ref("");
@@ -40,6 +47,11 @@ let narrationAudio: HTMLAudioElement | undefined;
 const pollTimers = new Map<string, number>();
 const pollRetryDelays = new Map<string, number>();
 const pollingJobs = new Set<string>();
+
+function generationPrompt(visualPlan: string): string {
+  const style = projectStylePrompt(workspace.project.value?.styleProfile);
+  return [visualPlan.trim(), style && `项目视觉规范：${style}`].filter(Boolean).join("。\n");
+}
 let recoveredProjectId = "";
 const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
   { id: "t2v", label: "自由生成", symbol: "✦" },
@@ -50,6 +62,12 @@ const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
 const statusLabel = { draft: "待生成", ready: "已就绪", generating: "生成中", generated: "候选版本", approved: "正式版本", failed: "生成失败" } as const;
 const statusTone = { draft: "muted", ready: "success", generating: "warning", generated: "primary", approved: "success", failed: "warning" } as const;
 const durationLabel = computed(() => `${Math.round((selectedScene.value?.targetDurationMs ?? 5000) / 1000)}秒`);
+const totalDurationSeconds = computed(() => scenes.value.reduce((total, scene) => total + scene.targetDurationMs / 1000, 0));
+function formatTimelineTime(seconds: number) {
+  const minutes = Math.floor(seconds / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(Math.round(seconds % 60)).padStart(2, "0")}`;
+}
+const timelineTicks = computed(() => Array.from({ length: 5 }, (_, index) => formatTimelineTime(totalDurationSeconds.value * index / 4)));
 const setDuration = (seconds: 5 | 10 | 15) => updateSelected({ targetDurationMs: (seconds * 1000) as 5000 | 10000 | 15000 });
 const setQuality = (quality: CandidateQuality) => updateSelected({ quality });
 const taskPercent = computed(() => Math.max(0, Math.min(100, Math.round((task.value?.progress ?? 0) * 100))));
@@ -237,6 +255,28 @@ async function loadCandidateVersions(projectId?: string, sceneId?: string) {
   previewEnhancedId.value = enhancedForOfficial.value?.id ?? "";
 }
 
+function updateTextField(field: "title" | "purpose" | "visualPlan", event: Event) {
+  updateSelected({ [field]: (event.target as HTMLInputElement | HTMLTextAreaElement).value });
+}
+
+function updateOnScreenText(event: Event) {
+  const value = (event.target as HTMLTextAreaElement).value;
+  updateSelected({ onScreenText: value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) });
+}
+
+async function loadScenePreview(scene: typeof scenes.value[number]) {
+  const items = await generationRepository.list(scene.projectId, scene.id).catch(() => []);
+  const version = items.find((item) => item.id === scene.selectedVersionId) ?? latestCandidate(items);
+  const next = { ...scenePreviewUrls.value };
+  if (version) next[scene.id] = version.previewUrl;
+  else delete next[scene.id];
+  scenePreviewUrls.value = next;
+}
+
+async function loadAllScenePreviews() {
+  await Promise.all(scenes.value.map(loadScenePreview));
+}
+
 function setReferenceSlot(slot: number, mediaType: AssetMediaType, event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   const scene = selectedScene.value;
@@ -306,6 +346,7 @@ async function refreshTask(sceneId: string, jobId: string) {
           previewVersionId.value = latestCandidate(downloaded)?.id ?? latestCandidate(candidateVersions.value)?.id ?? "";
           task.value = latest;
         }
+        await loadScenePreview(scene);
       }
       update(sceneId, { status: "generated", generationStage: "候选视频已保存到本地" });
     } else {
@@ -415,6 +456,7 @@ async function selectOfficialVersion() {
       status: "approved",
       generationStage: "已设为正式版本",
     });
+    scenePreviewUrls.value = { ...scenePreviewUrls.value, [scene.id]: version.previewUrl };
   } catch (error) {
     taskError.value = normalizeConnectionFailure(error).message;
   }
@@ -442,7 +484,7 @@ async function generateSelected() {
       quality: scene.quality,
       aspectRatio: settings.value.aspectRatio,
       durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
-      prompt: scene.visualPlan,
+      prompt: generationPrompt(scene.visualPlan),
       narration: scene.narration,
       seed: crypto.getRandomValues(new Uint32Array(1))[0],
       assetIds: scene.assetIds,
@@ -497,7 +539,7 @@ async function generateIncompleteScenes() {
         quality: scene.quality,
         aspectRatio: settings.value.aspectRatio,
         durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
-        prompt: scene.visualPlan,
+        prompt: generationPrompt(scene.visualPlan),
         narration: scene.narration,
         seed: crypto.getRandomValues(new Uint32Array(1))[0],
         assetIds: scene.assetIds,
@@ -650,6 +692,7 @@ watch(selectedSceneId, (sceneId) => {
 watch([loading, () => scenes.value[0]?.projectId], async ([isLoading, projectId]) => {
   if (isLoading || !projectId || recoveredProjectId === projectId) return;
   recoveredProjectId = projectId;
+  await loadAllScenePreviews();
   for (const scene of scenes.value) {
     if (await recoverPendingSceneJob(scene.id)) continue;
     if (scene.lastUpscaleJobId && scene.selectedVersionId) {
@@ -670,7 +713,7 @@ const confirmRemove = () => {
 <template>
   <section class="page storyboard-page">
     <header class="story-head">
-      <div><p class="breadcrumb">为什么会打雷？　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><span class="status-line"><span class="dot gray"></span><strong>优云智算</strong><b>无卡模式</b><span>|</span><span>提交生成时自动切换 GPU</span></span></div></div>
+      <div><p class="breadcrumb">{{ workspace.projectTitle.value }}　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><ComputeStatus context="提交生成时自动切换 GPU"/></div></div>
       <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="18"/>{{ previewBusy ? '正在合成' : '预览全片' }}</button></div>
     </header>
 
@@ -681,18 +724,17 @@ const confirmRemove = () => {
         <div v-else-if="!scenes.length" class="empty-storyboard"><Film :size="30"/><b>{{ loadError || '当前项目还没有分镜' }}</b><span>新增一条分镜，填写画面与旁白后即可提交生成。</span><button class="btn primary" :disabled="Boolean(loadError && loadError.includes('先'))" @click="add"><Plus :size="16"/>新增分镜</button></div>
         <div v-else class="shot-list">
           <article v-for="(shot,index) in scenes" :key="shot.id" :class="{selected:selectedSceneId===shot.id}" @click="select(shot.id)">
-            <span class="grab">⠿</span><div class="shot-thumb lightning-image"><b>{{ String(index + 1).padStart(2, '0') }}</b></div><div class="shot-copy"><strong>{{ shot.title }}</strong><p>{{ shot.narration || shot.purpose || '填写旁白与画面描述' }}</p><span :class="`${statusTone[shot.status]}-text`"><i class="dot" :class="statusTone[shot.status]"></i>{{ statusLabel[shot.status] }}</span></div><time>{{ shot.targetDurationMs / 1000 }}秒</time>
+            <span class="grab">⠿</span><div class="shot-thumb"><video v-if="scenePreviewUrls[shot.id]" :src="scenePreviewUrls[shot.id]" muted preload="metadata"></video><span v-else><Film :size="23"/></span><b>{{ String(index + 1).padStart(2, '0') }}</b></div><div class="shot-copy"><strong>{{ shot.title }}</strong><p>{{ shot.narration || shot.purpose || '填写旁白与画面描述' }}</p><span :class="`${statusTone[shot.status]}-text`"><i class="dot" :class="statusTone[shot.status]"></i>{{ statusLabel[shot.status] }}</span></div><time>{{ shot.targetDurationMs / 1000 }}秒</time>
           </article>
         </div>
       </aside>
 
       <section class="preview-column">
         <div class="video-card panel">
-          <div class="video-preview" :class="{ 'lightning-image': !previewMedia }">
+          <div class="video-preview">
             <video v-if="previewMedia" :key="previewMedia.id" :src="previewMedia.previewUrl" controls preload="metadata"></video>
+            <div v-else class="empty-preview"><Film :size="46"/><b>等待生成候选视频</b><span>填写右侧画面描述，然后点击“生成选中分镜”。</span></div>
             <span class="video-label">{{ settings.aspectRatio }} · {{ previewEnhanced ? '1080p 增强版' : previewVersion ? previewVersion.workflowId : '候选预览' }}</span>
-            <span v-if="!previewMedia" class="timecode">等待生成</span>
-            <div v-if="!previewMedia" class="caption">{{ selectedScene?.narration || '生成完成后在这里预览候选视频。' }}</div>
           </div>
           <div v-if="!previewVersion" class="player"><button><Play :size="19" fill="currentColor"/></button><button>Ⅰ◀</button><button>▶Ⅰ</button><strong>00:00</strong><span>/ --:--</span><div class="scrub"><i style="width:0"></i></div><Volume2 :size="19"/><div class="volume"><i style="width:55%"></i></div><Maximize2 :size="18"/></div>
         </div>
@@ -709,43 +751,64 @@ const confirmRemove = () => {
       </section>
 
       <aside class="panel inspector">
-        <div class="inspector-tabs"><button>内容</button><button>画面</button><button class="active">生成</button></div>
-        <div class="inspector-body">
-          <label class="section-label">生成方式</label>
-          <div class="mode-grid"><button v-for="item in modes" :key="item.id" :class="{active:selectedScene?.generationMode===item.id}" @click="chooseMode(item.id)"><span>{{ item.symbol }}</span>{{ item.label }}</button></div>
-          <div v-if="selectedScene && selectedScene.generationMode !== 't2v'" class="reference-inputs">
-            <div class="field-head"><label class="section-label">参考素材</label><RouterLink to="/assets">管理素材　›</RouterLink></div>
-            <label v-if="selectedScene.generationMode === 'i2v' || selectedScene.generationMode === 'continue'"><span>首帧图片</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
-            <template v-else-if="selectedScene.generationMode === 'flf2v'">
-              <label><span>首帧图片</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
-              <label><span>尾帧图片</span><select :value="selectedReferenceIds[1] ?? ''" :disabled="!selectedReferenceIds[0]" @change="setReferenceSlot(1, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
-            </template>
-            <template v-else-if="selectedScene.generationMode === 'r2v'">
-              <label><span>参考视频</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'video', $event)"><option value="">请选择视频</option><option v-for="asset in videoAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
-              <label><span>参考图片</span><select :value="selectedReferenceIds[1] ?? ''" :disabled="!selectedReferenceIds[0]" @change="setReferenceSlot(1, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
-            </template>
-            <p v-if="!referenceAssets.length">当前项目暂无可用素材，请先到素材页导入。</p>
-          </div>
-          <div class="field-head"><label class="section-label">系统旁白 / 解说文案</label><a>♟ 重写文案</a></div>
-          <textarea :value="selectedScene?.narration" @input="updateNarrationText"></textarea>
-          <div class="field-head"><label class="section-label">时长</label><label class="section-label">配音音色</label></div>
-          <div class="voice-row"><div class="segmented"><button v-for="seconds in [5,10,15] as const" :key="seconds" :class="{active:durationLabel===`${seconds}秒`}" @click="setDuration(seconds)">{{ seconds }}秒</button></div><select v-model="selectedVoiceId" class="select" aria-label="系统旁白音色"><option v-for="voice in systemVoices" :key="voice.id" :value="voice.id">{{ voice.name }} · {{ voice.locale }}</option></select><button class="round" :disabled="narrationBusy" @click="playNarration"><LoaderCircle v-if="narrationBusy" class="spin" :size="15"/><Play v-else :size="15" fill="currentColor"/></button><button class="btn compact" :disabled="narrationBusy" @click="synthesizeNarration(false)"><RotateCcw :size="15"/>{{ narrationArtifact ? '重新生成' : '生成旁白' }}</button></div>
-          <div class="narration-import-row"><select v-model="selectedNarrationAssetId" class="select" aria-label="导入旁白录音"><option value="">从素材库选择已有录音</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select><button class="btn compact" :disabled="narrationBusy || !selectedNarrationAssetId" @click="importNarrationAudio"><Music2 :size="15"/>使用录音</button><RouterLink to="/assets">管理音频素材　›</RouterLink></div>
-          <p v-if="narrationError" class="task-error narration-error">{{ narrationError }}</p>
-          <div class="field-head"><label class="section-label">生成设置</label><span class="warning-text">预计生成约 3 分钟</span></div>
-          <div class="quality-grid"><button :class="{active:selectedScene?.quality==='fast'}" @click="setQuality('fast')"><b>快速 8 步</b><span>约 3 分钟，适合快速预览</span></button><button :class="{active:selectedScene?.quality==='high'}" @click="setQuality('high')"><b>高质量 20 步</b><span>约 5 分钟，会重新生成内容</span></button></div>
-          <label class="section-label audio-label">音轨设置</label><div class="audio-setting"><span class="round filled"><Pause :size="13" fill="currentColor"/></span><div><b>不使用 H3 原生音轨</b><span>{{ narrationArtifact ? `系统旁白已生成 · ${(narrationArtifact.durationMs / 1000).toFixed(1)} 秒` : '正式旁白使用系统 TTS' }}</span></div><a>修改</a></div>
-          <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'enhancement' ? '1080p 增强版' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb lightning-image"></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
+        <div class="inspector-tabs">
+          <button :class="{active:activeInspector==='content'}" @click="activeInspector='content'">内容</button>
+          <button :class="{active:activeInspector==='visual'}" @click="activeInspector='visual'">画面</button>
+          <button :class="{active:activeInspector==='generation'}" @click="activeInspector='generation'">生成</button>
+        </div>
+        <div v-if="!selectedScene" class="inspector-empty"><Film :size="32"/><b>请选择或新增分镜</b></div>
+        <div v-else class="inspector-body">
+          <template v-if="activeInspector==='content'">
+            <label class="editor-field"><span>镜头标题</span><input :value="selectedScene.title" maxlength="80" @input="updateTextField('title',$event)"/></label>
+            <label class="editor-field"><span>本镜头目的</span><textarea :value="selectedScene.purpose" placeholder="说明这段画面要帮助观众理解什么" @input="updateTextField('purpose',$event)"></textarea></label>
+            <div class="field-head"><label class="section-label">系统旁白 / 解说文案</label><span>{{ selectedScene.narration.length }} 字</span></div>
+            <textarea :value="selectedScene.narration" placeholder="输入本镜头旁白" @input="updateNarrationText"></textarea>
+            <label class="editor-field"><span>屏幕文字</span><textarea :value="selectedScene.onScreenText.join('\n')" placeholder="每行一条，留空则只使用旁白字幕" @input="updateOnScreenText"></textarea></label>
+            <div class="field-head"><label class="section-label">旁白声音</label><span>{{ narrationArtifact ? `已生成 ${(narrationArtifact.durationMs / 1000).toFixed(1)} 秒` : '尚未生成' }}</span></div>
+            <div class="voice-row"><select v-model="selectedVoiceId" class="select" aria-label="系统旁白音色"><option v-for="voice in systemVoices" :key="voice.id" :value="voice.id">{{ voice.name }} · {{ voice.locale }}</option></select><button class="round" :disabled="narrationBusy" @click="playNarration"><LoaderCircle v-if="narrationBusy" class="spin" :size="15"/><Play v-else :size="15" fill="currentColor"/></button><button class="btn compact" :disabled="narrationBusy || !selectedScene.narration.trim()" @click="synthesizeNarration(false)"><RotateCcw :size="15"/>{{ narrationArtifact ? '重新生成' : '生成旁白' }}</button></div>
+            <div class="narration-import-row"><select v-model="selectedNarrationAssetId" class="select" aria-label="导入旁白录音"><option value="">从素材库选择已有录音</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select><button class="btn compact" :disabled="narrationBusy || !selectedNarrationAssetId" @click="importNarrationAudio"><Music2 :size="15"/>使用录音</button></div>
+            <p v-if="narrationError" class="task-error narration-error">{{ narrationError }}</p>
+          </template>
+
+          <template v-else-if="activeInspector==='visual'">
+            <label class="editor-field visual-plan"><span>画面描述</span><textarea :value="selectedScene.visualPlan" placeholder="描述主体、动作、场景、镜头和光线；此内容会用于生成候选视频" @input="updateTextField('visualPlan',$event)"></textarea></label>
+            <label class="section-label">生成方式</label>
+            <div class="mode-grid"><button v-for="item in modes" :key="item.id" :class="{active:selectedScene.generationMode===item.id}" @click="chooseMode(item.id)"><span>{{ item.symbol }}</span>{{ item.label }}</button></div>
+            <div v-if="selectedScene.generationMode !== 't2v'" class="reference-inputs">
+              <div class="field-head"><label class="section-label">参考素材</label><RouterLink to="/assets">管理素材　›</RouterLink></div>
+              <label v-if="selectedScene.generationMode === 'i2v' || selectedScene.generationMode === 'continue'"><span>首帧图片</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+              <template v-else-if="selectedScene.generationMode === 'flf2v'">
+                <label><span>首帧图片</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+                <label><span>尾帧图片</span><select :value="selectedReferenceIds[1] ?? ''" :disabled="!selectedReferenceIds[0]" @change="setReferenceSlot(1, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+              </template>
+              <template v-else-if="selectedScene.generationMode === 'r2v'">
+                <label><span>参考视频</span><select :value="selectedReferenceIds[0] ?? ''" @change="setReferenceSlot(0, 'video', $event)"><option value="">请选择视频</option><option v-for="asset in videoAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+                <label><span>参考图片</span><select :value="selectedReferenceIds[1] ?? ''" :disabled="!selectedReferenceIds[0]" @change="setReferenceSlot(1, 'image', $event)"><option value="">请选择图片</option><option v-for="asset in imageAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label>
+              </template>
+              <p v-if="!referenceAssets.length">当前项目暂无可用素材，请先到素材页导入。</p>
+            </div>
+            <div class="visual-summary"><b>提交前检查</b><span>{{ selectedScene.visualPlan.trim() ? '画面描述已填写' : '还需填写画面描述' }}</span><span>{{ selectedScene.generationMode === 't2v' || selectedScene.assetIds.length ? '参考输入已满足' : '还需选择参考素材' }}</span></div>
+          </template>
+
+          <template v-else>
+            <div class="field-head"><label class="section-label">片段时长</label><span>当前 {{ durationLabel }}</span></div>
+            <div class="segmented duration-options"><button v-for="seconds in [5,10,15] as const" :key="seconds" :class="{active:durationLabel===`${seconds}秒`}" @click="setDuration(seconds)">{{ seconds }} 秒</button></div>
+            <div class="field-head"><label class="section-label">质量模式</label><span class="warning-text">耗时受冷启动和队列影响</span></div>
+            <div class="quality-grid"><button :class="{active:selectedScene.quality==='fast'}" @click="setQuality('fast')"><b>快速 8 步</b><span>适合构图和动作候选</span></button><button :class="{active:selectedScene.quality==='high'}" @click="setQuality('high')"><b>高质量 20 步</b><span>生成新的高质量候选</span></button></div>
+            <label class="section-label audio-label">音轨设置</label><div class="audio-setting"><span class="round filled"><Pause :size="13" fill="currentColor"/></span><div><b>不使用 H3 原生音轨</b><span>旁白和音乐在本地合成，候选视频保持静音</span></div></div>
+            <div class="generation-contract"><span>项目画幅</span><b>{{ settings.aspectRatio }}</b><span>候选尺寸</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b><span>1080p</span><b>{{ settings.aspectRatio === '16:9' ? '可选增强' : '暂未开放' }}</b></div>
+            <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'enhancement' ? '1080p 增强版' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb"><Film :size="23"/></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
+          </template>
         </div>
       </aside>
     </div>
 
     <section class="panel timeline">
-      <div class="timeline-toolbar"><button><Play :size="20" fill="currentColor"/></button><b>00:18.4</b><span>/ 00:42.0</span><span class="shutdown"><span class="dot"></span>队列结束后自动关机</span><span class="zoom">−　━━━━　＋　 <button>适应</button></span></div>
-      <div class="ruler"><span>0:00</span><span>0:10</span><span>0:20</span><span>0:30</span><span>0:40</span></div>
+      <div class="timeline-toolbar"><button title="合成并预览全片" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="20" fill="currentColor"/></button><b>{{ scenes.length }} 个镜头</b><span>/ {{ formatTimelineTime(totalDurationSeconds) }}</span><span class="shutdown"><span class="dot"></span>队列结束后自动回到无卡模式</span><span class="timeline-note">时间线按镜头时长排列</span></div>
+      <div class="ruler"><span v-for="tick in timelineTicks" :key="tick">{{ tick }}</span></div>
       <div class="tracks">
         <div class="track-labels"><span><Film :size="18"/>画面</span><span>♩　旁白</span><span><Subtitles :size="18"/>字幕</span><span><Music2 :size="18"/>音乐</span></div>
-        <div class="track-content"><div class="video-track"><i v-for="(shot,index) in scenes" :key="shot.id" class="lightning-image"><b>{{ String(index + 1).padStart(2, '0') }}</b> {{ shot.title }}</i></div><div class="voice-track"><i v-for="shot in scenes" :key="shot.id">▥　{{ shot.title }}</i></div><div class="subtitle-track"><i v-for="shot in scenes" :key="shot.id">{{ shot.title }}</i></div><div class="music-track">♫　轻柔科普氛围音乐 -18 dB　﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏</div><div class="playhead"></div></div>
+        <div class="track-content"><div class="video-track"><i v-for="(shot,index) in scenes" :key="shot.id"><video v-if="scenePreviewUrls[shot.id]" :src="scenePreviewUrls[shot.id]" muted preload="metadata"></video><span><b>{{ String(index + 1).padStart(2, '0') }}</b> {{ shot.title }}</span></i></div><div class="voice-track"><i v-for="shot in scenes" :key="shot.id">▥　{{ shot.narration ? shot.title : '尚未生成旁白' }}</i></div><div class="subtitle-track"><i v-for="shot in scenes" :key="shot.id">{{ shot.narration || '尚无字幕文本' }}</i></div><div class="music-track">♫　背景音乐在导出页按需选择</div></div>
       </div>
     </section>
 
@@ -766,4 +829,6 @@ const confirmRemove = () => {
 .reference-inputs{margin:-3px 0 12px;padding:9px 10px;border:1px solid #d9e4f1;border-radius:8px;background:#f8fbff;display:grid;grid-template-columns:1fr 1fr;gap:7px}.reference-inputs .field-head{grid-column:1/-1;margin:0 0 2px}.reference-inputs .field-head a{color:var(--blue);font-size:12px}.reference-inputs label{display:flex;flex-direction:column;gap:4px;color:#52698c;font-size:11px}.reference-inputs select{height:34px;min-width:0;border:1px solid #cfdced;border-radius:6px;background:#fff;padding:0 8px;color:#203b65}.reference-inputs p{grid-column:1/-1;color:#7385a2;font-size:11px}
 .narration-import-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;margin-top:7px}.narration-import-row .select{height:34px}.narration-import-row a{color:var(--blue);font-size:11px;white-space:nowrap}
 .full-preview-backdrop{position:fixed;z-index:95;inset:30px 0 0;display:grid;place-items:center;background:rgba(5,18,40,.72);backdrop-filter:blur(3px)}.full-preview-dialog{width:min(1050px,82vw);overflow:hidden;border:1px solid #6d7f9b;border-radius:13px;background:#071326;box-shadow:0 26px 80px rgba(0,0,0,.38)}.full-preview-dialog header{height:68px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;color:#fff;background:#0d1c33}.full-preview-dialog header h2{color:#fff}.full-preview-dialog header p{margin-top:4px;color:#aab9cf;font-size:12px}.full-preview-dialog header button{width:38px;height:38px;border:0;border-radius:8px;display:grid;place-items:center;color:#d7e2f1;background:transparent}.full-preview-dialog header button:hover{background:#1a2d49}.full-preview-dialog video{display:block;width:100%;max-height:calc(82vh - 98px);aspect-ratio:16/9;object-fit:contain;background:#000}
+.shot-thumb{overflow:hidden;background:#e9f0f8}.shot-thumb video{width:100%;height:100%;display:block;object-fit:cover}.shot-thumb>span{width:100%;height:100%;display:grid;place-items:center;color:#7c8fae}.empty-preview{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#8395af;background:#0a1728}.empty-preview b{font-size:18px;color:#e2eaf5}.empty-preview span{font-size:13px}.task-thumb{display:grid;place-items:center;background:#eaf2fb;color:#5c7da8}.video-track i{position:relative;overflow:hidden;background:#203b64}.video-track i video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.video-track i>span{position:relative;z-index:1;text-shadow:0 1px 4px #07162c}.video-track i:not(:has(video)){background:#dbe6f3;color:#496482}.video-track i:not(:has(video))>span{text-shadow:none}
+.inspector-empty{height:calc(100% - 44px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--muted)}.editor-field{display:flex;flex-direction:column;gap:7px;margin-bottom:14px;font-size:13px;font-weight:700}.editor-field input,.editor-field textarea{width:100%;border:1px solid #d4dfef;border-radius:7px;background:var(--surface);padding:9px 11px}.editor-field input{height:42px}.editor-field textarea{height:80px}.editor-field.visual-plan textarea{height:148px;font-size:14px}.editor-field input:focus,.editor-field textarea:focus{outline:2px solid #d7e8ff;border-color:var(--blue)}.visual-summary{margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);display:flex;flex-direction:column;gap:6px}.visual-summary span{font-size:12px;color:var(--muted)}.duration-options{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:15px}.timeline-note{margin-left:auto;color:var(--muted);font-size:12px}.timeline-toolbar>button:disabled{opacity:.5;cursor:not-allowed}
 </style>

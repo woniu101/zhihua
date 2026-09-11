@@ -385,6 +385,11 @@ fn get_storage_info(storage: State<'_, ProjectStorage>) -> StorageInfo {
 }
 
 #[tauri::command]
+fn get_storage_usage(storage: State<'_, ProjectStorage>) -> Result<storage::StorageUsage, String> {
+    storage.usage().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn open_projects_root(storage: State<'_, ProjectStorage>) -> Result<(), String> {
     let path = storage.info().projects_root;
     std::process::Command::new("explorer")
@@ -1532,6 +1537,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_storage_info,
+            get_storage_usage,
             open_projects_root,
             create_project,
             list_projects,

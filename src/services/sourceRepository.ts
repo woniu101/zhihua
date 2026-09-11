@@ -173,20 +173,20 @@ export const sourceRepository = {
   },
   async remove(id: string): Promise<void> { await invokeOptional("delete_source", { id }); },
   async setEnabled(id: string, enabled: boolean): Promise<void> { await invokeOptional("set_source_enabled", { input: { id, enabled } }); },
-  async extractKnowledge(sourceIds: string[]): Promise<KnowledgePoint[] | undefined> {
+  async extractKnowledge(sourceIds: string[], targetAudience: string, targetDurationSec: number): Promise<KnowledgePoint[] | undefined> {
     if (!isNativeRuntime()) return undefined;
     const projectId = activeProjectId();
     if (!projectId) throw new Error("请先在项目页创建或打开一个项目");
     return invokeNative<KnowledgePoint[]>("knowledge_extract", {
-      input: { projectId, sourceIds, targetAudience: "小学高年级", targetDurationSec: 42 },
+      input: { projectId, sourceIds, targetAudience, targetDurationSec },
     });
   },
-  async createStoryboard(): Promise<SceneDraft[] | undefined> {
+  async createStoryboard(targetAudience: string, targetDurationSec: number): Promise<SceneDraft[] | undefined> {
     if (!isNativeRuntime()) return undefined;
     const projectId = activeProjectId();
     if (!projectId) throw new Error("请先在项目页创建或打开一个项目");
     return invokeNative<SceneDraft[]>("storyboard_generate_from_knowledge", {
-      input: { projectId, targetAudience: "小学高年级", targetDurationSec: 42 },
+      input: { projectId, targetAudience, targetDurationSec },
     });
   },
 };

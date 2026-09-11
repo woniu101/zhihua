@@ -130,6 +130,15 @@ pub struct StorageInfo {
     pub schema_version: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageUsage {
+    pub project_bytes: u64,
+    pub database_bytes: u64,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectStorage {
     database_path: PathBuf,
@@ -180,6 +189,15 @@ impl ProjectStorage {
             projects_root: self.projects_root.clone(),
             schema_version: SCHEMA_VERSION,
         }
+    }
+
+    pub fn usage(&self) -> Result<StorageUsage, StorageError> {
+        Ok(StorageUsage {
+            project_bytes: directory_size(&self.projects_root)?,
+            database_bytes: fs::metadata(&self.database_path).map(|value| value.len()).unwrap_or(0),
+            available_bytes: fs2::available_space(&self.projects_root)?,
+            total_bytes: fs2::total_space(&self.projects_root)?,
+        })
     }
 
     fn connection(&self) -> Result<Connection, StorageError> {
@@ -431,6 +449,20 @@ impl ProjectStorage {
         }
         Ok(())
     }
+}
+
+fn directory_size(path: &Path) -> Result<u64, StorageError> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
