@@ -18,7 +18,7 @@ interface AssetStoreState {
   selectedId: string | null;
   activeCategory: "全部" | AssetCategory;
   query: string;
-  detailTab: "versions" | "links";
+  detailTab: "versions" | "links" | "frame";
   notice: string;
 }
 

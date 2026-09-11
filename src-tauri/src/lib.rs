@@ -3,6 +3,7 @@ mod comp_share;
 mod compute_pool;
 mod deepseek;
 mod export;
+mod frame_composition;
 mod frame_profile;
 mod generation;
 mod job_queue;
@@ -30,6 +31,10 @@ use deepseek::{
     SaveDeepSeekConfigurationInput,
 };
 use export::{ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, ProjectExport};
+use frame_composition::{
+    FrameComposition, FrameCompositionError, FrameCompositionStorage, GetFrameCompositionInput,
+    SaveFrameCompositionInput,
+};
 use generation::{
     CandidateVersion, EnhancedVersion, GenerationError, GenerationStorage, RecordCandidateInput,
     RecordEnhancedInput,
@@ -1191,6 +1196,22 @@ fn safe_path_component(value: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_frame_composition(
+    storage: State<'_, FrameCompositionStorage>,
+    input: GetFrameCompositionInput,
+) -> Result<Option<FrameComposition>, FrameCompositionError> {
+    storage.get(input)
+}
+
+#[tauri::command]
+fn save_frame_composition(
+    storage: State<'_, FrameCompositionStorage>,
+    input: SaveFrameCompositionInput,
+) -> Result<FrameComposition, FrameCompositionError> {
+    storage.save(input)
+}
+
+#[tauri::command]
 fn list_assets(
     storage: State<'_, AssetStorage>,
     project_id: String,
@@ -1294,6 +1315,8 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let asset_storage = AssetStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let frame_compositions = FrameCompositionStorage::initialize(storage.clone())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let generation_storage = GenerationStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let job_queue = JobQueueStorage::initialize(storage.clone())
@@ -1319,6 +1342,7 @@ pub fn run() {
             app.manage(source_storage);
             app.manage(storyboard_storage);
             app.manage(asset_storage);
+            app.manage(frame_compositions);
             app.manage(generation_storage);
             app.manage(job_queue);
             app.manage(tts);
@@ -1395,6 +1419,8 @@ pub fn run() {
             select_candidate_version,
             download_completed_job,
             download_completed_enhancement,
+            get_frame_composition,
+            save_frame_composition,
             list_assets,
             import_asset_files,
             import_asset_payload,

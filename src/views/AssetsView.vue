@@ -1,19 +1,37 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { ChevronDown, FileAudio2, Link2, MoreVertical, Search, Trash2, Upload, X } from "lucide-vue-next";
 import { ASSET_CATEGORIES, currentAssetVersion, type AssetCategory, type AssetItem } from "../domain/assets";
+import { frameProfile } from "../domain/frameProfiles";
+import {
+  frameCompositionRepository,
+  type FrameBackgroundMode,
+  type FrameComposition,
+  type FrameFitMode,
+} from "../services/frameCompositionRepository";
+import { activeProjectId } from "../services/storyboardRepository";
 import { useAssetStore } from "../stores/assets";
+import { useStoryboardStore } from "../stores/storyboard";
 import { isNativeRuntime } from "../services/nativeBridge";
 
 const store = useAssetStore();
+const storyboard = useStoryboardStore();
 const uploadInput = ref<HTMLInputElement | null>(null);
 const replaceInput = ref<HTMLInputElement | null>(null);
 const dragActive = ref(false);
+const composition = ref<FrameComposition>();
+const fitMode = ref<FrameFitMode>("cover");
+const focalX = ref(0.5);
+const focalY = ref(0.5);
+const backgroundMode = ref<FrameBackgroundMode>("edge");
+const compositionBusy = ref(false);
+const compositionNotice = ref("");
 const selected = store.selectedAsset;
 const selectedVersion = store.currentVersion;
+const activeProfile = computed(() => frameProfile(storyboard.settings.value.aspectRatio));
 const selectedVersionIndex = computed(() => {
   if (!selected.value) return 0;
   return selected.value.versions.findIndex((item) => item.id === selected.value?.currentVersionId) + 1;
@@ -63,7 +81,70 @@ function previewStyle(asset: AssetItem) {
 }
 function currentPreviewStyle() {
   const previewUrl = selectedVersion.value?.previewUrl;
-  return previewUrl ? { backgroundImage: `url(${JSON.stringify(previewUrl)})` } : undefined;
+  if (!previewUrl) return undefined;
+  return {
+    backgroundImage: `url(${JSON.stringify(previewUrl)})`,
+    backgroundSize: fitMode.value,
+    backgroundPosition: `${Math.round(focalX.value * 100)}% ${Math.round(focalY.value * 100)}%`,
+    backgroundRepeat: "no-repeat",
+  };
+}
+function framePreviewStyle() {
+  return {
+    ...currentPreviewStyle(),
+    aspectRatio: `${activeProfile.value.visibleWidth} / ${activeProfile.value.visibleHeight}`,
+  };
+}
+
+async function loadComposition() {
+  const projectId = activeProjectId();
+  const asset = selected.value;
+  const version = selectedVersion.value;
+  if (!projectId || !asset || !version || asset.mediaType !== "image") {
+    composition.value = undefined;
+    if (store.state.detailTab === "frame") store.state.detailTab = "versions";
+    return;
+  }
+  const saved = await frameCompositionRepository.get({
+    projectId,
+    assetId: asset.id,
+    assetVersionId: version.id,
+    aspectRatio: storyboard.settings.value.aspectRatio,
+  }).catch(() => undefined);
+  composition.value = saved ?? undefined;
+  fitMode.value = saved?.fitMode ?? "cover";
+  focalX.value = saved?.focalX ?? 0.5;
+  focalY.value = saved?.focalY ?? 0.5;
+  backgroundMode.value = saved?.backgroundMode ?? "edge";
+  compositionNotice.value = saved ? "已载入该版本的项目画幅构图" : "尚未保存该画幅构图";
+}
+
+async function saveComposition() {
+  const projectId = activeProjectId();
+  const asset = selected.value;
+  const version = selectedVersion.value;
+  if (!projectId || !asset || !version || asset.mediaType !== "image") return;
+  compositionBusy.value = true;
+  compositionNotice.value = "正在保存画幅构图";
+  try {
+    const saved = await frameCompositionRepository.save({
+      projectId,
+      assetId: asset.id,
+      assetVersionId: version.id,
+      aspectRatio: storyboard.settings.value.aspectRatio,
+      fitMode: fitMode.value,
+      focalX: focalX.value,
+      focalY: focalY.value,
+      backgroundMode: backgroundMode.value,
+    });
+    if (!saved) throw new Error("画幅构图只能在桌面客户端中保存");
+    composition.value = saved;
+    compositionNotice.value = `${saved.aspectRatio} 构图已保存，不会修改原图`;
+  } catch (error) {
+    compositionNotice.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    compositionBusy.value = false;
+  }
 }
 async function importSelection(event: Event, source: "本地上传" | "剪贴板" = "本地上传") {
   const input = event.target as HTMLInputElement;
@@ -105,6 +186,15 @@ async function onPaste(event: ClipboardEvent) {
 function setCategory(event: Event) {
   store.changeCategory((event.target as HTMLSelectElement).value as AssetCategory);
 }
+watch(
+  [
+    () => selected.value?.id,
+    () => selectedVersion.value?.id,
+    () => storyboard.settings.value.aspectRatio,
+  ],
+  () => void loadComposition(),
+  { immediate: true },
+);
 onMounted(() => {
   window.addEventListener("paste", onPaste);
   void store.loadActiveProject();
@@ -170,13 +260,23 @@ onBeforeUnmount(() => {
           <p><span>来源</span>{{ selected.source }}</p><p><span>规格</span>{{ selectedVersion.dimensions ?? selectedVersion.duration ?? '待读取' }} · {{ selectedVersion.format }}</p><p><span>版本</span>{{ selectedVersion.label }}　|　共 {{ selected.versions.length }} 个历史版本</p><p><span>导入时间</span>{{ selectedVersion.createdAt }}</p>
           <label>描述 <textarea :value="selected.description" @change="store.updateDescription(($event.target as HTMLTextAreaElement).value)"></textarea></label>
         </div>
-        <div class="detail-tabs"><button :class="{active:store.state.detailTab==='versions'}" @click="store.state.detailTab='versions'">版本记录 ({{ selected.versions.length }})</button><button :class="{active:store.state.detailTab==='links'}" @click="store.state.detailTab='links'">关联分镜 ({{ selected.linkedShotIds.length }})</button></div>
+        <div class="detail-tabs"><button :class="{active:store.state.detailTab==='versions'}" @click="store.state.detailTab='versions'">版本记录 ({{ selected.versions.length }})</button><button :class="{active:store.state.detailTab==='links'}" @click="store.state.detailTab='links'">关联分镜 ({{ selected.linkedShotIds.length }})</button><button v-if="selected.mediaType==='image'" :class="{active:store.state.detailTab==='frame'}" @click="store.state.detailTab='frame'">画幅适配</button></div>
         <div v-if="store.state.detailTab==='versions'" class="version-list">
           <article v-for="version in selected.versions" :key="version.id" :class="{selected:version.id===selected.currentVersionId}" @click="store.activateVersion(version.id)"><span class="version-thumb" :class="`asset-${selected.fallbackImage}`" :style="version.previewUrl ? {backgroundImage:`url(${JSON.stringify(version.previewUrl)})`} : undefined"></span><div><b>{{ version.label }}</b><small>{{ version.createdAt }}</small><p>{{ version.note }}</p></div><em v-if="version.id===selected.currentVersionId">当前版本</em><button v-else>设为当前</button></article>
         </div>
-        <div v-else class="link-list">
+        <div v-else-if="store.state.detailTab==='links'" class="link-list">
           <article v-for="shotId in selected.linkedShotIds" :key="shotId"><span class="link-badge">{{ shotId }}</span><div><b>分镜 {{ shotId }}</b><small>使用当前素材版本</small></div><button class="btn link" @click="store.unlinkShot(shotId)">解除关联</button></article>
           <div v-if="!selected.linkedShotIds.length" class="empty-links"><Link2 :size="25"/><b>暂未关联分镜</b><span>可在分镜页将本素材绑定为参考输入</span></div>
+        </div>
+        <div v-else class="frame-editor">
+          <div class="frame-preview" :style="framePreviewStyle()"><span>{{ activeProfile.aspectRatio }} · 最终可见画框</span></div>
+          <div class="frame-choice"><button :class="{active:fitMode==='cover'}" @click="fitMode='cover'">裁切填满</button><button :class="{active:fitMode==='contain'}" @click="fitMode='contain'">完整显示</button></div>
+          <label><span>主体水平位置</span><input v-model.number="focalX" type="range" min="0" max="1" step="0.01"/></label>
+          <label><span>主体垂直位置</span><input v-model.number="focalY" type="range" min="0" max="1" step="0.01"/></label>
+          <label v-if="fitMode==='contain'"><span>留白处理</span><select v-model="backgroundMode"><option value="edge">延展边缘</option><option value="blur">模糊背景</option><option value="solid">纯色背景</option></select></label>
+          <p>{{ activeProfile.visibleWidth }}×{{ activeProfile.visibleHeight }} 可见画面 · {{ activeProfile.workWidth }}×{{ activeProfile.workHeight }} H3 工作画布</p>
+          <button class="btn primary" :disabled="compositionBusy" @click="saveComposition">{{ compositionBusy ? '正在保存' : '保存该画幅构图' }}</button>
+          <small>{{ compositionNotice }}</small>
         </div>
         <footer><button class="btn primary" @click="chooseReplacement">▣　替换文件</button><button v-if="selected.linkedShotIds.length" class="btn" @click="store.unlinkAll">解除全部关联</button><button v-else class="btn danger" @click="store.removeSelected"><Trash2 :size="16"/>删除素材</button><input ref="replaceInput" class="visually-hidden" type="file" :accept="replacementAccept" @change="replaceSelection"/></footer>
       </aside>
@@ -187,4 +287,5 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .assets-page{display:grid;grid-template-rows:90px 46px minmax(0,1fr);gap:8px}.breadcrumb{color:#576b8f;margin:0 0 6px 4px}.status-pill{height:42px;border:1px solid var(--line);border-radius:8px;background:#fff;display:flex;align-items:center;gap:8px;padding:0 14px;font-weight:650}.search-box{min-width:220px}.visually-hidden{position:fixed;left:-10000px;width:1px;height:1px;opacity:0}.asset-tabs{display:flex;align-items:center;gap:9px}.asset-tabs .tab-btn{min-width:78px}.asset-notice{margin-left:auto;max-width:360px;color:#526b91;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-layout{min-height:0;display:grid;grid-template-columns:minmax(620px,1fr) 426px;gap:15px}.asset-library{min-height:0;display:flex;flex-direction:column;gap:10px}.drop-zone{height:80px;border:1.5px dashed #5a9dff;border-radius:9px;background:transparent;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--blue);gap:3px}.drop-zone.dragging{background:#eaf3ff;border-style:solid}.drop-zone b{font-size:14px}.drop-zone span{font-size:12px;color:#7184a3}.asset-grid{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:minmax(130px,1fr);gap:11px;overflow:auto;padding:1px}.asset-grid article{min-height:130px;border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden;box-shadow:var(--shadow);display:grid;grid-template-rows:minmax(70px,1fr) 31px 29px;cursor:pointer}.asset-grid article.selected{border:2px solid var(--blue)}.asset-thumb,.detail-preview,.version-thumb,.mini-img{background-position:center;background-size:cover}.asset-clouds{background-image:url('../assets/asset-clouds.jpg')}.asset-bolt{background-image:url('../assets/asset-bolt.jpg')}.asset-runner{background-image:url('../assets/asset-runner.jpg')}.asset-mountain{background-image:url('../assets/asset-mountain.jpg')}.asset-palette{background-image:url('../assets/asset-palette.jpg')}.asset-audio{background-image:url('../assets/asset-audio.jpg')}.asset-safety{background-image:url('../assets/asset-safety.jpg')}.asset-village{background-image:url('../assets/asset-village.jpg')}.asset-street{background-image:url('../assets/asset-street.jpg')}.asset-thumb{position:relative}.audio-mark{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff;filter:drop-shadow(0 2px 4px #18355e)}.selected-mark{position:absolute;right:8px;top:8px;width:25px;height:25px;border-radius:50%;display:grid;place-items:center;color:#fff;background:var(--blue)}.asset-name{padding:3px 10px;display:flex;align-items:center;justify-content:space-between;min-width:0}.asset-name h3{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-name h3 span{font-size:11px;color:var(--blue);background:#e9f3ff;padding:3px 6px;border-radius:4px}.asset-name button{border:0;background:transparent}.asset-grid article footer{padding:0 10px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#64789a}.asset-grid footer a{display:flex;align-items:center;gap:4px;color:var(--blue)}.empty-assets{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:#7184a3}.style-profile{height:170px;padding:9px 11px}.style-head{display:flex;align-items:center;justify-content:space-between;height:30px}.style-head h3{display:flex;align-items:center}.style-head a{color:var(--blue);font-size:12px}.style-items{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}.style-items>div{height:111px;border:1px solid #dfe7f2;border-radius:7px;padding:8px;display:flex;flex-direction:column;gap:5px}.style-items small{color:#354c72}.style-items b{font-size:10px;color:#617595}.mini-img{height:46px;border-radius:5px}.colors{font-size:23px;white-space:nowrap;color:#0f5aa8}.ban{height:46px;display:grid;place-items:center;color:#f44336;font-size:38px}.asset-detail{min-height:0;display:flex;flex-direction:column;overflow:hidden}.asset-detail .panel-head button{border:0;background:transparent}.detail-preview{height:198px;margin:0 15px;position:relative;border-radius:8px}.detail-preview>span{position:absolute;right:8px;bottom:8px;color:#fff;background:#071a38;padding:4px 7px;border-radius:4px;font-size:11px}.detail-audio{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff}.detail-form{padding:10px 16px;display:flex;flex-direction:column;gap:7px}.detail-form label{display:grid;grid-template-columns:72px 1fr;align-items:start;font-size:12px}.detail-form input,.detail-form select,.detail-form textarea{border:1px solid #d5e0ef;border-radius:6px;background:#fff;min-height:34px;padding:0 9px}.detail-form p{font-size:12px}.detail-form p span{display:inline-block;width:72px;color:#5f7396}.detail-form textarea{height:70px;resize:none;padding:8px;line-height:1.5}.detail-tabs{height:42px;border-bottom:1px solid var(--line);display:flex;padding:0 15px;gap:30px}.detail-tabs button{border:0;background:transparent;position:relative;font-weight:700}.detail-tabs .active{color:var(--blue)}.detail-tabs .active:after{content:"";position:absolute;bottom:0;left:0;right:0;height:3px;background:var(--blue)}.version-list,.link-list{padding:8px 15px;display:flex;flex-direction:column;gap:8px;overflow:auto}.version-list article{min-height:64px;border:1px solid #dbe4f0;border-radius:7px;display:flex;align-items:center;gap:10px;padding:6px;cursor:pointer}.version-list article.selected{border-color:var(--blue);background:#f3f7ff}.version-thumb{width:82px;height:48px;border-radius:5px;flex:0 0 auto}.version-list small{margin-left:8px;color:#6c80a1}.version-list p{font-size:11px;color:#637797;margin-top:4px}.version-list em{margin-left:auto;font-style:normal;color:var(--blue);font-size:11px}.version-list article>button{margin-left:auto;border:0;background:transparent;color:var(--blue);font-size:11px}.link-list article{height:58px;border:1px solid #dbe4f0;border-radius:7px;display:flex;align-items:center;gap:10px;padding:7px}.link-badge{width:37px;height:37px;display:grid;place-items:center;border-radius:7px;background:#eaf3ff;color:var(--blue);font-weight:700}.link-list article div{display:flex;flex-direction:column;gap:3px}.link-list small{font-size:11px;color:#697d9c}.link-list article button{margin-left:auto}.empty-links,.detail-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:#7184a3}.empty-links span{font-size:12px}.asset-detail>footer{margin-top:auto;border-top:1px solid var(--line);padding:13px 15px;display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:1380px){.asset-layout{grid-template-columns:minmax(600px,1fr) 380px}.style-profile{height:145px}.style-items>div{height:88px}.mini-img,.ban{height:31px}.asset-grid{gap:8px}.detail-preview{height:155px}.head-actions{gap:6px}.status-pill{display:none}}
+.detail-tabs{gap:18px}.detail-tabs button{white-space:nowrap}.frame-editor{padding:10px 15px;display:flex;flex-direction:column;gap:9px;overflow:auto}.frame-preview{width:100%;max-height:150px;min-height:100px;margin:auto;border-radius:7px;background-color:#e7edf5;background-position:center;background-repeat:no-repeat;background-size:cover;position:relative}.frame-preview>span{position:absolute;right:7px;bottom:7px;padding:4px 7px;border-radius:4px;background:rgba(5,20,43,.78);color:#fff;font-size:11px}.frame-choice{display:grid;grid-template-columns:1fr 1fr;gap:8px}.frame-choice button{height:34px;border:1px solid #cad8ea;border-radius:6px;background:#fff}.frame-choice button.active{border-color:var(--blue);background:#edf5ff;color:var(--blue);font-weight:700}.frame-editor label{display:grid;grid-template-columns:105px 1fr;align-items:center;gap:9px;font-size:12px}.frame-editor select{height:32px;border:1px solid #cad8ea;border-radius:6px;background:#fff;padding:0 7px}.frame-editor input[type=range]{accent-color:var(--blue)}.frame-editor p,.frame-editor small{font-size:11px;color:#667b9c}.frame-editor small{min-height:16px}@media(max-width:1380px){.frame-preview{max-height:110px;min-height:80px}}
 </style>
