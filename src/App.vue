@@ -15,6 +15,7 @@ import {
 } from "lucide-vue-next";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import TaskCenter from "./components/TaskCenter.vue";
 
 const route = useRoute();
 const appWindow = isTauri() ? getCurrentWindow() : null;
@@ -38,6 +39,7 @@ const nav = [
   <div class="app-frame">
     <div class="titlebar" data-tauri-drag-region>
       <div class="titlebar-name" data-tauri-drag-region>知画</div>
+      <TaskCenter />
       <div class="window-actions">
         <button aria-label="最小化" @click="minimizeWindow"><Minus :size="16" /></button>
         <button aria-label="最大化" @click="toggleMaximizeWindow"><Square :size="13" /></button>

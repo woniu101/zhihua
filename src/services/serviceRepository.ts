@@ -210,6 +210,16 @@ export const serviceRepository = {
     invokeNative<ServiceProbe>("prepare_generation_service"),
   listLocalJobs: (projectId?: string) =>
     invokeNative<LocalGenerationJob[]>("list_local_jobs", { projectId }),
+  syncJob: async (jobId: string) => {
+    const job = await invokeNative<NativeServiceJob>("get_service_job", { jobId });
+    if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
+    return mapJob(job);
+  },
+  cancelJob: async (jobId: string) => {
+    const job = await invokeNative<NativeServiceJob>("cancel_service_job", { jobId });
+    if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
+    return mapJob(job);
+  },
   planComputePool: (input: ComputePoolPlanInput) =>
     invokeNative<ComputePoolPlan>("plan_generation_compute_pool", { input }),
   uploadInput: (sourcePath: string) =>
