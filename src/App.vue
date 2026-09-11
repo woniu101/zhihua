@@ -80,7 +80,7 @@ const nav = [
           <li><b>创建项目</b><span>填写名称，选择目标受众与成片时长。</span></li>
           <li><b>导入并审核资料</b><span>核对知识点、事实和来源后再生成分镜。</span></li>
           <li><b>生成候选视频</b><span>优云智算仅在需要生成时切换到 GPU，空闲后自动关机。</span></li>
-          <li><b>制作并导出成片</b><span>选择正式版本，制作 1080p 视频并导出 MP4。</span></li>
+          <li><b>选择并导出成片</b><span>候选可直接设为正式版本并导出 MP4，1080p AI 增强按需制作。</span></li>
         </ol>
         <footer><button type="button" class="btn primary" @click="helpOpen = false">知道了</button></footer>
       </section>

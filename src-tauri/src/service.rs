@@ -1187,7 +1187,7 @@ mod tests {
             project_id: "project-1".to_owned(),
             scene_id: "scene-1".to_owned(),
             kind: "arbitrary_command".to_owned(),
-            workflow_id: "h3-fl2v-turbo-v1".to_owned(),
+            workflow_id: "h3-flf2v-turbo-v1".to_owned(),
             parameters: serde_json::json!({}),
         };
         assert_eq!(
@@ -1281,7 +1281,7 @@ mod tests {
         assert_eq!(probe.api_version.as_deref(), Some("v1"));
         assert_eq!(probe.service_version, "0.3.0");
         assert!(probe.workflows.iter().any(|item| item == "h3-t2v-turbo-v1"));
-        assert_eq!(probe.available_workflows.len(), 10);
+        assert_eq!(probe.available_workflows.len(), 9);
         assert!(probe
             .available_workflows
             .iter()
