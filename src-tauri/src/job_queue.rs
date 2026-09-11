@@ -61,8 +61,8 @@ impl JobQueueStorage {
         let storage = Self {
             database_path: projects.info().database_path,
         };
-        storage
-            .connection()?
+        let connection = storage.connection()?;
+        connection
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS generation_jobs (
@@ -82,8 +82,7 @@ impl JobQueueStorage {
                 error_message     TEXT,
                 created_at        TEXT NOT NULL,
                 updated_at        TEXT NOT NULL,
-                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
-                FOREIGN KEY(scene_id) REFERENCES storyboard_scenes(id) ON DELETE CASCADE
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_generation_jobs_project_updated
                 ON generation_jobs(project_id, updated_at DESC);
@@ -92,6 +91,61 @@ impl JobQueueStorage {
             ",
             )
             .map_err(database_error)?;
+        let has_scene_foreign_key = {
+            let mut statement = connection
+                .prepare("PRAGMA foreign_key_list(generation_jobs)")
+                .map_err(database_error)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(2))
+                .map_err(database_error)?;
+            let found = rows
+                .filter_map(Result::ok)
+                .any(|table| table == "storyboard_scenes");
+            found
+        };
+        if has_scene_foreign_key {
+            connection
+                .pragma_update(None, "foreign_keys", "OFF")
+                .map_err(database_error)?;
+            let migration = connection.execute_batch(
+                    "
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE generation_jobs RENAME TO generation_jobs_legacy;
+                    CREATE TABLE generation_jobs (
+                        client_request_id TEXT PRIMARY KEY NOT NULL,
+                        remote_job_id     TEXT UNIQUE,
+                        project_id        TEXT NOT NULL,
+                        scene_id          TEXT NOT NULL,
+                        kind              TEXT NOT NULL,
+                        workflow_id       TEXT NOT NULL,
+                        request_json      TEXT NOT NULL,
+                        status            TEXT NOT NULL,
+                        progress          REAL NOT NULL DEFAULT 0,
+                        worker_id         TEXT,
+                        lease_expires_at  TEXT,
+                        attempt           INTEGER NOT NULL DEFAULT 0,
+                        error_code        TEXT,
+                        error_message     TEXT,
+                        created_at        TEXT NOT NULL,
+                        updated_at        TEXT NOT NULL,
+                        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO generation_jobs
+                    SELECT * FROM generation_jobs_legacy;
+                    DROP TABLE generation_jobs_legacy;
+                    CREATE INDEX idx_generation_jobs_project_updated
+                        ON generation_jobs(project_id, updated_at DESC);
+                    CREATE INDEX idx_generation_jobs_dispatch
+                        ON generation_jobs(status, lease_expires_at, created_at);
+                    COMMIT;
+                    ",
+                );
+            let restore = connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .map_err(database_error);
+            migration.map_err(database_error)?;
+            restore?;
+        }
         storage.release_expired_leases()?;
         Ok(storage)
     }
@@ -437,6 +491,21 @@ mod tests {
             queue.find_by_request("request-1").expect("find").status,
             "completed_local"
         );
+    }
+
+    #[test]
+    fn accepts_project_level_image_jobs_without_a_storyboard_scene() {
+        let (_directory, queue, project_id, _scene_id) = setup();
+        let input = SubmitServiceJobInput {
+            client_request_id: "image-request-1".into(),
+            project_id,
+            scene_id: "project-assets".into(),
+            kind: "image_generation".into(),
+            workflow_id: "qwen-image-generate-v1".into(),
+            parameters: serde_json::json!({"prompt": "一张科普插画"}),
+        };
+        let stored = queue.stage(&input).expect("stage project-level image job");
+        assert_eq!(stored.scene_id, "project-assets");
     }
 
     #[test]

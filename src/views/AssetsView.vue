@@ -18,7 +18,7 @@ import { useAssetStore } from "../stores/assets";
 import { useStoryboardStore } from "../stores/storyboard";
 import { isNativeRuntime } from "../services/nativeBridge";
 import { assetRepository } from "../services/assetRepository";
-import { ComfyUiQwenImageProvider, normalizeConnectionFailure } from "../services/serviceRepository";
+import { ComfyUiQwenImageProvider, normalizeConnectionFailure, serviceRepository } from "../services/serviceRepository";
 
 const store = useAssetStore();
 const storyboard = useStoryboardStore();
@@ -132,7 +132,7 @@ async function submitImage() {
     const job = await imageProvider.submit({
       clientRequestId: `image-${imageMode.value}-${crypto.randomUUID()}`,
       projectId,
-      sceneId: storyboard.selectedScene.value?.id ?? "asset-library",
+      sceneId: storyboard.selectedScene.value?.id ?? "project-assets",
       mode: imageMode.value,
       aspectRatio: activeProfile.value.aspectRatio,
       prompt,
@@ -145,6 +145,38 @@ async function submitImage() {
     imageNotice.value = normalizeConnectionFailure(error).message;
     imageBusy.value = false;
   }
+}
+
+async function cancelImage() {
+  const job = imageJob.value;
+  if (!job || !imageBusy.value) return;
+  imageNotice.value = "正在取消远端图片任务。";
+  try {
+    await imageProvider.cancel(job.id);
+  } catch (error) {
+    imageNotice.value = normalizeConnectionFailure(error).message;
+  }
+}
+
+async function recoverImageJob() {
+  const projectId = activeProjectId();
+  if (!projectId) return;
+  const jobs = await serviceRepository.listLocalJobs(projectId).catch(() => undefined);
+  const resumable = jobs
+    ?.slice()
+    .reverse()
+    .find((item) =>
+      ["image_generation", "image_edit"].includes(item.kind)
+      && Boolean(item.remoteJobId)
+      && item.status !== "completed_local"
+      && !["failed", "cancelled", "interrupted"].includes(item.status),
+    );
+  if (!resumable?.remoteJobId) return;
+  imageMode.value = resumable.kind === "image_edit" ? "edit" : "generate";
+  imagePanelOpen.value = true;
+  imageBusy.value = true;
+  imageNotice.value = "已从本地任务队列恢复图片任务，正在核对远端状态。";
+  await pollImageJob(resumable.remoteJobId);
 }
 
 async function chooseFiles() {
@@ -303,9 +335,10 @@ watch(
   () => void loadComposition(),
   { immediate: true },
 );
-onMounted(() => {
+onMounted(async () => {
   window.addEventListener("paste", onPaste);
-  void store.loadActiveProject();
+  await store.loadActiveProject();
+  void recoverImageJob();
   if (isNativeRuntime()) {
     void getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "enter" || event.payload.type === "over") {
@@ -399,7 +432,7 @@ onBeforeUnmount(() => {
         <label><span>{{ imageMode==='generate' ? '画面描述' : '编辑要求' }}</span><textarea v-model="imagePrompt" :disabled="imageBusy" :placeholder="imageMode==='generate' ? '例如：深蓝雷云覆盖群山，一道闪电连接云层与地面，科普插画，清晰轮廓，无文字' : '例如：保持主体和构图不变，把夜空调整为雨后的蓝紫色，并增强闪电亮度'"/></label>
         <div v-if="imageMode==='edit'" class="edit-source"><div class="edit-source-thumb" :style="selected ? previewStyle(selected) : undefined"></div><div><b>{{ selected?.name }}</b><span>使用已确认的 {{ activeProfile.aspectRatio }} 构图作为编辑输入</span></div></div>
         <div class="image-task"><div class="field-head"><b>{{ imageJob ? `任务 ${imageJob.id.slice(0,8)}` : '提交前保持无卡模式' }}</b><span>{{ imageJob ? `${imageProgress}%` : '0%' }}</span></div><div class="progress"><i :style="{width:`${imageProgress}%`}"></i></div><p>{{ imageNotice }}</p></div>
-        <footer><button class="btn" :disabled="imageBusy" @click="imagePanelOpen=false">关闭</button><button class="btn primary" :disabled="imageBusy || !imagePrompt.trim()" @click="submitImage"><LoaderCircle v-if="imageBusy" class="spin" :size="17"/><Sparkles v-else :size="17"/>{{ imageBusy ? '生成中' : imageMode==='generate' ? '生成图片' : '生成编辑版本' }}</button></footer>
+        <footer><button v-if="imageBusy && imageJob" class="btn danger" @click="cancelImage">取消任务</button><button class="btn" :disabled="imageBusy" @click="imagePanelOpen=false">关闭</button><button class="btn primary" :disabled="imageBusy || !imagePrompt.trim()" @click="submitImage"><LoaderCircle v-if="imageBusy" class="spin" :size="17"/><Sparkles v-else :size="17"/>{{ imageBusy ? '生成中' : imageMode==='generate' ? '生成图片' : '生成编辑版本' }}</button></footer>
       </section>
     </div>
   </section>
