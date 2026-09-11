@@ -8,6 +8,7 @@ import { invokeNative } from "./nativeBridge";
 import { assetRepository } from "./assetRepository";
 import { currentAssetVersion } from "../domain/assets";
 import { frameProfile } from "../domain/frameProfiles";
+import { frameCompositionRepository } from "./frameCompositionRepository";
 
 export interface ServiceConnectionResult {
   baseUrl: string;
@@ -261,9 +262,36 @@ export class ComfyUiH3Provider implements VideoProvider {
       const selected = request.assetIds
         .map((id) => assets.find((asset) => asset.id === id))
         .filter((asset): asset is NonNullable<typeof asset> => Boolean(asset));
-      const upload = async (asset: (typeof selected)[number]) => {
-        const path = currentAssetVersion(asset).storedPath;
+      const upload = async (
+        asset: (typeof selected)[number],
+        frameBound = false,
+      ) => {
+        const version = currentAssetVersion(asset);
+        let path = version.storedPath;
         if (!path) throw new Error(`参考素材“${asset.name}”没有可上传的本地文件。`);
+        if (asset.mediaType === "image" && frameBound) {
+          const key = {
+            projectId: request.projectId,
+            assetId: asset.id,
+            assetVersionId: version.id,
+            aspectRatio: frameProfile(request.aspectRatio).aspectRatio,
+          };
+          let composition = await frameCompositionRepository.get(key);
+          if (!composition) {
+            composition = await frameCompositionRepository.save({
+              ...key,
+              fitMode: "cover",
+              focalX: 0.5,
+              focalY: 0.5,
+              backgroundMode: "edge",
+            });
+          }
+          composition = await frameCompositionRepository.prepare(key);
+          if (!composition?.derivativePath) {
+            throw new Error(`参考素材“${asset.name}”的画幅适配文件生成失败。`);
+          }
+          path = composition.derivativePath;
+        }
         const result = await serviceRepository.uploadInput(path);
         if (!result) throw new Error(`参考素材“${asset.name}”上传失败。`);
         uploaded.push(result);
@@ -273,12 +301,12 @@ export class ComfyUiH3Provider implements VideoProvider {
         if (request.mode === "i2v" || request.mode === "continue") {
           const image = selected.find((asset) => asset.mediaType === "image");
           if (!image) throw new Error("“从这张画面开始”需要选择一张首帧图片。");
-          parameters.firstFrameFile = await upload(image);
+          parameters.firstFrameFile = await upload(image, true);
         } else if (request.mode === "flf2v") {
           const images = selected.filter((asset) => asset.mediaType === "image");
           if (images.length < 2) throw new Error("“首尾画面过渡”需要按顺序选择首帧和尾帧图片。");
-          parameters.firstFrameFile = await upload(images[0]);
-          parameters.lastFrameFile = await upload(images[1]);
+          parameters.firstFrameFile = await upload(images[0], true);
+          parameters.lastFrameFile = await upload(images[1], true);
         } else if (request.mode === "r2v") {
           const video = selected.find((asset) => asset.mediaType === "video");
           const image = selected.find((asset) => asset.mediaType === "image");

@@ -41,4 +41,6 @@ export const frameCompositionRepository = {
     focalY: number;
     backgroundMode: FrameBackgroundMode;
   }) => invokeNative<FrameComposition>("save_frame_composition", { input }),
+  prepare: (input: FrameCompositionKey) =>
+    invokeNative<FrameComposition>("prepare_frame_derivative", { input }),
 };

@@ -33,7 +33,7 @@ use deepseek::{
 use export::{ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, ProjectExport};
 use frame_composition::{
     FrameComposition, FrameCompositionError, FrameCompositionStorage, GetFrameCompositionInput,
-    SaveFrameCompositionInput,
+    PrepareFrameDerivativeInput, SaveFrameCompositionInput,
 };
 use generation::{
     CandidateVersion, EnhancedVersion, GenerationError, GenerationStorage, RecordCandidateInput,
@@ -1212,6 +1212,14 @@ fn save_frame_composition(
 }
 
 #[tauri::command]
+fn prepare_frame_derivative(
+    storage: State<'_, FrameCompositionStorage>,
+    input: PrepareFrameDerivativeInput,
+) -> Result<FrameComposition, FrameCompositionError> {
+    storage.prepare(input)
+}
+
+#[tauri::command]
 fn list_assets(
     storage: State<'_, AssetStorage>,
     project_id: String,
@@ -1421,6 +1429,7 @@ pub fn run() {
             download_completed_enhancement,
             get_frame_composition,
             save_frame_composition,
+            prepare_frame_derivative,
             list_assets,
             import_asset_files,
             import_asset_payload,
