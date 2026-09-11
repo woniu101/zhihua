@@ -108,7 +108,7 @@ impl JobQueueStorage {
                 .pragma_update(None, "foreign_keys", "OFF")
                 .map_err(database_error)?;
             let migration = connection.execute_batch(
-                    "
+                "
                     BEGIN IMMEDIATE;
                     ALTER TABLE generation_jobs RENAME TO generation_jobs_legacy;
                     CREATE TABLE generation_jobs (
@@ -139,7 +139,7 @@ impl JobQueueStorage {
                         ON generation_jobs(status, lease_expires_at, created_at);
                     COMMIT;
                     ",
-                );
+            );
             let restore = connection
                 .pragma_update(None, "foreign_keys", "ON")
                 .map_err(database_error);

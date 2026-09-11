@@ -145,6 +145,22 @@ export async function requestNativeExport(
   return result;
 }
 
+export async function requestNativePreview(
+  projectId: string,
+  aspectRatio: ConcreteAspectRatio,
+): Promise<ProjectExport> {
+  const result = await invokeNative<ProjectExport>("preview_project_video", {
+    input: {
+      projectId,
+      frameRate: 24,
+      aspectRatio,
+      narrationVolume: 80,
+    },
+  });
+  if (!result) throw new Error("全片预览只能在知画桌面客户端中生成");
+  return result;
+}
+
 export function exportResolution(settings: Pick<ExportSettings, "ratio" | "rendition">): string {
   const { width, height } = renditionDimensions(settings.ratio, settings.rendition);
   return `${width} × ${height}`;

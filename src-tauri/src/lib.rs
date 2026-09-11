@@ -30,7 +30,10 @@ use deepseek::{
     DeepSeekError, DeepSeekProvider, DeepSeekSource, KnowledgePoint,
     SaveDeepSeekConfigurationInput,
 };
-use export::{ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, ProjectExport};
+use export::{
+    ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, PreviewProjectInput,
+    ProjectExport,
+};
 use frame_composition::{
     FrameComposition, FrameCompositionError, FrameCompositionStorage, GetFrameCompositionInput,
     PrepareFrameDerivativeInput, SaveFrameCompositionInput,
@@ -1021,6 +1024,30 @@ async fn download_completed_job(
 }
 
 #[tauri::command]
+async fn preview_project_video(
+    exporter: State<'_, FfmpegExporter>,
+    storyboard: State<'_, StoryboardStorage>,
+    generations: State<'_, GenerationStorage>,
+    assets: State<'_, AssetStorage>,
+    tts: State<'_, SystemTtsProvider>,
+    input: PreviewProjectInput,
+) -> Result<ProjectExport, ExportError> {
+    let exporter = exporter.inner().clone();
+    let storyboard = storyboard.inner().clone();
+    let generations = generations.inner().clone();
+    let assets = assets.inner().clone();
+    let tts = tts.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        exporter.preview(&storyboard, &generations, &assets, &tts, input)
+    })
+    .await
+    .map_err(|error| ExportError {
+        code: "PREVIEW_TASK_ERROR".to_owned(),
+        message: format!("全片预览任务异常结束：{error}"),
+    })?
+}
+
+#[tauri::command]
 async fn download_completed_image_job(
     app: AppHandle,
     projects: State<'_, ProjectStorage>,
@@ -1497,6 +1524,7 @@ pub fn run() {
             import_scene_narration,
             inspect_export_capability,
             export_project_video,
+            preview_project_video,
             test_service_connection,
             get_service_connection_info,
             save_service_connection,

@@ -85,6 +85,15 @@ pub struct ExportProjectInput {
     pub music_fade: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewProjectInput {
+    pub project_id: String,
+    pub frame_rate: u32,
+    pub aspect_ratio: FrameAspectRatio,
+    pub narration_volume: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectExport {
@@ -150,6 +159,53 @@ impl FfmpegExporter {
                 version: None,
             },
         }
+    }
+
+    pub fn preview(
+        &self,
+        storyboards: &StoryboardStorage,
+        generations: &GenerationStorage,
+        assets: &AssetStorage,
+        tts: &SystemTtsProvider,
+        input: PreviewProjectInput,
+    ) -> ExportResult<ProjectExport> {
+        let project = self
+            .projects
+            .get_project(&input.project_id)
+            .map_err(|error| ExportError::new("PROJECT_ERROR", error.to_string()))?;
+        let output_directory = project.project_dir.join("previews");
+        fs::create_dir_all(&output_directory).map_err(io_error)?;
+        if let Ok(entries) = fs::read_dir(&output_directory) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && matches!(
+                        path.extension().and_then(|value| value.to_str()),
+                        Some("mp4" | "srt")
+                    )
+                {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        self.export(
+            storyboards,
+            generations,
+            assets,
+            tts,
+            ExportProjectInput {
+                project_id: input.project_id,
+                output_directory,
+                frame_rate: input.frame_rate,
+                subtitle_mode: SubtitleMode::Burn,
+                aspect_ratio: input.aspect_ratio,
+                rendition: OutputRendition::Candidate,
+                narration_volume: input.narration_volume,
+                music_asset_id: None,
+                music_volume: 0,
+                music_fade: false,
+            },
+        )
     }
 
     pub fn export(

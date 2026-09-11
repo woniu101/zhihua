@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, LoaderCircle, Maximize2, Music2, Pause, Play, Plus, RotateCcw, Sparkles, Star, Subtitles, Trash2, Volume2, X } from "lucide-vue-next";
 import type { GenerationJob } from "../domain/providers";
 import type { AspectRatio, CandidateQuality, GenerationMode } from "../domain/storyboard";
@@ -9,6 +10,7 @@ import { assetRepository } from "../services/assetRepository";
 import { generationRepository, type CandidateVersion, type EnhancedVersion } from "../services/generationRepository";
 import { ComfyUiH3Provider, normalizeConnectionFailure, serviceRepository } from "../services/serviceRepository";
 import { ttsRepository, type NarrationArtifact, type SystemVoice } from "../services/ttsRepository";
+import { requestNativePreview } from "../services/exportService";
 import { useStoryboardStore } from "../stores/storyboard";
 
 const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, select, update, save, updateSelected, add, duplicateSelected, removeSelected, moveSelected } = useStoryboardStore();
@@ -23,6 +25,9 @@ const taskError = ref("");
 const submitting = ref(false);
 const batchSubmitting = ref(false);
 const batchNotice = ref("");
+const previewBusy = ref(false);
+const fullPreviewUrl = ref("");
+const fullPreviewOpen = ref(false);
 const enhancing = ref(false);
 const taskKind = ref<"candidate" | "enhancement">("candidate");
 const systemVoices = ref<SystemVoice[]>([]);
@@ -518,6 +523,22 @@ async function generateIncompleteScenes() {
     : `${submittedCount} 个分镜已排入队列，可在右上角“任务”中查看。`;
 }
 
+async function openFullPreview() {
+  const scene = scenes.value[0];
+  if (!scene || previewBusy.value) return;
+  previewBusy.value = true;
+  taskError.value = "";
+  try {
+    const result = await requestNativePreview(scene.projectId, activeFrameProfile.value.aspectRatio);
+    fullPreviewUrl.value = convertFileSrc(result.outputPath);
+    fullPreviewOpen.value = true;
+  } catch (error) {
+    taskError.value = normalizeConnectionFailure(error).message;
+  } finally {
+    previewBusy.value = false;
+  }
+}
+
 async function makeEnhancement() {
   const scene = selectedScene.value;
   const source = candidateVersions.value.find((item) => item.id === scene?.selectedVersionId);
@@ -650,7 +671,7 @@ const confirmRemove = () => {
   <section class="page storyboard-page">
     <header class="story-head">
       <div><p class="breadcrumb">为什么会打雷？　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><span class="status-line"><span class="dot gray"></span><strong>优云智算</strong><b>无卡模式</b><span>|</span><span>提交生成时自动切换 GPU</span></span></div></div>
-      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" disabled title="全片预览将在全部镜头准备完成后开放"><Play :size="18"/>预览全片</button></div>
+      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="18"/>{{ previewBusy ? '正在合成' : '预览全片' }}</button></div>
     </header>
 
     <div class="story-workspace">
@@ -727,6 +748,13 @@ const confirmRemove = () => {
         <div class="track-content"><div class="video-track"><i v-for="(shot,index) in scenes" :key="shot.id" class="lightning-image"><b>{{ String(index + 1).padStart(2, '0') }}</b> {{ shot.title }}</i></div><div class="voice-track"><i v-for="shot in scenes" :key="shot.id">▥　{{ shot.title }}</i></div><div class="subtitle-track"><i v-for="shot in scenes" :key="shot.id">{{ shot.title }}</i></div><div class="music-track">♫　轻柔科普氛围音乐 -18 dB　﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏﹏</div><div class="playhead"></div></div>
       </div>
     </section>
+
+    <div v-if="fullPreviewOpen" class="full-preview-backdrop" @click.self="fullPreviewOpen=false">
+      <section class="full-preview-dialog">
+        <header><div><h2>全片预览</h2><p>使用正式候选、系统旁白和字幕在本机临时合成</p></div><button type="button" aria-label="关闭全片预览" @click="fullPreviewOpen=false"><X :size="21"/></button></header>
+        <video :src="fullPreviewUrl" controls autoplay></video>
+      </section>
+    </div>
   </section>
 </template>
 
@@ -737,4 +765,5 @@ const confirmRemove = () => {
 .empty-storyboard{height:calc(100% - 50px);padding:28px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;color:#617697}.empty-storyboard b{color:#29466f}.empty-storyboard span{max-width:245px;font-size:12px;line-height:1.6}.empty-storyboard .btn{margin-top:7px}
 .reference-inputs{margin:-3px 0 12px;padding:9px 10px;border:1px solid #d9e4f1;border-radius:8px;background:#f8fbff;display:grid;grid-template-columns:1fr 1fr;gap:7px}.reference-inputs .field-head{grid-column:1/-1;margin:0 0 2px}.reference-inputs .field-head a{color:var(--blue);font-size:12px}.reference-inputs label{display:flex;flex-direction:column;gap:4px;color:#52698c;font-size:11px}.reference-inputs select{height:34px;min-width:0;border:1px solid #cfdced;border-radius:6px;background:#fff;padding:0 8px;color:#203b65}.reference-inputs p{grid-column:1/-1;color:#7385a2;font-size:11px}
 .narration-import-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;margin-top:7px}.narration-import-row .select{height:34px}.narration-import-row a{color:var(--blue);font-size:11px;white-space:nowrap}
+.full-preview-backdrop{position:fixed;z-index:95;inset:30px 0 0;display:grid;place-items:center;background:rgba(5,18,40,.72);backdrop-filter:blur(3px)}.full-preview-dialog{width:min(1050px,82vw);overflow:hidden;border:1px solid #6d7f9b;border-radius:13px;background:#071326;box-shadow:0 26px 80px rgba(0,0,0,.38)}.full-preview-dialog header{height:68px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;color:#fff;background:#0d1c33}.full-preview-dialog header h2{color:#fff}.full-preview-dialog header p{margin-top:4px;color:#aab9cf;font-size:12px}.full-preview-dialog header button{width:38px;height:38px;border:0;border-radius:8px;display:grid;place-items:center;color:#d7e2f1;background:transparent}.full-preview-dialog header button:hover{background:#1a2d49}.full-preview-dialog video{display:block;width:100%;max-height:calc(82vh - 98px);aspect-ratio:16/9;object-fit:contain;background:#000}
 </style>
