@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use keyring::Entry;
-use reqwest::{Client, Method, Response, StatusCode, Url};
+use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,6 +24,7 @@ const MODEL_MANIFEST_VERSION: &str = "public-models-2026.09.08";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const REQUEST_RETRY_DELAYS_SECONDS: [u64; 6] = [0, 1, 2, 4, 8, 16];
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceConnectionError {
@@ -488,18 +489,18 @@ impl ServiceClient {
         validate_job_input(&input)?;
         let connection = self.connection()?;
         let job: JobWire = decode_response(
-            self.authenticated(&connection, Method::POST, "/api/v1/jobs")
-                .json(&JobCreateWire {
-                    client_request_id: &input.client_request_id,
-                    project_id: &input.project_id,
-                    scene_id: &input.scene_id,
-                    kind: &input.kind,
-                    workflow_id: &input.workflow_id,
-                    parameters: &input.parameters,
-                })
-                .send()
-                .await
-                .map_err(connection_error)?,
+            self.send_with_retry(|| {
+                self.authenticated(&connection, Method::POST, "/api/v1/jobs")
+                    .json(&JobCreateWire {
+                        client_request_id: &input.client_request_id,
+                        project_id: &input.project_id,
+                        scene_id: &input.scene_id,
+                        kind: &input.kind,
+                        workflow_id: &input.workflow_id,
+                        parameters: &input.parameters,
+                    })
+            })
+            .await?,
         )
         .await?;
         Ok(job.into())
@@ -509,10 +510,10 @@ impl ServiceClient {
         validate_identifier(job_id, "任务 ID")?;
         let connection = self.connection()?;
         let job: JobWire = decode_response(
-            self.authenticated(&connection, Method::GET, &format!("/api/v1/jobs/{job_id}"))
-                .send()
-                .await
-                .map_err(connection_error)?,
+            self.send_with_retry(|| {
+                self.authenticated(&connection, Method::GET, &format!("/api/v1/jobs/{job_id}"))
+            })
+            .await?,
         )
         .await?;
         Ok(job.into())
@@ -740,6 +741,60 @@ impl ServiceClient {
             .bearer_auth(&connection.token)
             .header("X-Zhihua-API-Version", API_VERSION)
             .header("X-Zhihua-Client-Version", CLIENT_VERSION)
+    }
+
+    async fn send_with_retry<F>(&self, mut build: F) -> ServiceResult<Response>
+    where
+        F: FnMut() -> RequestBuilder,
+    {
+        for (attempt, delay_seconds) in REQUEST_RETRY_DELAYS_SECONDS.iter().enumerate() {
+            if *delay_seconds > 0 {
+                tokio::time::sleep(retry_delay(*delay_seconds)).await;
+            }
+            match build().send().await {
+                Ok(response)
+                    if transient_status(response.status())
+                        && attempt + 1 < REQUEST_RETRY_DELAYS_SECONDS.len() =>
+                {
+                    continue;
+                }
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let error = connection_error(error);
+                    if transient_error(&error) && attempt + 1 < REQUEST_RETRY_DELAYS_SECONDS.len() {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Err(service_error(
+            "request_failed",
+            "知画服务请求在连接恢复后仍未成功。",
+        ))
+    }
+}
+
+fn transient_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn transient_error(error: &ServiceConnectionError) -> bool {
+    matches!(error.code, "timeout" | "unreachable" | "request_failed")
+}
+
+fn retry_delay(seconds: u64) -> Duration {
+    if cfg!(test) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(seconds)
     }
 }
 
@@ -1197,6 +1252,42 @@ mod tests {
     }
 
     #[test]
+    fn retries_idempotent_job_reads_after_a_transient_gateway_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        thread::spawn(move || {
+            for (index, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.expect("accept request");
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).expect("read request");
+                assert!(String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /api/v1/jobs/job-1 HTTP/1.1"));
+                let (status, body) = if index == 0 {
+                    (
+                        "502 Bad Gateway",
+                        r#"{"detail":{"code":"tunnel_reconnecting"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"id":"job-1","client_request_id":"request-1","project_id":"project-1","scene_id":"scene-1","kind":"video_candidate","workflow_id":"h3-t2v-turbo-v1","status":"running","prompt_id":"prompt-1","progress":0.5,"error_code":null,"error_message":null,"status_detail":"ComfyUI is executing the prompt","created_at":"2026-09-11T00:00:00Z","updated_at":"2026-09-11T00:00:01Z","result_manifest":null}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("response");
+            }
+        });
+        let client = connected_client(format!("http://{address}"));
+        let job = tauri::async_runtime::block_on(client.get_job("job-1"))
+            .expect("job read should recover");
+        assert_eq!(job.id, "job-1");
+        assert_eq!(job.status, "running");
+    }
+
+    #[test]
     fn resumes_and_verifies_artifact_download() {
         let content = b"0123456789";
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -1255,7 +1346,7 @@ mod tests {
         let result: ServiceResult<_> = tauri::async_runtime::block_on(async {
             let probe = client.probe().await?;
             let request = SubmitServiceJobInput {
-                client_request_id: "rust-client-live-smoke-t2v-20260910-v2".to_owned(),
+                client_request_id: "rust-client-live-smoke-t2v-20260911-v3".to_owned(),
                 project_id: "rust-client-project".to_owned(),
                 scene_id: "rust-client-scene".to_owned(),
                 kind: "video_candidate".to_owned(),
@@ -1265,8 +1356,13 @@ mod tests {
                     "durationSec": 5,
                     "width": 1344,
                     "height": 768,
+                    "visibleWidth": 1344,
+                    "visibleHeight": 756,
+                    "cropX": 0,
+                    "cropY": 6,
                     "length": 124,
-                    "discardH3Audio": true
+                    "discardH3Audio": true,
+                    "outputPrefix": "video/zhihua/live-contract/rust-client-v3"
                 }),
             };
             let first = client.submit_job(request.clone()).await?;

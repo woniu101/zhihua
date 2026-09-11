@@ -31,6 +31,7 @@ const narrationError = ref("");
 const selectedNarrationAssetId = ref("");
 let narrationAudio: HTMLAudioElement | undefined;
 let pollTimer: number | undefined;
+let pollRetryDelayMs = 2500;
 const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
   { id: "t2v", label: "自由生成", symbol: "✦" },
   { id: "i2v", label: "从这张画面开始", symbol: "▧" },
@@ -261,6 +262,8 @@ async function refreshTask(sceneId: string, jobId: string) {
   taskKind.value = "candidate";
   try {
     const latest = await provider.getStatus(jobId);
+    pollRetryDelayMs = 2500;
+    taskError.value = "";
     if (selectedSceneId.value === sceneId) task.value = latest;
     const scene = scenes.value.find((item) => item.id === sceneId);
     if (latest.status === "completed" && scene) {
@@ -291,9 +294,13 @@ async function refreshTask(sceneId: string, jobId: string) {
       pollTimer = window.setTimeout(() => refreshTask(sceneId, jobId), 2500);
     }
   } catch (error) {
+    const failure = normalizeConnectionFailure(error);
     if (selectedSceneId.value === sceneId) {
-      taskError.value = normalizeConnectionFailure(error).message;
+      taskError.value = `安全连接暂时中断，远端任务仍会继续；正在恢复：${failure.message}`;
     }
+    update(sceneId, { status: "generating", generationStage: "安全连接正在恢复，远端任务继续运行" });
+    pollRetryDelayMs = Math.min(pollRetryDelayMs * 2, 20_000);
+    pollTimer = window.setTimeout(() => refreshTask(sceneId, jobId), pollRetryDelayMs);
   }
 }
 
@@ -302,6 +309,8 @@ async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCand
   taskKind.value = "enhancement";
   try {
     const latest = await provider.getStatus(jobId);
+    pollRetryDelayMs = 2500;
+    taskError.value = "";
     if (selectedSceneId.value === sceneId) task.value = latest;
     const scene = scenes.value.find((item) => item.id === sceneId);
     if (latest.status === "completed" && scene) {
@@ -336,9 +345,16 @@ async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCand
       );
     }
   } catch (error) {
+    const failure = normalizeConnectionFailure(error);
     if (selectedSceneId.value === sceneId) {
-      taskError.value = normalizeConnectionFailure(error).message;
+      taskError.value = `安全连接暂时中断，1080p 任务仍会继续；正在恢复：${failure.message}`;
     }
+    update(sceneId, { status: "generating", generationStage: "安全连接正在恢复，1080p 任务继续运行" });
+    pollRetryDelayMs = Math.min(pollRetryDelayMs * 2, 20_000);
+    pollTimer = window.setTimeout(
+      () => refreshEnhancementTask(sceneId, jobId, sourceCandidateId),
+      pollRetryDelayMs,
+    );
   }
 }
 
