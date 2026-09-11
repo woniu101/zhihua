@@ -19,7 +19,7 @@ use tokio_util::io::ReaderStream;
 const CREDENTIAL_SERVICE: &str = "cn.zhihua.desktop.zhihua-service";
 const CLIENT_VERSION: &str = "0.1.0";
 const API_VERSION: &str = "v1";
-const WORKFLOW_MANIFEST_VERSION: &str = "zhihua-workflows-2026.09.11";
+const WORKFLOW_MANIFEST_VERSION: &str = "zhihua-workflows-2026.09.11-r2";
 const MODEL_MANIFEST_VERSION: &str = "public-models-2026.09.08";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;

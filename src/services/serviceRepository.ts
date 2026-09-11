@@ -437,7 +437,7 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
       throw new Error(`工作流 ${workflowId} 尚未就绪，当前不会启动 GPU。`);
     }
     const profile = frameProfile(request.aspectRatio);
-    const parameters: Record<string, unknown> = {
+        const parameters: Record<string, unknown> = {
       prompt: request.prompt,
       negativePrompt: request.negativePrompt ?? "模糊、畸形、乱码、水印、低清晰度",
       width: profile.workWidth,
@@ -474,6 +474,8 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
         uploaded = await serviceRepository.uploadInput(composition.derivativePath);
         if (!uploaded) throw new Error("来源图片上传失败。");
         parameters.sourceImageFile = uploaded.remoteFile;
+        parameters.width = profile.workWidth;
+        parameters.height = profile.workHeight;
       }
       const probe = await serviceRepository.prepareGeneration();
       if (!probe?.comfyuiReady) throw new Error(probe?.detail ?? "图片生成环境尚未就绪。");
