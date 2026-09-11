@@ -21,6 +21,8 @@ const previewVersionId = ref("");
 const previewEnhancedId = ref("");
 const taskError = ref("");
 const submitting = ref(false);
+const batchSubmitting = ref(false);
+const batchNotice = ref("");
 const enhancing = ref(false);
 const taskKind = ref<"candidate" | "enhancement">("candidate");
 const systemVoices = ref<SystemVoice[]>([]);
@@ -30,8 +32,10 @@ const narrationBusy = ref(false);
 const narrationError = ref("");
 const selectedNarrationAssetId = ref("");
 let narrationAudio: HTMLAudioElement | undefined;
-let pollTimer: number | undefined;
-let pollRetryDelayMs = 2500;
+const pollTimers = new Map<string, number>();
+const pollRetryDelays = new Map<string, number>();
+const pollingJobs = new Set<string>();
+let recoveredProjectId = "";
 const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
   { id: "t2v", label: "自由生成", symbol: "✦" },
   { id: "i2v", label: "从这张画面开始", symbol: "▧" },
@@ -245,9 +249,22 @@ function chooseMode(mode: GenerationMode) {
   updateSelected({ generationMode: mode, assetIds: [] });
 }
 
-function clearPoll() {
-  if (pollTimer !== undefined) window.clearTimeout(pollTimer);
-  pollTimer = undefined;
+function clearPoll(jobId?: string) {
+  if (jobId) {
+    const timer = pollTimers.get(jobId);
+    if (timer !== undefined) window.clearTimeout(timer);
+    pollTimers.delete(jobId);
+    return;
+  }
+  pollTimers.forEach((timer) => window.clearTimeout(timer));
+  pollTimers.clear();
+  pollRetryDelays.clear();
+}
+
+function schedulePoll(jobId: string, callback: () => void, delay = 2500) {
+  const current = pollTimers.get(jobId);
+  if (current !== undefined) window.clearTimeout(current);
+  pollTimers.set(jobId, window.setTimeout(callback, delay));
 }
 
 function sceneStatusFor(job: GenerationJob) {
@@ -258,11 +275,13 @@ function sceneStatusFor(job: GenerationJob) {
 }
 
 async function refreshTask(sceneId: string, jobId: string) {
-  clearPoll();
-  taskKind.value = "candidate";
+  if (pollingJobs.has(jobId)) return;
+  pollingJobs.add(jobId);
+  clearPoll(jobId);
+  if (selectedSceneId.value === sceneId) taskKind.value = "candidate";
   try {
     const latest = await provider.getStatus(jobId);
-    pollRetryDelayMs = 2500;
+    pollRetryDelays.set(jobId, 2500);
     taskError.value = "";
     if (selectedSceneId.value === sceneId) task.value = latest;
     const scene = scenes.value.find((item) => item.id === sceneId);
@@ -291,7 +310,9 @@ async function refreshTask(sceneId: string, jobId: string) {
       });
     }
     if (!["completed", "failed", "cancelled", "interrupted"].includes(latest.status)) {
-      pollTimer = window.setTimeout(() => refreshTask(sceneId, jobId), 2500);
+      schedulePoll(jobId, () => void refreshTask(sceneId, jobId));
+    } else {
+      pollRetryDelays.delete(jobId);
     }
   } catch (error) {
     const failure = normalizeConnectionFailure(error);
@@ -299,17 +320,22 @@ async function refreshTask(sceneId: string, jobId: string) {
       taskError.value = `安全连接暂时中断，远端任务仍会继续；正在恢复：${failure.message}`;
     }
     update(sceneId, { status: "generating", generationStage: "安全连接正在恢复，远端任务继续运行" });
-    pollRetryDelayMs = Math.min(pollRetryDelayMs * 2, 20_000);
-    pollTimer = window.setTimeout(() => refreshTask(sceneId, jobId), pollRetryDelayMs);
+    const delay = Math.min((pollRetryDelays.get(jobId) ?? 2500) * 2, 20_000);
+    pollRetryDelays.set(jobId, delay);
+    schedulePoll(jobId, () => void refreshTask(sceneId, jobId), delay);
+  } finally {
+    pollingJobs.delete(jobId);
   }
 }
 
 async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCandidateId: string) {
-  clearPoll();
-  taskKind.value = "enhancement";
+  if (pollingJobs.has(jobId)) return;
+  pollingJobs.add(jobId);
+  clearPoll(jobId);
+  if (selectedSceneId.value === sceneId) taskKind.value = "enhancement";
   try {
     const latest = await provider.getStatus(jobId);
-    pollRetryDelayMs = 2500;
+    pollRetryDelays.set(jobId, 2500);
     taskError.value = "";
     if (selectedSceneId.value === sceneId) task.value = latest;
     const scene = scenes.value.find((item) => item.id === sceneId);
@@ -339,10 +365,12 @@ async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCand
       });
     }
     if (!["completed", "failed", "cancelled", "interrupted"].includes(latest.status)) {
-      pollTimer = window.setTimeout(
-        () => refreshEnhancementTask(sceneId, jobId, sourceCandidateId),
-        2500,
+      schedulePoll(
+        jobId,
+        () => void refreshEnhancementTask(sceneId, jobId, sourceCandidateId),
       );
+    } else {
+      pollRetryDelays.delete(jobId);
     }
   } catch (error) {
     const failure = normalizeConnectionFailure(error);
@@ -350,11 +378,15 @@ async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCand
       taskError.value = `安全连接暂时中断，1080p 任务仍会继续；正在恢复：${failure.message}`;
     }
     update(sceneId, { status: "generating", generationStage: "安全连接正在恢复，1080p 任务继续运行" });
-    pollRetryDelayMs = Math.min(pollRetryDelayMs * 2, 20_000);
-    pollTimer = window.setTimeout(
-      () => refreshEnhancementTask(sceneId, jobId, sourceCandidateId),
-      pollRetryDelayMs,
+    const delay = Math.min((pollRetryDelays.get(jobId) ?? 2500) * 2, 20_000);
+    pollRetryDelays.set(jobId, delay);
+    schedulePoll(
+      jobId,
+      () => void refreshEnhancementTask(sceneId, jobId, sourceCandidateId),
+      delay,
     );
+  } finally {
+    pollingJobs.delete(jobId);
   }
 }
 
@@ -425,6 +457,65 @@ async function generateSelected() {
   } finally {
     submitting.value = false;
   }
+}
+
+async function generateIncompleteScenes() {
+  if (batchSubmitting.value || submitting.value || enhancing.value) return;
+  const candidates = scenes.value.filter((scene) =>
+    !["generated", "approved", "generating"].includes(scene.status)
+  );
+  const valid = candidates.filter((scene) => scene.visualPlan.trim());
+  if (!valid.length) {
+    batchNotice.value = candidates.length
+      ? "未完成分镜还没有画面描述，请先补充后再生成。"
+      : "全部分镜都已有候选或正式版本。";
+    return;
+  }
+
+  batchSubmitting.value = true;
+  batchNotice.value = `正在将 ${valid.length} 个分镜加入生成队列…`;
+  let submittedCount = 0;
+  const failures: string[] = [];
+  for (const scene of valid) {
+    const requestId = scene.pendingRequestId ?? crypto.randomUUID();
+    await save(scene.id, {
+      pendingRequestId: requestId,
+      status: "generating",
+      generationStage: "正在批量提交任务",
+    });
+    try {
+      const submitted = await provider.submit({
+        clientRequestId: requestId,
+        projectId: scene.projectId,
+        sceneId: scene.id,
+        mode: scene.generationMode,
+        quality: scene.quality,
+        aspectRatio: settings.value.aspectRatio,
+        durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
+        prompt: scene.visualPlan,
+        narration: scene.narration,
+        seed: crypto.getRandomValues(new Uint32Array(1))[0],
+        assetIds: scene.assetIds,
+        discardH3Audio: settings.value.discardH3Audio,
+      });
+      await save(scene.id, {
+        lastJobId: submitted.id,
+        pendingRequestId: undefined,
+        status: sceneStatusFor(submitted),
+        generationStage: submitted.stageMessage,
+      });
+      submittedCount += 1;
+      void refreshTask(scene.id, submitted.id);
+    } catch (error) {
+      const message = normalizeConnectionFailure(error).message;
+      failures.push(`${scene.title}：${message}`);
+      await save(scene.id, { status: "failed", generationStage: message });
+    }
+  }
+  batchSubmitting.value = false;
+  batchNotice.value = failures.length
+    ? `已排入 ${submittedCount} 个，${failures.length} 个未提交：${failures[0]}`
+    : `${submittedCount} 个分镜已排入队列，可在右上角“任务”中查看。`;
 }
 
 async function makeEnhancement() {
@@ -519,7 +610,6 @@ async function recoverPendingSceneJob(sceneId: string): Promise<boolean> {
 }
 
 watch(selectedSceneId, (sceneId) => {
-  clearPoll();
   task.value = undefined;
   taskError.value = "";
   const scene = scenes.value.find((item) => item.id === sceneId);
@@ -536,6 +626,19 @@ watch(selectedSceneId, (sceneId) => {
   });
 }, { immediate: true });
 
+watch([loading, () => scenes.value[0]?.projectId], async ([isLoading, projectId]) => {
+  if (isLoading || !projectId || recoveredProjectId === projectId) return;
+  recoveredProjectId = projectId;
+  for (const scene of scenes.value) {
+    if (await recoverPendingSceneJob(scene.id)) continue;
+    if (scene.lastUpscaleJobId && scene.selectedVersionId) {
+      void refreshEnhancementTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
+    } else if (scene.lastJobId) {
+      void refreshTask(scene.id, scene.lastJobId);
+    }
+  }
+}, { immediate: true });
+
 onBeforeUnmount(() => { clearPoll(); narrationAudio?.pause(); });
 const confirmRemove = () => {
   if (scenes.value.length <= 1) return;
@@ -547,7 +650,7 @@ const confirmRemove = () => {
   <section class="page storyboard-page">
     <header class="story-head">
       <div><p class="breadcrumb">为什么会打雷？　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><span class="status-line"><span class="dot gray"></span><strong>优云智算</strong><b>无卡模式</b><span>|</span><span>提交生成时自动切换 GPU</span></span></div></div>
-      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" disabled title="全片预览将在全部镜头准备完成后开放"><Play :size="18"/>预览全片</button></div>
+      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" disabled title="全片预览将在全部镜头准备完成后开放"><Play :size="18"/>预览全片</button></div>
     </header>
 
     <div class="story-workspace">

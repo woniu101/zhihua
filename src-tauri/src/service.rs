@@ -1332,6 +1332,65 @@ mod tests {
     }
 
     #[test]
+    fn keeps_partial_file_after_disconnect_and_resumes_on_next_attempt() {
+        let content = b"0123456789";
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).expect("read request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.starts_with("GET /api/v1/jobs/job-1/artifacts/video-0 HTTP/1.1"));
+                if attempt == 0 {
+                    assert!(!request.to_ascii_lowercase().contains("range:"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 10\r\nConnection: close\r\n\r\n01234",
+                        )
+                        .expect("write truncated response");
+                } else {
+                    assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nConnection: close\r\n\r\n56789",
+                        )
+                        .expect("write resumed response");
+                }
+            }
+        });
+
+        let directory = TempDir::new().expect("download directory");
+        let destination = directory.path().join("clip.mp4");
+        let expected_sha256 = format!("{:x}", Sha256::digest(content));
+        let client = connected_client(format!("http://{address}"));
+        let input = || DownloadServiceArtifactInput {
+            job_id: "job-1".to_owned(),
+            artifact_id: "video-0".to_owned(),
+            destination_path: destination.to_string_lossy().into_owned(),
+            expected_size_bytes: content.len() as u64,
+            expected_sha256: expected_sha256.clone(),
+        };
+
+        let first = tauri::async_runtime::block_on(client.download_artifact(input()))
+            .expect_err("truncated response must remain incomplete");
+        assert!(matches!(
+            first.code,
+            "request_failed" | "artifact_incomplete"
+        ));
+        assert_eq!(
+            fs::read(partial_path(&destination)).expect("partial file"),
+            b"01234"
+        );
+
+        let resumed = tauri::async_runtime::block_on(client.download_artifact(input()))
+            .expect("second attempt resumes download");
+        assert!(resumed.resumed);
+        assert_eq!(fs::read(destination).expect("downloaded file"), content);
+    }
+
+    #[test]
     #[ignore = "requires an SSH tunnel and ZHIHUA_TEST_SERVICE_TOKEN"]
     fn connects_to_live_secure_service_and_recovers_idempotent_job() {
         let base_url = std::env::var("ZHIHUA_TEST_SERVICE_URL")
