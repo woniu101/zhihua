@@ -7,7 +7,10 @@ import ProjectsView from "./views/ProjectsView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import SourcesView from "./views/SourcesView.vue";
 import StoryboardView from "./views/StoryboardView.vue";
+import { initializeAppearance } from "./services/appearance";
 import "./styles.css";
+
+initializeAppearance();
 
 const router = createRouter({
   history: createWebHashHistory(),

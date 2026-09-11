@@ -385,6 +385,16 @@ fn get_storage_info(storage: State<'_, ProjectStorage>) -> StorageInfo {
 }
 
 #[tauri::command]
+fn open_projects_root(storage: State<'_, ProjectStorage>) -> Result<(), String> {
+    let path = storage.info().projects_root;
+    std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开项目目录：{error}"))
+}
+
+#[tauri::command]
 fn create_project(
     storage: State<'_, ProjectStorage>,
     input: CreateProjectInput,
@@ -1493,6 +1503,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_storage_info,
+            open_projects_root,
             create_project,
             list_projects,
             update_project,
