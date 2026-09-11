@@ -260,6 +260,30 @@ impl AssetStorage {
         Ok(imported)
     }
 
+    pub fn import_generated_file(
+        &self,
+        project_id: &str,
+        source_path: &Path,
+        source_label: &str,
+    ) -> AssetResult<AssetItem> {
+        if !matches!(source_label, "知画生成" | "知画编辑") {
+            return Err(AssetError::new(
+                "asset_source_invalid",
+                "生成素材来源类型无效",
+            ));
+        }
+        let project = self
+            .project_storage
+            .get_project(project_id)
+            .map_err(|error| AssetError::new("project_unavailable", error.to_string()))?;
+        self.import_one(
+            &project.id,
+            &project.project_dir,
+            &source_path.to_string_lossy(),
+            source_label,
+        )
+    }
+
     pub fn import_payload(&self, input: ImportAssetPayloadInput) -> AssetResult<AssetItem> {
         if input.base64_data.len() > 28 * 1024 * 1024 {
             return Err(AssetError::new(

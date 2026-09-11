@@ -3,8 +3,9 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { ChevronDown, FileAudio2, Link2, MoreVertical, Search, Trash2, Upload, X } from "lucide-vue-next";
+import { ChevronDown, FileAudio2, ImagePlus, Link2, LoaderCircle, MoreVertical, Pencil, Search, Sparkles, Trash2, Upload, X } from "lucide-vue-next";
 import { ASSET_CATEGORIES, currentAssetVersion, type AssetCategory, type AssetItem } from "../domain/assets";
+import type { GenerationJob } from "../domain/providers";
 import { frameProfile } from "../domain/frameProfiles";
 import {
   frameCompositionRepository,
@@ -16,6 +17,8 @@ import { activeProjectId } from "../services/storyboardRepository";
 import { useAssetStore } from "../stores/assets";
 import { useStoryboardStore } from "../stores/storyboard";
 import { isNativeRuntime } from "../services/nativeBridge";
+import { assetRepository } from "../services/assetRepository";
+import { ComfyUiQwenImageProvider, normalizeConnectionFailure } from "../services/serviceRepository";
 
 const store = useAssetStore();
 const storyboard = useStoryboardStore();
@@ -29,6 +32,13 @@ const focalY = ref(0.5);
 const backgroundMode = ref<FrameBackgroundMode>("edge");
 const compositionBusy = ref(false);
 const compositionNotice = ref("");
+const imagePanelOpen = ref(false);
+const imageMode = ref<"generate" | "edit">("generate");
+const imagePrompt = ref("");
+const imageJob = ref<GenerationJob>();
+const imageBusy = ref(false);
+const imageNotice = ref("");
+const imageProvider = new ComfyUiQwenImageProvider();
 const selected = store.selectedAsset;
 const selectedVersion = store.currentVersion;
 const activeProfile = computed(() => frameProfile(storyboard.settings.value.aspectRatio));
@@ -38,6 +48,104 @@ const selectedVersionIndex = computed(() => {
 });
 const replacementAccept = computed(() => selected.value?.mediaType === "audio" ? "audio/*" : selected.value?.mediaType === "video" ? "video/*" : "image/*");
 let unlistenDragDrop: UnlistenFn | undefined;
+let imagePollTimer: number | undefined;
+
+const imageProgress = computed(() => Math.round((imageJob.value?.progress ?? 0) * 100));
+
+function openImagePanel(mode: "generate" | "edit") {
+  if (mode === "edit" && selected.value?.mediaType !== "image") return;
+  imageMode.value = mode;
+  imagePrompt.value = mode === "generate"
+    ? storyboard.selectedScene.value?.visualPlan ?? ""
+    : "";
+  imageJob.value = undefined;
+  imageNotice.value = mode === "generate"
+    ? "描述想要的关键画面，结果会自动保存到当前项目素材库。"
+    : `将以“${selected.value?.name ?? "当前图片"}”的项目画幅版本为基础编辑。`;
+  imagePanelOpen.value = true;
+}
+
+async function pollImageJob(jobId: string) {
+  try {
+    const job = await imageProvider.getStatus(jobId);
+    imageJob.value = job;
+    if (job.status === "completed") {
+      const projectId = activeProjectId();
+      if (!projectId) throw new Error("当前项目已关闭，无法保存生成图片。");
+      const imported = await assetRepository.downloadCompletedImage(projectId, job.id);
+      await store.loadActiveProject(true);
+      const asset = imported[0];
+      if (asset) {
+        store.selectAsset(asset.id);
+        const version = currentAssetVersion(asset);
+        await frameCompositionRepository.save({
+          projectId,
+          assetId: asset.id,
+          assetVersionId: version.id,
+          aspectRatio: activeProfile.value.aspectRatio,
+          fitMode: "cover",
+          focalX: 0.5,
+          focalY: 0.5,
+          backgroundMode: "edge",
+        });
+        const scene = storyboard.selectedScene.value;
+        if (scene) {
+          await storyboard.save(scene.id, {
+            assetIds: [...new Set([...scene.assetIds, asset.id])],
+            generationMode: "i2v",
+          });
+        }
+      }
+      imageNotice.value = imported.length
+        ? `图片已保存到素材库，并套用 ${activeProfile.value.aspectRatio} 最终画框。`
+        : "任务完成，但没有可保存的图片。";
+      imageBusy.value = false;
+      return;
+    }
+    if (["failed", "cancelled", "interrupted"].includes(job.status)) {
+      imageNotice.value = job.errorMessage ?? job.stageMessage ?? "图片任务未完成。";
+      imageBusy.value = false;
+      return;
+    }
+    imageNotice.value = job.stageMessage || "远端正在生成图片。";
+  } catch (error) {
+    imageNotice.value = `${normalizeConnectionFailure(error).message}，正在继续恢复远端任务。`;
+  }
+  imagePollTimer = window.setTimeout(() => void pollImageJob(jobId), 2500);
+}
+
+async function submitImage() {
+  const projectId = activeProjectId();
+  const prompt = imagePrompt.value.trim();
+  if (!projectId || !prompt || imageBusy.value) {
+    if (!prompt) imageNotice.value = "请先填写图片描述或编辑要求。";
+    return;
+  }
+  if (imageMode.value === "edit" && selected.value?.mediaType !== "image") {
+    imageNotice.value = "请选择一张图片素材后再编辑。";
+    return;
+  }
+  imageBusy.value = true;
+  imageNotice.value = "正在检查工作流并准备 GPU。";
+  if (imagePollTimer !== undefined) window.clearTimeout(imagePollTimer);
+  try {
+    const job = await imageProvider.submit({
+      clientRequestId: `image-${imageMode.value}-${crypto.randomUUID()}`,
+      projectId,
+      sceneId: storyboard.selectedScene.value?.id ?? "asset-library",
+      mode: imageMode.value,
+      aspectRatio: activeProfile.value.aspectRatio,
+      prompt,
+      seed: Math.floor(Math.random() * 2_147_483_647),
+      sourceAssetId: imageMode.value === "edit" ? selected.value?.id : undefined,
+    });
+    imageJob.value = job;
+    await pollImageJob(job.id);
+  } catch (error) {
+    imageNotice.value = normalizeConnectionFailure(error).message;
+    imageBusy.value = false;
+  }
+}
 
 async function chooseFiles() {
   if (!isNativeRuntime()) {
@@ -214,6 +322,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener("paste", onPaste);
   unlistenDragDrop?.();
+  if (imagePollTimer !== undefined) window.clearTimeout(imagePollTimer);
 });
 </script>
 
@@ -224,6 +333,7 @@ onBeforeUnmount(() => {
       <div class="head-actions">
         <div class="status-pill"><span class="dot blue"></span>无卡模式</div>
         <button class="btn primary" @click="chooseFiles"><Upload :size="19"/>上传素材</button>
+        <button class="btn" @click="openImagePanel('generate')"><Sparkles :size="18"/>生成图片</button>
         <button class="btn" @click="readClipboard">▣　从剪贴板粘贴</button>
         <label class="search-box"><Search :size="19"/><input v-model="store.state.query" placeholder="搜索素材、分类或描述"/></label>
         <input ref="uploadInput" class="visually-hidden" type="file" multiple accept="image/*,audio/*,video/*" @change="importSelection"/>
@@ -278,9 +388,19 @@ onBeforeUnmount(() => {
           <button class="btn primary" :disabled="compositionBusy" @click="saveComposition">{{ compositionBusy ? '正在保存' : '保存该画幅构图' }}</button>
           <small>{{ compositionNotice }}</small>
         </div>
-        <footer><button class="btn primary" @click="chooseReplacement">▣　替换文件</button><button v-if="selected.linkedShotIds.length" class="btn" @click="store.unlinkAll">解除全部关联</button><button v-else class="btn danger" @click="store.removeSelected"><Trash2 :size="16"/>删除素材</button><input ref="replaceInput" class="visually-hidden" type="file" :accept="replacementAccept" @change="replaceSelection"/></footer>
+        <footer><button v-if="selected.mediaType==='image'" class="btn primary" @click="openImagePanel('edit')"><Pencil :size="16"/>AI 编辑图片</button><button v-else class="btn primary" @click="chooseReplacement">▣　替换文件</button><button v-if="selected.linkedShotIds.length" class="btn" @click="store.unlinkAll">解除全部关联</button><button v-else class="btn danger" @click="store.removeSelected"><Trash2 :size="16"/>删除素材</button><input ref="replaceInput" class="visually-hidden" type="file" :accept="replacementAccept" @change="replaceSelection"/></footer>
       </aside>
       <aside v-else class="panel asset-detail detail-empty"><Upload :size="34"/><b>选择一个素材查看详情</b></aside>
+    </div>
+    <div v-if="imagePanelOpen" class="image-modal-backdrop" @click.self="!imageBusy && (imagePanelOpen=false)">
+      <section class="image-modal panel" role="dialog" aria-modal="true" aria-label="AI 图片生成与编辑">
+        <header><div class="image-modal-title"><span><ImagePlus :size="22"/></span><div><h2>{{ imageMode==='generate' ? '生成分镜关键画面' : '编辑当前图片' }}</h2><p>{{ activeProfile.aspectRatio }} · {{ activeProfile.workWidth }}×{{ activeProfile.workHeight }} 工作图 · 自动保存版本</p></div></div><button :disabled="imageBusy" aria-label="关闭" @click="imagePanelOpen=false"><X :size="20"/></button></header>
+        <div class="image-mode-tabs"><button :class="{active:imageMode==='generate'}" :disabled="imageBusy" @click="imageMode='generate'">从描述生成</button><button :class="{active:imageMode==='edit'}" :disabled="imageBusy || selected?.mediaType!=='image'" @click="imageMode='edit'">编辑所选图片</button></div>
+        <label><span>{{ imageMode==='generate' ? '画面描述' : '编辑要求' }}</span><textarea v-model="imagePrompt" :disabled="imageBusy" :placeholder="imageMode==='generate' ? '例如：深蓝雷云覆盖群山，一道闪电连接云层与地面，科普插画，清晰轮廓，无文字' : '例如：保持主体和构图不变，把夜空调整为雨后的蓝紫色，并增强闪电亮度'"/></label>
+        <div v-if="imageMode==='edit'" class="edit-source"><div class="edit-source-thumb" :style="selected ? previewStyle(selected) : undefined"></div><div><b>{{ selected?.name }}</b><span>使用已确认的 {{ activeProfile.aspectRatio }} 构图作为编辑输入</span></div></div>
+        <div class="image-task"><div class="field-head"><b>{{ imageJob ? `任务 ${imageJob.id.slice(0,8)}` : '提交前保持无卡模式' }}</b><span>{{ imageJob ? `${imageProgress}%` : '0%' }}</span></div><div class="progress"><i :style="{width:`${imageProgress}%`}"></i></div><p>{{ imageNotice }}</p></div>
+        <footer><button class="btn" :disabled="imageBusy" @click="imagePanelOpen=false">关闭</button><button class="btn primary" :disabled="imageBusy || !imagePrompt.trim()" @click="submitImage"><LoaderCircle v-if="imageBusy" class="spin" :size="17"/><Sparkles v-else :size="17"/>{{ imageBusy ? '生成中' : imageMode==='generate' ? '生成图片' : '生成编辑版本' }}</button></footer>
+      </section>
     </div>
   </section>
 </template>
@@ -288,4 +408,5 @@ onBeforeUnmount(() => {
 <style scoped>
 .assets-page{display:grid;grid-template-rows:90px 46px minmax(0,1fr);gap:8px}.breadcrumb{color:#576b8f;margin:0 0 6px 4px}.status-pill{height:42px;border:1px solid var(--line);border-radius:8px;background:#fff;display:flex;align-items:center;gap:8px;padding:0 14px;font-weight:650}.search-box{min-width:220px}.visually-hidden{position:fixed;left:-10000px;width:1px;height:1px;opacity:0}.asset-tabs{display:flex;align-items:center;gap:9px}.asset-tabs .tab-btn{min-width:78px}.asset-notice{margin-left:auto;max-width:360px;color:#526b91;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-layout{min-height:0;display:grid;grid-template-columns:minmax(620px,1fr) 426px;gap:15px}.asset-library{min-height:0;display:flex;flex-direction:column;gap:10px}.drop-zone{height:80px;border:1.5px dashed #5a9dff;border-radius:9px;background:transparent;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--blue);gap:3px}.drop-zone.dragging{background:#eaf3ff;border-style:solid}.drop-zone b{font-size:14px}.drop-zone span{font-size:12px;color:#7184a3}.asset-grid{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:minmax(130px,1fr);gap:11px;overflow:auto;padding:1px}.asset-grid article{min-height:130px;border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden;box-shadow:var(--shadow);display:grid;grid-template-rows:minmax(70px,1fr) 31px 29px;cursor:pointer}.asset-grid article.selected{border:2px solid var(--blue)}.asset-thumb,.detail-preview,.version-thumb,.mini-img{background-position:center;background-size:cover}.asset-clouds{background-image:url('../assets/asset-clouds.jpg')}.asset-bolt{background-image:url('../assets/asset-bolt.jpg')}.asset-runner{background-image:url('../assets/asset-runner.jpg')}.asset-mountain{background-image:url('../assets/asset-mountain.jpg')}.asset-palette{background-image:url('../assets/asset-palette.jpg')}.asset-audio{background-image:url('../assets/asset-audio.jpg')}.asset-safety{background-image:url('../assets/asset-safety.jpg')}.asset-village{background-image:url('../assets/asset-village.jpg')}.asset-street{background-image:url('../assets/asset-street.jpg')}.asset-thumb{position:relative}.audio-mark{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff;filter:drop-shadow(0 2px 4px #18355e)}.selected-mark{position:absolute;right:8px;top:8px;width:25px;height:25px;border-radius:50%;display:grid;place-items:center;color:#fff;background:var(--blue)}.asset-name{padding:3px 10px;display:flex;align-items:center;justify-content:space-between;min-width:0}.asset-name h3{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-name h3 span{font-size:11px;color:var(--blue);background:#e9f3ff;padding:3px 6px;border-radius:4px}.asset-name button{border:0;background:transparent}.asset-grid article footer{padding:0 10px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#64789a}.asset-grid footer a{display:flex;align-items:center;gap:4px;color:var(--blue)}.empty-assets{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:#7184a3}.style-profile{height:170px;padding:9px 11px}.style-head{display:flex;align-items:center;justify-content:space-between;height:30px}.style-head h3{display:flex;align-items:center}.style-head a{color:var(--blue);font-size:12px}.style-items{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}.style-items>div{height:111px;border:1px solid #dfe7f2;border-radius:7px;padding:8px;display:flex;flex-direction:column;gap:5px}.style-items small{color:#354c72}.style-items b{font-size:10px;color:#617595}.mini-img{height:46px;border-radius:5px}.colors{font-size:23px;white-space:nowrap;color:#0f5aa8}.ban{height:46px;display:grid;place-items:center;color:#f44336;font-size:38px}.asset-detail{min-height:0;display:flex;flex-direction:column;overflow:hidden}.asset-detail .panel-head button{border:0;background:transparent}.detail-preview{height:198px;margin:0 15px;position:relative;border-radius:8px}.detail-preview>span{position:absolute;right:8px;bottom:8px;color:#fff;background:#071a38;padding:4px 7px;border-radius:4px;font-size:11px}.detail-audio{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff}.detail-form{padding:10px 16px;display:flex;flex-direction:column;gap:7px}.detail-form label{display:grid;grid-template-columns:72px 1fr;align-items:start;font-size:12px}.detail-form input,.detail-form select,.detail-form textarea{border:1px solid #d5e0ef;border-radius:6px;background:#fff;min-height:34px;padding:0 9px}.detail-form p{font-size:12px}.detail-form p span{display:inline-block;width:72px;color:#5f7396}.detail-form textarea{height:70px;resize:none;padding:8px;line-height:1.5}.detail-tabs{height:42px;border-bottom:1px solid var(--line);display:flex;padding:0 15px;gap:30px}.detail-tabs button{border:0;background:transparent;position:relative;font-weight:700}.detail-tabs .active{color:var(--blue)}.detail-tabs .active:after{content:"";position:absolute;bottom:0;left:0;right:0;height:3px;background:var(--blue)}.version-list,.link-list{padding:8px 15px;display:flex;flex-direction:column;gap:8px;overflow:auto}.version-list article{min-height:64px;border:1px solid #dbe4f0;border-radius:7px;display:flex;align-items:center;gap:10px;padding:6px;cursor:pointer}.version-list article.selected{border-color:var(--blue);background:#f3f7ff}.version-thumb{width:82px;height:48px;border-radius:5px;flex:0 0 auto}.version-list small{margin-left:8px;color:#6c80a1}.version-list p{font-size:11px;color:#637797;margin-top:4px}.version-list em{margin-left:auto;font-style:normal;color:var(--blue);font-size:11px}.version-list article>button{margin-left:auto;border:0;background:transparent;color:var(--blue);font-size:11px}.link-list article{height:58px;border:1px solid #dbe4f0;border-radius:7px;display:flex;align-items:center;gap:10px;padding:7px}.link-badge{width:37px;height:37px;display:grid;place-items:center;border-radius:7px;background:#eaf3ff;color:var(--blue);font-weight:700}.link-list article div{display:flex;flex-direction:column;gap:3px}.link-list small{font-size:11px;color:#697d9c}.link-list article button{margin-left:auto}.empty-links,.detail-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:#7184a3}.empty-links span{font-size:12px}.asset-detail>footer{margin-top:auto;border-top:1px solid var(--line);padding:13px 15px;display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:1380px){.asset-layout{grid-template-columns:minmax(600px,1fr) 380px}.style-profile{height:145px}.style-items>div{height:88px}.mini-img,.ban{height:31px}.asset-grid{gap:8px}.detail-preview{height:155px}.head-actions{gap:6px}.status-pill{display:none}}
 .detail-tabs{gap:18px}.detail-tabs button{white-space:nowrap}.frame-editor{padding:10px 15px;display:flex;flex-direction:column;gap:9px;overflow:auto}.frame-preview{width:100%;max-height:150px;min-height:100px;margin:auto;border-radius:7px;background-color:#e7edf5;background-position:center;background-repeat:no-repeat;background-size:cover;position:relative}.frame-preview>span{position:absolute;right:7px;bottom:7px;padding:4px 7px;border-radius:4px;background:rgba(5,20,43,.78);color:#fff;font-size:11px}.frame-choice{display:grid;grid-template-columns:1fr 1fr;gap:8px}.frame-choice button{height:34px;border:1px solid #cad8ea;border-radius:6px;background:#fff}.frame-choice button.active{border-color:var(--blue);background:#edf5ff;color:var(--blue);font-weight:700}.frame-editor label{display:grid;grid-template-columns:105px 1fr;align-items:center;gap:9px;font-size:12px}.frame-editor select{height:32px;border:1px solid #cad8ea;border-radius:6px;background:#fff;padding:0 7px}.frame-editor input[type=range]{accent-color:var(--blue)}.frame-editor p,.frame-editor small{font-size:11px;color:#667b9c}.frame-editor small{min-height:16px}@media(max-width:1380px){.frame-preview{max-height:110px;min-height:80px}}
+.image-modal-backdrop{position:fixed;inset:0;z-index:100;background:rgba(13,30,55,.36);display:grid;place-items:center;padding:30px}.image-modal{width:min(640px,calc(100vw - 60px));padding:0;overflow:hidden;box-shadow:0 24px 70px rgba(18,46,83,.25)}.image-modal>header{height:78px;padding:0 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}.image-modal>header>button{border:0;background:transparent}.image-modal-title{display:flex;align-items:center;gap:12px}.image-modal-title>span{width:42px;height:42px;border-radius:10px;background:#eaf3ff;color:var(--blue);display:grid;place-items:center}.image-modal h2{font-size:20px}.image-modal header p{margin-top:4px;color:#6c7e9d;font-size:12px}.image-mode-tabs{margin:18px 22px 0;display:grid;grid-template-columns:1fr 1fr;padding:4px;background:#eef3f9;border-radius:9px}.image-mode-tabs button{height:38px;border:0;border-radius:7px;background:transparent;color:#647797}.image-mode-tabs button.active{background:#fff;color:var(--blue);font-weight:750;box-shadow:0 2px 8px rgba(34,79,139,.1)}.image-modal>label{display:flex;flex-direction:column;gap:8px;margin:18px 22px}.image-modal>label>span{font-weight:700}.image-modal textarea{height:122px;border:1px solid #cad8e9;border-radius:8px;padding:12px;resize:none;line-height:1.6;font:inherit}.edit-source{margin:0 22px 16px;border:1px solid #d9e4f1;border-radius:8px;padding:9px;display:flex;align-items:center;gap:12px;background:#f8fbff}.edit-source-thumb{width:90px;height:58px;border-radius:6px;background-position:center;background-size:cover}.edit-source div:last-child{display:flex;flex-direction:column;gap:5px}.edit-source span{font-size:12px;color:#6a7e9e}.image-task{margin:0 22px 18px;padding:12px;border:1px solid #dce6f2;border-radius:8px;background:#fbfdff}.image-task .field-head{display:flex;justify-content:space-between}.image-task p{margin-top:8px;color:#607596;font-size:12px}.image-modal>footer{height:68px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;align-items:center;gap:10px;padding:0 22px}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 </style>

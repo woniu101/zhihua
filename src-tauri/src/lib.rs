@@ -50,6 +50,7 @@ use source::{
 };
 use ssh_tunnel::{SaveTunnelConfigurationInput, SshTunnelManager, TunnelError, TunnelStatus};
 use std::{
+    fs,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -1020,6 +1021,86 @@ async fn download_completed_job(
 }
 
 #[tauri::command]
+async fn download_completed_image_job(
+    app: AppHandle,
+    projects: State<'_, ProjectStorage>,
+    assets: State<'_, AssetStorage>,
+    queue: State<'_, JobQueueStorage>,
+    service: State<'_, ServiceClient>,
+    lifecycle: State<'_, ComputeLifecycle>,
+    input: DownloadCompletedImageInput,
+) -> Result<Vec<AssetItem>, String> {
+    let project = projects
+        .get_project(&input.project_id)
+        .map_err(|error| error.to_string())?;
+    let job = service
+        .get_job(&input.job_id)
+        .await
+        .map_err(|error| error.message)?;
+    if job.project_id != project.id {
+        return Err("远端图片任务不属于当前项目，已停止下载。".to_owned());
+    }
+    let source_label = match job.kind.as_str() {
+        "image_generation" => "知画生成",
+        "image_edit" => "知画编辑",
+        _ => return Err("远端任务不是图片生成或编辑任务。".to_owned()),
+    };
+    if job.status != "completed" {
+        return Err("远端图片任务尚未完成。".to_owned());
+    }
+    let manifest = job
+        .result_manifest
+        .ok_or_else(|| "远端图片任务已完成，但没有返回成品清单。".to_owned())?;
+    if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
+        return Err("远端图片清单与任务不匹配，已停止下载。".to_owned());
+    }
+    let artifacts = manifest
+        .artifacts
+        .into_iter()
+        .filter(|artifact| artifact.kind == "image")
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() || artifacts.len() > 4 {
+        return Err("远端任务返回的图片数量异常。".to_owned());
+    }
+
+    let mut imported = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
+        let temporary = project
+            .project_dir
+            .join("cache")
+            .join("image-jobs")
+            .join(safe_path_component(&job.id)?)
+            .join(filename);
+        let downloaded = service
+            .download_artifact(DownloadServiceArtifactInput {
+                job_id: job.id.clone(),
+                artifact_id: artifact.artifact_id,
+                destination_path: temporary.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256,
+            })
+            .await
+            .map_err(|error| error.message)?;
+        let result = assets
+            .import_generated_file(
+                &project.id,
+                std::path::Path::new(&downloaded.destination_path),
+                source_label,
+            )
+            .map_err(|error| error.message);
+        let _ = fs::remove_file(&downloaded.destination_path);
+        imported.push(result?);
+    }
+    queue
+        .mark_local_complete(&job.id)
+        .map_err(|error| error.message)?;
+    let revision = lifecycle.invalidate_idle_shutdown();
+    schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
+    Ok(imported)
+}
+
+#[tauri::command]
 async fn download_completed_enhancement(
     app: AppHandle,
     projects: State<'_, ProjectStorage>,
@@ -1201,6 +1282,13 @@ fn get_frame_composition(
     input: GetFrameCompositionInput,
 ) -> Result<Option<FrameComposition>, FrameCompositionError> {
     storage.get(input)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadCompletedImageInput {
+    project_id: String,
+    job_id: String,
 }
 
 #[tauri::command]
@@ -1426,6 +1514,7 @@ pub fn run() {
             list_enhanced_versions,
             select_candidate_version,
             download_completed_job,
+            download_completed_image_job,
             download_completed_enhancement,
             get_frame_composition,
             save_frame_composition,

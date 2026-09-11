@@ -22,7 +22,7 @@ export interface AssetItem {
   name: string;
   category: AssetCategory;
   mediaType: AssetMediaType;
-  source: "本地上传" | "剪贴板" | "演示素材";
+  source: "本地上传" | "剪贴板" | "演示素材" | "知画生成" | "知画编辑";
   description: string;
   fallbackImage: string;
   currentVersionId: string;

@@ -1,5 +1,7 @@
 import type {
   GenerationJob,
+  ImageGenerationRequest,
+  ImageProvider,
   RuntimeCapabilities,
   VideoGenerationRequest,
   VideoProvider,
@@ -237,6 +239,8 @@ export class ComfyUiH3Provider implements VideoProvider {
       acceptedWorkflowIds: probe.workflows,
       availableWorkflowIds: probe.availableWorkflows,
       workflows: [
+        probe.availableWorkflows.includes("qwen-image-generate-v1") && "image_generate",
+        probe.availableWorkflows.includes("qwen-image-edit-v1") && "image_edit",
         probe.availableWorkflows.some((item) => item.startsWith("h3-t2v-")) && "t2v",
         probe.availableWorkflows.some((item) => item.startsWith("h3-i2v-")) && "i2v",
         probe.availableWorkflows.some((item) => item.startsWith("h3-flf2v-")) && "flf2v",
@@ -413,5 +417,91 @@ export class ComfyUiH3Provider implements VideoProvider {
 
   async downloadResult(): Promise<string> {
     throw new Error("结果下载将在工作流执行器完成后开放");
+  }
+}
+
+export class ComfyUiQwenImageProvider implements ImageProvider {
+  async getCapabilities(): Promise<RuntimeCapabilities> {
+    return new ComfyUiH3Provider().getCapabilities();
+  }
+
+  async submit(request: ImageGenerationRequest): Promise<GenerationJob> {
+    const capabilities = await this.getCapabilities();
+    const workflowId = request.mode === "edit"
+      ? "qwen-image-edit-v1"
+      : "qwen-image-generate-v1";
+    if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
+      throw new Error(`知画服务不接受工作流 ${workflowId}，请先更新服务。`);
+    }
+    if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
+      throw new Error(`工作流 ${workflowId} 尚未就绪，当前不会启动 GPU。`);
+    }
+    const profile = frameProfile(request.aspectRatio);
+    const parameters: Record<string, unknown> = {
+      prompt: request.prompt,
+      negativePrompt: request.negativePrompt ?? "模糊、畸形、乱码、水印、低清晰度",
+      width: profile.workWidth,
+      height: profile.workHeight,
+      seed: request.seed,
+    };
+    let uploaded: ServiceInputUpload | undefined;
+    try {
+      if (request.mode === "edit") {
+        if (!request.sourceAssetId) throw new Error("图片编辑需要选择一张来源图片。");
+        const assets = await assetRepository.list(request.projectId);
+        const asset = assets.find((item) => item.id === request.sourceAssetId);
+        if (!asset || asset.mediaType !== "image") throw new Error("找不到要编辑的图片素材。");
+        const version = currentAssetVersion(asset);
+        if (!version.storedPath) throw new Error("来源图片没有可读取的本地文件。");
+        const key = {
+          projectId: request.projectId,
+          assetId: asset.id,
+          assetVersionId: version.id,
+          aspectRatio: profile.aspectRatio,
+        };
+        let composition = await frameCompositionRepository.get(key);
+        if (!composition) {
+          composition = await frameCompositionRepository.save({
+            ...key,
+            fitMode: "cover",
+            focalX: 0.5,
+            focalY: 0.5,
+            backgroundMode: "edge",
+          });
+        }
+        composition = await frameCompositionRepository.prepare(key);
+        if (!composition?.derivativePath) throw new Error("来源图片的项目画幅准备失败。");
+        uploaded = await serviceRepository.uploadInput(composition.derivativePath);
+        if (!uploaded) throw new Error("来源图片上传失败。");
+        parameters.sourceImageFile = uploaded.remoteFile;
+      }
+      const probe = await serviceRepository.prepareGeneration();
+      if (!probe?.comfyuiReady) throw new Error(probe?.detail ?? "图片生成环境尚未就绪。");
+      const job = await invokeNative<NativeServiceJob>("submit_service_job", {
+        input: {
+          clientRequestId: request.clientRequestId,
+          projectId: request.projectId,
+          sceneId: request.sceneId,
+          kind: request.mode === "edit" ? "image_edit" : "image_generation",
+          workflowId,
+          parameters,
+        },
+      });
+      if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
+      return mapJob(job);
+    } catch (error) {
+      if (uploaded) await serviceRepository.deleteInput(uploaded.inputId).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async getStatus(jobId: string): Promise<GenerationJob> {
+    const job = await invokeNative<NativeServiceJob>("get_service_job", { jobId });
+    if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
+    return mapJob(job);
+  }
+
+  async cancel(jobId: string): Promise<void> {
+    await invokeNative("cancel_service_job", { jobId });
   }
 }

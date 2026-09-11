@@ -107,4 +107,10 @@ export const assetRepository = {
     if (!result) throw new Error("分镜关联只能在桌面客户端中修改。");
     return fromNative(result);
   },
+  async downloadCompletedImage(projectId: string, jobId: string): Promise<AssetItem[]> {
+    const result = await invokeNative<NativeAsset[]>("download_completed_image_job", {
+      input: { projectId, jobId },
+    });
+    return result?.map(fromNative) ?? [];
+  },
 };

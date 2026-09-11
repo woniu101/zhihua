@@ -52,7 +52,7 @@ export interface RuntimeCapabilities {
   workflowVersion: string;
   modelManifestVersion: string;
   comfyUiReady: boolean;
-  workflows: Array<"t2v" | "i2v" | "flf2v" | "r2v" | "seedvr2">;
+  workflows: Array<"image_generate" | "image_edit" | "t2v" | "i2v" | "flf2v" | "r2v" | "seedvr2">;
   acceptedWorkflowIds?: string[];
   availableWorkflowIds?: string[];
 }
@@ -85,6 +85,18 @@ export interface VideoGenerationRequest {
   discardH3Audio: boolean;
 }
 
+export interface ImageGenerationRequest {
+  clientRequestId: string;
+  projectId: string;
+  sceneId: string;
+  mode: "generate" | "edit";
+  aspectRatio: AspectRatio;
+  prompt: string;
+  negativePrompt?: string;
+  seed: number;
+  sourceAssetId?: string;
+}
+
 export interface GenerationJob {
   id: string;
   clientRequestId: string;
@@ -113,4 +125,11 @@ export interface VideoProvider {
   getStatus(jobId: string): Promise<GenerationJob>;
   cancel(jobId: string): Promise<void>;
   downloadResult(jobId: string, destination: string): Promise<string>;
+}
+
+export interface ImageProvider {
+  getCapabilities(): Promise<RuntimeCapabilities>;
+  submit(request: ImageGenerationRequest): Promise<GenerationJob>;
+  getStatus(jobId: string): Promise<GenerationJob>;
+  cancel(jobId: string): Promise<void>;
 }

@@ -19,7 +19,7 @@ use tokio_util::io::ReaderStream;
 const CREDENTIAL_SERVICE: &str = "cn.zhihua.desktop.zhihua-service";
 const CLIENT_VERSION: &str = "0.1.0";
 const API_VERSION: &str = "v1";
-const WORKFLOW_MANIFEST_VERSION: &str = "h3-workflows-2026.09.11";
+const WORKFLOW_MANIFEST_VERSION: &str = "zhihua-workflows-2026.09.11";
 const MODEL_MANIFEST_VERSION: &str = "public-models-2026.09.08";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -998,7 +998,11 @@ fn validate_job_input(input: &SubmitServiceJobInput) -> ServiceResult<()> {
     validate_identifier(&input.workflow_id, "工作流 ID")?;
     if !matches!(
         input.kind.as_str(),
-        "video_candidate" | "video_reference_remake" | "video_upscale"
+        "image_generation"
+            | "image_edit"
+            | "video_candidate"
+            | "video_reference_remake"
+            | "video_upscale"
     ) {
         return Err(service_error("invalid_job_kind", "任务类型不受支持。"));
     }
@@ -1375,9 +1379,9 @@ mod tests {
         let (probe, first, second, fetched) = result.expect("run live service contract");
         assert!(probe.compatible);
         assert_eq!(probe.api_version.as_deref(), Some("v1"));
-        assert_eq!(probe.service_version, "0.3.0");
+        assert_eq!(probe.service_version, "0.4.0");
         assert!(probe.workflows.iter().any(|item| item == "h3-t2v-turbo-v1"));
-        assert_eq!(probe.available_workflows.len(), 9);
+        assert_eq!(probe.available_workflows.len(), 11);
         assert!(probe
             .available_workflows
             .iter()

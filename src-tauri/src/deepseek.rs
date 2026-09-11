@@ -964,4 +964,31 @@ mod tests {
         let error = validate_storyboard_plan(&plan, &points).expect_err("unknown ref must fail");
         assert_eq!(error.code, "INVALID_STORYBOARD");
     }
+
+    #[tokio::test]
+    #[ignore = "requires ZHIHUA_TEST_DEEPSEEK_API_KEY and writes the authorized key to Windows Credential Manager"]
+    async fn provisions_and_tests_live_deepseek_connection() {
+        let api_key = std::env::var("ZHIHUA_TEST_DEEPSEEK_API_KEY")
+            .expect("set ZHIHUA_TEST_DEEPSEEK_API_KEY for the live connection test");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let provider = DeepSeekProvider::initialize(
+            directory.path().join("settings"),
+            directory.path().join("zhihua.sqlite3"),
+        )
+        .expect("initialize DeepSeek provider");
+        let configuration = provider
+            .save_configuration(SaveDeepSeekConfigurationInput {
+                base_url: DEFAULT_BASE_URL.to_owned(),
+                model: DEFAULT_MODEL.to_owned(),
+                api_key,
+            })
+            .expect("save authorized DeepSeek configuration");
+        assert!(configuration.credential_stored);
+        let result = provider
+            .test_connection()
+            .await
+            .expect("connect to DeepSeek");
+        assert!(result.connected);
+        assert_eq!(result.model, DEFAULT_MODEL);
+    }
 }
