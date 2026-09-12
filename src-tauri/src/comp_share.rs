@@ -686,11 +686,10 @@ impl CompShareProvider {
         zone: &str,
     ) -> CompShareResult<CompShareInstance> {
         let mut parameters = BTreeMap::new();
-        parameters.insert("Limit".to_string(), "2".to_string());
+        parameters.insert("Limit".to_string(), "100".to_string());
         parameters.insert("Offset".to_string(), "0".to_string());
         parameters.insert("Region".to_string(), region.to_string());
         parameters.insert("Zone".to_string(), zone.to_string());
-        parameters.insert("UHostIds.0".to_string(), instance_id.to_string());
         parameters.insert("WithoutGpu".to_string(), "true".to_string());
         let response: DescribeInstancesResponseWire = self
             .api
@@ -1223,5 +1222,189 @@ mod tests {
         assert_eq!(error.code, "COMPSHARE_API_ERROR");
         assert_eq!(error.ret_code, Some(12345));
         assert_eq!(error.request_uuid.as_deref(), Some("request-test"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authorized CompShare credentials and starts the selected instance in paid GPU mode"]
+    async fn live_start_selected_instance_in_gpu_mode() {
+        let public_key = std::env::var("ZHIHUA_TEST_COMPSHARE_PUBLIC_KEY")
+            .expect("set ZHIHUA_TEST_COMPSHARE_PUBLIC_KEY");
+        let private_key = std::env::var("ZHIHUA_TEST_COMPSHARE_PRIVATE_KEY")
+            .expect("set ZHIHUA_TEST_COMPSHARE_PRIVATE_KEY");
+        let instance_id = std::env::var("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID")
+            .expect("set ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let provider = CompShareProvider::new(directory.path().to_path_buf())
+            .expect("initialize CompShare provider");
+        provider
+            .save_credentials(SaveCompShareCredentialsInput {
+                public_key,
+                private_key,
+            })
+            .expect("save authorized credentials");
+        let instance = provider
+            .list_instances(ListCompShareInstancesInput {
+                region: None,
+                zone: None,
+            })
+            .await
+            .expect("list instances")
+            .into_iter()
+            .find(|instance| instance.instance_id == instance_id)
+            .expect("selected instance exists");
+        provider
+            .bind_instance(BindCompShareInstanceInput {
+                instance_id,
+                region: instance.region,
+                zone: instance.zone,
+                project_id: instance.project_id,
+            })
+            .await
+            .expect("bind selected instance");
+
+        wait_for_stable_state(&provider).await;
+        let current = provider
+            .bound_instance()
+            .await
+            .expect("read current instance");
+        if current.state == CompSharePowerState::Running
+            && current.running_mode == CompShareRunningMode::NoGpu
+        {
+            provider
+                .stop_instance()
+                .await
+                .expect("stop no-GPU instance");
+            wait_for_state(&provider, CompSharePowerState::Stopped, None).await;
+        }
+        let current = provider
+            .bound_instance()
+            .await
+            .expect("read stopped instance");
+        if current.state == CompSharePowerState::Stopped {
+            provider
+                .start_instance(CompShareStartMode::Gpu)
+                .await
+                .expect("start GPU instance");
+        }
+        let running = wait_for_state(
+            &provider,
+            CompSharePowerState::Running,
+            Some(CompShareRunningMode::Gpu),
+        )
+        .await;
+        assert_eq!(running.gpu_count, Some(1));
+
+        let stop_time = chrono::Utc::now().timestamp() + 3_600;
+        let scheduler = provider
+            .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+                stop_time,
+                project_id: running.project_id,
+            })
+            .await
+            .expect("set one-hour stop safeguard");
+        assert_eq!(scheduler.stop_time, stop_time);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authorized CompShare credentials and leaves the selected instance running without GPU"]
+    async fn live_leave_selected_instance_in_no_gpu_mode() {
+        let public_key = std::env::var("ZHIHUA_TEST_COMPSHARE_PUBLIC_KEY")
+            .expect("set ZHIHUA_TEST_COMPSHARE_PUBLIC_KEY");
+        let private_key = std::env::var("ZHIHUA_TEST_COMPSHARE_PRIVATE_KEY")
+            .expect("set ZHIHUA_TEST_COMPSHARE_PRIVATE_KEY");
+        let instance_id = std::env::var("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID")
+            .expect("set ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let provider = CompShareProvider::new(directory.path().to_path_buf())
+            .expect("initialize CompShare provider");
+        provider
+            .save_credentials(SaveCompShareCredentialsInput {
+                public_key,
+                private_key,
+            })
+            .expect("save authorized credentials");
+        let instance = provider
+            .list_instances(ListCompShareInstancesInput {
+                region: None,
+                zone: None,
+            })
+            .await
+            .expect("list instances")
+            .into_iter()
+            .find(|instance| instance.instance_id == instance_id)
+            .expect("selected instance exists");
+        provider
+            .bind_instance(BindCompShareInstanceInput {
+                instance_id,
+                region: instance.region,
+                zone: instance.zone,
+                project_id: instance.project_id,
+            })
+            .await
+            .expect("bind selected instance");
+
+        let current = wait_for_stable_state(&provider).await;
+        if current.project_id.is_some() {
+            provider
+                .delete_stop_scheduler()
+                .await
+                .expect("remove GPU stop scheduler");
+        }
+        if current.state == CompSharePowerState::Running
+            && current.running_mode != CompShareRunningMode::NoGpu
+        {
+            provider.stop_instance().await.expect("stop GPU instance");
+            wait_for_state(&provider, CompSharePowerState::Stopped, None).await;
+        }
+        let current = provider
+            .bound_instance()
+            .await
+            .expect("read current instance");
+        if current.state == CompSharePowerState::Stopped {
+            provider
+                .start_instance(CompShareStartMode::NoGpu)
+                .await
+                .expect("start instance without GPU");
+        }
+        let running = wait_for_state(
+            &provider,
+            CompSharePowerState::Running,
+            Some(CompShareRunningMode::NoGpu),
+        )
+        .await;
+        assert_eq!(running.gpu_count, Some(0));
+    }
+
+    async fn wait_for_stable_state(provider: &CompShareProvider) -> CompShareInstance {
+        for _ in 0..90 {
+            let instance = provider.bound_instance().await.expect("poll instance");
+            if matches!(
+                instance.state,
+                CompSharePowerState::Running | CompSharePowerState::Stopped
+            ) {
+                return instance;
+            }
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+        panic!("instance did not reach a stable state within six minutes");
+    }
+
+    async fn wait_for_state(
+        provider: &CompShareProvider,
+        expected_state: CompSharePowerState,
+        expected_mode: Option<CompShareRunningMode>,
+    ) -> CompShareInstance {
+        for _ in 0..120 {
+            let instance = provider.bound_instance().await.expect("poll instance");
+            if instance.state == expected_state
+                && expected_mode
+                    .map(|mode| instance.running_mode == mode)
+                    .unwrap_or(true)
+            {
+                return instance;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        panic!("instance did not reach the requested state within ten minutes");
     }
 }

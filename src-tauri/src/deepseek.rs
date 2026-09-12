@@ -674,23 +674,35 @@ fn validate_storyboard_plan(
         .iter()
         .map(|point| point.id.as_str())
         .collect::<HashSet<_>>();
-    for scene in &plan.scenes {
-        if scene.title.trim().is_empty()
-            || scene.title.chars().count() > 120
-            || scene.purpose.trim().is_empty()
-            || scene.narration.trim().is_empty()
-            || scene.visual_plan.trim().is_empty()
-            || !matches!(scene.target_duration_sec, 5 | 10 | 15)
-            || scene.knowledge_point_ids.is_empty()
-            || scene
-                .knowledge_point_ids
-                .iter()
-                .any(|id| !known.contains(id.as_str()))
-            || scene.on_screen_text.len() > 2
+    for (index, scene) in plan.scenes.iter().enumerate() {
+        let scene_number = index + 1;
+        let reason = if scene.title.trim().is_empty() || scene.title.chars().count() > 120 {
+            Some("标题为空或过长")
+        } else if scene.purpose.trim().is_empty() {
+            Some("镜头目的为空")
+        } else if scene.narration.trim().is_empty() {
+            Some("旁白为空")
+        } else if scene.visual_plan.trim().is_empty() {
+            Some("画面描述为空")
+        } else if !matches!(scene.target_duration_sec, 5 | 10 | 15) {
+            Some("时长不是 5、10 或 15 秒")
+        } else if scene.knowledge_point_ids.is_empty() {
+            Some("没有引用知识点")
+        } else if scene
+            .knowledge_point_ids
+            .iter()
+            .any(|id| !known.contains(id.as_str()))
         {
+            Some("引用了不存在的知识点")
+        } else if scene.on_screen_text.len() > 2 {
+            Some("画面文字超过两条")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             return Err(DeepSeekError::new(
                 "INVALID_STORYBOARD",
-                "DeepSeek 返回的分镜字段、时长或知识点引用无效",
+                format!("DeepSeek 返回的第 {scene_number} 个分镜无效：{reason}"),
             ));
         }
     }

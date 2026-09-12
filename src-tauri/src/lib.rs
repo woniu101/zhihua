@@ -7,6 +7,8 @@ mod frame_composition;
 mod frame_profile;
 mod generation;
 mod job_queue;
+#[cfg(test)]
+mod live_validation;
 mod service;
 mod source;
 mod ssh_tunnel;
@@ -598,6 +600,14 @@ async fn storyboard_generate_from_knowledge(
     storyboard: State<'_, StoryboardStorage>,
     input: CreateStoryboardInput,
 ) -> Result<Vec<SceneDraft>, DeepSeekError> {
+    generate_and_persist_storyboard(provider.inner(), storyboard.inner(), input).await
+}
+
+async fn generate_and_persist_storyboard(
+    provider: &DeepSeekProvider,
+    storyboard: &StoryboardStorage,
+    input: CreateStoryboardInput,
+) -> Result<Vec<SceneDraft>, DeepSeekError> {
     if !storyboard
         .list(&input.project_id)
         .map_err(|error| DeepSeekError {
@@ -665,6 +675,108 @@ async fn storyboard_generate_from_knowledge(
         }
     }
     Ok(saved)
+}
+
+#[cfg(test)]
+mod live_flow_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ZHIHUA_TEST_DEEPSEEK_API_KEY and performs two authorized live DeepSeek requests"]
+    async fn live_content_to_persisted_storyboard_flow() {
+        let api_key = std::env::var("ZHIHUA_TEST_DEEPSEEK_API_KEY")
+            .expect("set ZHIHUA_TEST_DEEPSEEK_API_KEY for the live flow test");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let projects = ProjectStorage::initialize(
+            directory.path().join("zhihua.sqlite3"),
+            directory.path().join("projects"),
+        )
+        .expect("initialize projects");
+        let project = projects
+            .create_project(CreateProjectInput {
+                title: "雷电形成验收".to_owned(),
+                audience: Some("小学高年级".to_owned()),
+                target_duration_sec: Some(30),
+            })
+            .expect("create project");
+        let provider = DeepSeekProvider::initialize(
+            directory.path().join("settings"),
+            projects.info().database_path,
+        )
+        .expect("initialize DeepSeek provider");
+        provider
+            .save_configuration(SaveDeepSeekConfigurationInput {
+                base_url: "https://api.deepseek.com".to_owned(),
+                model: "deepseek-chat".to_owned(),
+                api_key,
+            })
+            .expect("save authorized DeepSeek configuration");
+
+        let source_id = "source-lightning".to_owned();
+        let points = provider
+            .analyze_sources(
+                AnalyzeSourcesInput {
+                    project_id: project.id.clone(),
+                    source_ids: vec![source_id.clone()],
+                    target_audience: project.audience.clone(),
+                    target_duration_sec: project.target_duration_sec,
+                },
+                vec![DeepSeekSource {
+                    id: source_id.clone(),
+                    name: "雷电基础资料.txt".to_owned(),
+                    text: "云中的冰晶和水滴碰撞，使云层不同区域积累不同电荷。电势差足够大时，空气被击穿，形成明亮的闪电通道。闪电会把周围空气迅速加热，空气快速膨胀并形成声波，这就是雷声。光传播得比声音快，所以人们通常先看到闪电，后听到雷声。"
+                        .to_owned(),
+                }],
+            )
+            .await
+            .expect("extract knowledge points from the live model");
+        assert!((3..=12).contains(&points.len()));
+        assert!(points.iter().all(|point| {
+            !point.title.trim().is_empty()
+                && !point.detail.trim().is_empty()
+                && point
+                    .source_refs
+                    .iter()
+                    .all(|reference| reference.source_id == source_id)
+        }));
+
+        let confirmed = points
+            .into_iter()
+            .map(|mut point| {
+                point.confirmed = true;
+                point
+            })
+            .collect::<Vec<_>>();
+        provider
+            .replace_knowledge_points(&project.id, &confirmed)
+            .expect("confirm extracted knowledge points");
+
+        let storyboard = StoryboardStorage::initialize(projects).expect("initialize storyboard");
+        let scenes = generate_and_persist_storyboard(
+            &provider,
+            &storyboard,
+            CreateStoryboardInput {
+                project_id: project.id.clone(),
+                target_audience: project.audience,
+                target_duration_sec: project.target_duration_sec,
+            },
+        )
+        .await
+        .expect("generate and persist storyboard with the live model");
+
+        assert!(!scenes.is_empty());
+        assert!(scenes.iter().all(|scene| {
+            !scene.title.trim().is_empty()
+                && !scene.narration.trim().is_empty()
+                && !scene.visual_plan.trim().is_empty()
+                && matches!(scene.target_duration_ms, 5_000 | 10_000 | 15_000)
+                && scene.status == SceneStatus::Draft
+        }));
+        assert_eq!(
+            storyboard.list(&project.id).expect("reload storyboard"),
+            scenes
+        );
+    }
 }
 
 #[tauri::command]
