@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, LoaderCircle, Maximize2, Music2, Pause, Play, Plus, RotateCcw, Sparkles, Star, Subtitles, Trash2, Volume2, X } from "lucide-vue-next";
+import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, LoaderCircle, Maximize2, Music2, Play, Plus, RotateCcw, Sparkles, Star, Subtitles, Trash2, Volume2, X } from "lucide-vue-next";
 import type { GenerationJob } from "../domain/providers";
 import type { AspectRatio, CandidateQuality, GenerationMode } from "../domain/storyboard";
 import { frameProfile } from "../domain/frameProfiles";
@@ -165,7 +165,7 @@ async function synthesizeNarration(playAfter = false) {
   narrationBusy.value = true;
   narrationError.value = "";
   try {
-    await save(scene.id, { narration: scene.narration });
+    await save(scene.id, { narration: scene.narration, narrationMode: "tts" });
     narrationArtifact.value = await ttsRepository.synthesize({
       projectId: scene.projectId,
       sceneId: scene.id,
@@ -195,7 +195,7 @@ async function importNarrationAudio() {
   narrationBusy.value = true;
   narrationError.value = "";
   try {
-    await save(scene.id, { narration: scene.narration });
+    await save(scene.id, { narration: scene.narration, narrationMode: "imported" });
     narrationArtifact.value = await ttsRepository.importAudio(
       scene.projectId,
       scene.id,
@@ -255,6 +255,14 @@ async function loadCandidateVersions(projectId?: string, sceneId?: string) {
   previewEnhancedId.value = enhancedForOfficial.value?.id ?? "";
 }
 
+function setNarrationMode(mode: "tts" | "imported" | "none") {
+  updateSelected({ narrationMode: mode });
+  if (mode === "none") {
+    narrationAudio?.pause();
+    narrationError.value = "";
+  }
+}
+
 function updateTextField(field: "title" | "purpose" | "visualPlan", event: Event) {
   updateSelected({ [field]: (event.target as HTMLInputElement | HTMLTextAreaElement).value });
 }
@@ -262,6 +270,10 @@ function updateTextField(field: "title" | "purpose" | "visualPlan", event: Event
 function updateOnScreenText(event: Event) {
   const value = (event.target as HTMLTextAreaElement).value;
   updateSelected({ onScreenText: value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) });
+}
+
+function updateAmbientSound(event: Event) {
+  updateSelected({ ambientSound: (event.target as HTMLTextAreaElement).value });
 }
 
 async function loadScenePreview(scene: typeof scenes.value[number]) {
@@ -485,10 +497,10 @@ async function generateSelected() {
       aspectRatio: settings.value.aspectRatio,
       durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
       prompt: generationPrompt(scene.visualPlan),
-      narration: scene.narration,
+      ambientSound: scene.ambientSound,
       seed: crypto.getRandomValues(new Uint32Array(1))[0],
       assetIds: scene.assetIds,
-      discardH3Audio: settings.value.discardH3Audio,
+      h3AudioPolicy: settings.value.h3AudioPolicy,
     });
     task.value = submitted;
     await save(scene.id, {
@@ -540,10 +552,10 @@ async function generateIncompleteScenes() {
         aspectRatio: settings.value.aspectRatio,
         durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
         prompt: generationPrompt(scene.visualPlan),
-        narration: scene.narration,
+        ambientSound: scene.ambientSound,
         seed: crypto.getRandomValues(new Uint32Array(1))[0],
         assetIds: scene.assetIds,
-        discardH3Audio: settings.value.discardH3Audio,
+        h3AudioPolicy: settings.value.h3AudioPolicy,
       });
       await save(scene.id, {
         lastJobId: submitted.id,
@@ -761,12 +773,13 @@ const confirmRemove = () => {
           <template v-if="activeInspector==='content'">
             <label class="editor-field"><span>镜头标题</span><input :value="selectedScene.title" maxlength="80" @input="updateTextField('title',$event)"/></label>
             <label class="editor-field"><span>本镜头目的</span><textarea :value="selectedScene.purpose" placeholder="说明这段画面要帮助观众理解什么" @input="updateTextField('purpose',$event)"></textarea></label>
-            <div class="field-head"><label class="section-label">系统旁白 / 解说文案</label><span>{{ selectedScene.narration.length }} 字</span></div>
-            <textarea :value="selectedScene.narration" placeholder="输入本镜头旁白" @input="updateNarrationText"></textarea>
+            <div class="field-head"><label class="section-label">旁白与字幕</label><span>{{ selectedScene.narrationMode === 'none' ? '本镜头无旁白' : `${selectedScene.narration.length} 字` }}</span></div>
+            <div class="segmented narration-modes"><button :class="{active:selectedScene.narrationMode==='tts'}" @click="setNarrationMode('tts')">系统配音</button><button :class="{active:selectedScene.narrationMode==='imported'}" @click="setNarrationMode('imported')">导入录音</button><button :class="{active:selectedScene.narrationMode==='none'}" @click="setNarrationMode('none')">关闭旁白</button></div>
+            <textarea v-if="selectedScene.narrationMode!=='none'" :value="selectedScene.narration" placeholder="输入本镜头旁白；字幕会按标点自动拆分，可在导出前关闭" @input="updateNarrationText"></textarea>
             <label class="editor-field"><span>屏幕文字</span><textarea :value="selectedScene.onScreenText.join('\n')" placeholder="每行一条，留空则只使用旁白字幕" @input="updateOnScreenText"></textarea></label>
-            <div class="field-head"><label class="section-label">旁白声音</label><span>{{ narrationArtifact ? `已生成 ${(narrationArtifact.durationMs / 1000).toFixed(1)} 秒` : '尚未生成' }}</span></div>
-            <div class="voice-row"><select v-model="selectedVoiceId" class="select" aria-label="系统旁白音色"><option v-for="voice in systemVoices" :key="voice.id" :value="voice.id">{{ voice.name }} · {{ voice.locale }}</option></select><button class="round" :disabled="narrationBusy" @click="playNarration"><LoaderCircle v-if="narrationBusy" class="spin" :size="15"/><Play v-else :size="15" fill="currentColor"/></button><button class="btn compact" :disabled="narrationBusy || !selectedScene.narration.trim()" @click="synthesizeNarration(false)"><RotateCcw :size="15"/>{{ narrationArtifact ? '重新生成' : '生成旁白' }}</button></div>
-            <div class="narration-import-row"><select v-model="selectedNarrationAssetId" class="select" aria-label="导入旁白录音"><option value="">从素材库选择已有录音</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select><button class="btn compact" :disabled="narrationBusy || !selectedNarrationAssetId" @click="importNarrationAudio"><Music2 :size="15"/>使用录音</button></div>
+            <template v-if="selectedScene.narrationMode==='tts'"><div class="field-head"><label class="section-label">系统配音</label><span>{{ narrationArtifact ? `已生成 ${(narrationArtifact.durationMs / 1000).toFixed(1)} 秒` : '尚未生成' }}</span></div><div class="voice-row"><select v-model="selectedVoiceId" class="select" aria-label="系统旁白音色"><option v-for="voice in systemVoices" :key="voice.id" :value="voice.id">{{ voice.name }} · {{ voice.locale }}</option></select><button class="round" :disabled="narrationBusy" @click="playNarration"><LoaderCircle v-if="narrationBusy" class="spin" :size="15"/><Play v-else :size="15" fill="currentColor"/></button><button class="btn compact" :disabled="narrationBusy || !selectedScene.narration.trim()" @click="synthesizeNarration(false)"><RotateCcw :size="15"/>{{ narrationArtifact ? '重新生成' : '生成旁白' }}</button></div></template>
+            <div v-else-if="selectedScene.narrationMode==='imported'" class="narration-import-row"><select v-model="selectedNarrationAssetId" class="select" aria-label="导入旁白录音"><option value="">从素材库选择已有录音</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select><button class="btn compact" :disabled="narrationBusy || !selectedNarrationAssetId" @click="importNarrationAudio"><Music2 :size="15"/>使用录音</button><button v-if="narrationArtifact" class="round" @click="playNarration"><Play :size="15" fill="currentColor"/></button></div>
+            <div v-else class="narration-off-note">此镜头只保留画面和可选环境音，字幕默认关闭。</div>
             <p v-if="narrationError" class="task-error narration-error">{{ narrationError }}</p>
           </template>
 
@@ -795,7 +808,9 @@ const confirmRemove = () => {
             <div class="segmented duration-options"><button v-for="seconds in [5,10,15] as const" :key="seconds" :class="{active:durationLabel===`${seconds}秒`}" @click="setDuration(seconds)">{{ seconds }} 秒</button></div>
             <div class="field-head"><label class="section-label">质量模式</label><span class="warning-text">耗时受冷启动和队列影响</span></div>
             <div class="quality-grid"><button :class="{active:selectedScene.quality==='fast'}" @click="setQuality('fast')"><b>快速 8 步</b><span>适合构图和动作候选</span></button><button :class="{active:selectedScene.quality==='high'}" @click="setQuality('high')"><b>高质量 20 步</b><span>生成新的高质量候选</span></button></div>
-            <label class="section-label audio-label">音轨设置</label><div class="audio-setting"><span class="round filled"><Pause :size="13" fill="currentColor"/></span><div><b>不使用 H3 原生音轨</b><span>旁白和音乐在本地合成，候选视频保持静音</span></div></div>
+            <div class="field-head"><label class="section-label">H3 原生环境音</label><span>不作为正式旁白</span></div>
+            <label class="editor-field ambient-field"><span>希望听到的声音</span><textarea :value="selectedScene.ambientSound" placeholder="例如：细雨、远处雷声，闪电出现时一声清晰雷鸣" @input="updateAmbientSound"></textarea></label>
+            <div class="audio-policy-grid"><button :class="{active:settings.h3AudioPolicy==='smart'}" @click="settings.h3AudioPolicy='smart'"><b>智能使用</b><span>默认保留候选音轨，成片检查后低音量混入</span></button><button :class="{active:settings.h3AudioPolicy==='always'}" @click="settings.h3AudioPolicy='always'"><b>始终使用</b><span>保留原声，由你试听决定</span></button><button :class="{active:settings.h3AudioPolicy==='off'}" @click="settings.h3AudioPolicy='off'"><b>不使用</b><span>生成静音候选</span></button></div>
             <div class="generation-contract"><span>项目画幅</span><b>{{ settings.aspectRatio }}</b><span>候选尺寸</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b><span>1080p</span><b>{{ settings.aspectRatio === '16:9' ? '可选增强' : '暂未开放' }}</b></div>
             <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'enhancement' ? '1080p 增强版' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb"><Film :size="23"/></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
           </template>
@@ -828,6 +843,7 @@ const confirmRemove = () => {
 .empty-storyboard{height:calc(100% - 50px);padding:28px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;color:#617697}.empty-storyboard b{color:#29466f}.empty-storyboard span{max-width:245px;font-size:12px;line-height:1.6}.empty-storyboard .btn{margin-top:7px}
 .reference-inputs{margin:-3px 0 12px;padding:9px 10px;border:1px solid #d9e4f1;border-radius:8px;background:#f8fbff;display:grid;grid-template-columns:1fr 1fr;gap:7px}.reference-inputs .field-head{grid-column:1/-1;margin:0 0 2px}.reference-inputs .field-head a{color:var(--blue);font-size:12px}.reference-inputs label{display:flex;flex-direction:column;gap:4px;color:#52698c;font-size:11px}.reference-inputs select{height:34px;min-width:0;border:1px solid #cfdced;border-radius:6px;background:#fff;padding:0 8px;color:#203b65}.reference-inputs p{grid-column:1/-1;color:#7385a2;font-size:11px}
 .narration-import-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;margin-top:7px}.narration-import-row .select{height:34px}.narration-import-row a{color:var(--blue);font-size:11px;white-space:nowrap}
+.narration-modes{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:8px}.narration-off-note{padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);color:var(--muted);font-size:12px;line-height:1.6}.ambient-field{margin-bottom:8px}.ambient-field textarea{height:58px}.audio-policy-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.audio-policy-grid button{min-height:68px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);text-align:left;color:var(--text)}.audio-policy-grid b,.audio-policy-grid span{display:block}.audio-policy-grid span{margin-top:4px;color:var(--muted);font-size:10px;line-height:1.35}.audio-policy-grid button.active{border-color:var(--blue);background:#edf5ff;color:var(--blue)}
 .full-preview-backdrop{position:fixed;z-index:95;inset:30px 0 0;display:grid;place-items:center;background:rgba(5,18,40,.72);backdrop-filter:blur(3px)}.full-preview-dialog{width:min(1050px,82vw);overflow:hidden;border:1px solid #6d7f9b;border-radius:13px;background:#071326;box-shadow:0 26px 80px rgba(0,0,0,.38)}.full-preview-dialog header{height:68px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;color:#fff;background:#0d1c33}.full-preview-dialog header h2{color:#fff}.full-preview-dialog header p{margin-top:4px;color:#aab9cf;font-size:12px}.full-preview-dialog header button{width:38px;height:38px;border:0;border-radius:8px;display:grid;place-items:center;color:#d7e2f1;background:transparent}.full-preview-dialog header button:hover{background:#1a2d49}.full-preview-dialog video{display:block;width:100%;max-height:calc(82vh - 98px);aspect-ratio:16/9;object-fit:contain;background:#000}
 .shot-thumb{overflow:hidden;background:#e9f0f8}.shot-thumb video{width:100%;height:100%;display:block;object-fit:cover}.shot-thumb>span{width:100%;height:100%;display:grid;place-items:center;color:#7c8fae}.empty-preview{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#8395af;background:#0a1728}.empty-preview b{font-size:18px;color:#e2eaf5}.empty-preview span{font-size:13px}.task-thumb{display:grid;place-items:center;background:#eaf2fb;color:#5c7da8}.video-track i{position:relative;overflow:hidden;background:#203b64}.video-track i video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.video-track i>span{position:relative;z-index:1;text-shadow:0 1px 4px #07162c}.video-track i:not(:has(video)){background:#dbe6f3;color:#496482}.video-track i:not(:has(video))>span{text-shadow:none}
 .inspector-empty{height:calc(100% - 44px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--muted)}.editor-field{display:flex;flex-direction:column;gap:7px;margin-bottom:14px;font-size:13px;font-weight:700}.editor-field input,.editor-field textarea{width:100%;border:1px solid #d4dfef;border-radius:7px;background:var(--surface);padding:9px 11px}.editor-field input{height:42px}.editor-field textarea{height:80px}.editor-field.visual-plan textarea{height:148px;font-size:14px}.editor-field input:focus,.editor-field textarea:focus{outline:2px solid #d7e8ff;border-color:var(--blue)}.visual-summary{margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);display:flex;flex-direction:column;gap:6px}.visual-summary span{font-size:12px;color:var(--muted)}.duration-options{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:15px}.timeline-note{margin-left:auto;color:var(--muted);font-size:12px}.timeline-toolbar>button:disabled{opacity:.5;cursor:not-allowed}

@@ -966,6 +966,8 @@ mod tests {
                 purpose: String::new(),
                 source_refs: vec![],
                 narration: String::new(),
+                narration_mode: crate::storyboard::NarrationMode::None,
+                ambient_sound: "环境声".to_owned(),
                 on_screen_text: vec![],
                 visual_plan: "闪电".to_owned(),
                 generation_mode: GenerationMode::I2v,

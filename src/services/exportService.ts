@@ -2,6 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { invokeNative } from "./nativeBridge";
 import type { ConcreteAspectRatio, OutputRendition } from "../domain/frameProfiles";
 import { renditionDimensions } from "../domain/frameProfiles";
+import type { H3AudioPolicy } from "../domain/storyboard";
 
 export type ExportStatus = "idle" | "checking" | "blocked" | "exporting" | "succeeded" | "failed";
 
@@ -12,7 +13,8 @@ export interface ExportSettings {
   frameRate: 24 | 25 | 30;
   ratio: ConcreteAspectRatio;
   rendition: OutputRendition;
-  subtitleMode: "burn-and-srt" | "burn" | "srt";
+  subtitleMode: "burn-and-srt" | "burn" | "srt" | "none";
+  environmentAudioPolicy: H3AudioPolicy;
   musicAssetId: string;
   outputDirectory: string;
 }
@@ -63,6 +65,7 @@ export const defaultExportSettings = (): ExportSettings => ({
   ratio: "16:9",
   rendition: "candidate",
   subtitleMode: "burn-and-srt",
+  environmentAudioPolicy: "smart",
   musicAssetId: "",
   outputDirectory: "",
 });
@@ -126,6 +129,7 @@ export async function requestNativeExport(
   narrationVolume: number,
   musicVolume: number,
   musicFade: boolean,
+  environmentVolume: number,
 ): Promise<ProjectExport> {
   const result = await invokeNative<ProjectExport>("export_project_video", {
     input: {
@@ -139,6 +143,8 @@ export async function requestNativeExport(
       musicAssetId: settings.musicAssetId || undefined,
       musicVolume,
       musicFade,
+      environmentAudioPolicy: settings.environmentAudioPolicy,
+      environmentVolume,
     },
   });
   if (!result) throw new Error("视频只能在知画桌面客户端中导出");
@@ -147,14 +153,28 @@ export async function requestNativeExport(
 
 export async function requestNativePreview(
   projectId: string,
-  aspectRatio: ConcreteAspectRatio,
+  settingsOrRatio: ExportSettings | ConcreteAspectRatio,
+  narrationVolume = 80,
+  musicVolume = 0,
+  musicFade = false,
+  environmentVolume = 28,
 ): Promise<ProjectExport> {
+  const settings = typeof settingsOrRatio === "string"
+    ? { ...defaultExportSettings(), ratio: settingsOrRatio }
+    : settingsOrRatio;
   const result = await invokeNative<ProjectExport>("preview_project_video", {
     input: {
       projectId,
-      frameRate: 24,
-      aspectRatio,
-      narrationVolume: 80,
+      frameRate: settings.frameRate,
+      aspectRatio: settings.ratio,
+      rendition: settings.rendition,
+      subtitleMode: settings.subtitleMode,
+      narrationVolume,
+      musicAssetId: settings.musicAssetId || undefined,
+      musicVolume,
+      musicFade,
+      environmentAudioPolicy: settings.environmentAudioPolicy,
+      environmentVolume,
     },
   });
   if (!result) throw new Error("全片预览只能在知画桌面客户端中生成");

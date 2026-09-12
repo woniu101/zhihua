@@ -550,6 +550,8 @@ mod tests {
                 purpose: "验证系统旁白".to_owned(),
                 source_refs: Vec::new(),
                 narration: "闪电发生后，我们会听到雷声。".to_owned(),
+                narration_mode: crate::storyboard::NarrationMode::Tts,
+                ambient_sound: "雨声和雷声".to_owned(),
                 on_screen_text: Vec::new(),
                 visual_plan: "雷雨云".to_owned(),
                 generation_mode: GenerationMode::T2v,

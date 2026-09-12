@@ -11,13 +11,13 @@ import {
 } from "../services/storyboardRepository";
 
 function settingsKey(projectId: string): string {
-  return `zhihua.storyboard.settings.${projectId}.v2`;
+  return `zhihua.storyboard.settings.${projectId}.v3`;
 }
 
 function defaultSettings(): StoryboardProjectSettings {
   return {
     aspectRatio: "16:9",
-    discardH3Audio: true,
+    h3AudioPolicy: "smart",
   };
 }
 
@@ -141,6 +141,8 @@ export function useStoryboardStore() {
       purpose: "",
       sourceRefs: [],
       narration: "",
+      narrationMode: "tts",
+      ambientSound: "与画面动作同步的自然环境声",
       onScreenText: [],
       visualPlan: "",
       generationMode: "t2v",

@@ -1,6 +1,8 @@
 export type AspectRatio = "auto" | "1:1" | "4:3" | "3:4" | "16:9" | "9:16";
 export type GenerationMode = "t2v" | "i2v" | "flf2v" | "r2v" | "continue";
 export type CandidateQuality = "fast" | "high";
+export type H3AudioPolicy = "smart" | "always" | "off";
+export type NarrationMode = "tts" | "imported" | "none";
 export type SceneStatus = "draft" | "ready" | "generating" | "generated" | "approved" | "failed";
 
 export interface SourceReference {
@@ -18,6 +20,8 @@ export interface SceneDraft {
   purpose: string;
   sourceRefs: SourceReference[];
   narration: string;
+  narrationMode: NarrationMode;
+  ambientSound: string;
   onScreenText: string[];
   visualPlan: string;
   generationMode: GenerationMode;
@@ -35,5 +39,5 @@ export interface SceneDraft {
 
 export interface StoryboardProjectSettings {
   aspectRatio: AspectRatio;
-  discardH3Audio: boolean;
+  h3AudioPolicy: H3AudioPolicy;
 }

@@ -126,6 +126,33 @@ impl CandidateQuality {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NarrationMode {
+    Tts,
+    Imported,
+    None,
+}
+
+impl NarrationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tts => "tts",
+            Self::Imported => "imported",
+            Self::None => "none",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoryboardError> {
+        match value {
+            "tts" => Ok(Self::Tts),
+            "imported" => Ok(Self::Imported),
+            "none" => Ok(Self::None),
+            _ => Err(StoryboardError::new(format!("未知的旁白方式：{value}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceReference {
@@ -145,6 +172,8 @@ pub struct SceneDraft {
     pub purpose: String,
     pub source_refs: Vec<SourceReference>,
     pub narration: String,
+    pub narration_mode: NarrationMode,
+    pub ambient_sound: String,
     pub on_screen_text: Vec<String>,
     pub visual_plan: String,
     pub generation_mode: GenerationMode,
@@ -191,6 +220,8 @@ impl StoryboardStorage {
                 purpose               TEXT NOT NULL DEFAULT '',
                 source_refs_json      TEXT NOT NULL DEFAULT '[]',
                 narration             TEXT NOT NULL DEFAULT '',
+                narration_mode        TEXT NOT NULL DEFAULT 'tts',
+                ambient_sound         TEXT NOT NULL DEFAULT '',
                 on_screen_text_json   TEXT NOT NULL DEFAULT '[]',
                 visual_plan           TEXT NOT NULL DEFAULT '',
                 generation_mode       TEXT NOT NULL,
@@ -223,6 +254,25 @@ impl StoryboardStorage {
                 [],
             )?;
         }
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(storyboard_scenes)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns
+        };
+        if !columns.iter().any(|column| column == "narration_mode") {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN narration_mode TEXT NOT NULL DEFAULT 'tts'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "ambient_sound") {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN ambient_sound TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(storage)
     }
 
@@ -239,7 +289,7 @@ impl StoryboardStorage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, project_id, order_index, title, purpose, source_refs_json,
-                    narration, on_screen_text_json, visual_plan, generation_mode,
+                    narration, narration_mode, ambient_sound, on_screen_text_json, visual_plan, generation_mode,
                     target_duration_ms, asset_ids_json, selected_version_id, last_job_id,
                     last_upscale_job_id, pending_request_id, generation_stage, status, quality, updated_at
              FROM storyboard_scenes WHERE project_id = ?1
@@ -260,12 +310,12 @@ impl StoryboardStorage {
         let changed = connection.execute(
             "INSERT INTO storyboard_scenes (
                 id, project_id, order_index, title, purpose, source_refs_json, narration,
-                on_screen_text_json, visual_plan, generation_mode, target_duration_ms,
+                narration_mode, ambient_sound, on_screen_text_json, visual_plan, generation_mode, target_duration_ms,
                 asset_ids_json, selected_version_id, last_job_id, last_upscale_job_id,
                 pending_request_id, generation_stage, status, quality, updated_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
              )
              ON CONFLICT(id) DO UPDATE SET
                 order_index = excluded.order_index,
@@ -273,6 +323,8 @@ impl StoryboardStorage {
                 purpose = excluded.purpose,
                 source_refs_json = excluded.source_refs_json,
                 narration = excluded.narration,
+                narration_mode = excluded.narration_mode,
+                ambient_sound = excluded.ambient_sound,
                 on_screen_text_json = excluded.on_screen_text_json,
                 visual_plan = excluded.visual_plan,
                 generation_mode = excluded.generation_mode,
@@ -295,6 +347,8 @@ impl StoryboardStorage {
                 scene.purpose,
                 source_refs,
                 scene.narration,
+                scene.narration_mode.as_str(),
+                scene.ambient_sound,
                 on_screen_text,
                 scene.visual_plan,
                 scene.generation_mode.as_str(),
@@ -423,13 +477,14 @@ fn normalize_order(connection: &Connection, project_id: &str) -> Result<(), Stor
 
 fn scene_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SceneDraft> {
     let order: i64 = row.get(2)?;
-    let target_duration: i64 = row.get(10)?;
+    let target_duration: i64 = row.get(12)?;
     let source_refs_json: String = row.get(5)?;
-    let on_screen_text_json: String = row.get(7)?;
-    let asset_ids_json: String = row.get(11)?;
-    let generation_mode: String = row.get(9)?;
-    let status: String = row.get(17)?;
-    let quality: String = row.get(18)?;
+    let narration_mode: String = row.get(7)?;
+    let on_screen_text_json: String = row.get(9)?;
+    let asset_ids_json: String = row.get(13)?;
+    let generation_mode: String = row.get(11)?;
+    let status: String = row.get(19)?;
+    let quality: String = row.get(20)?;
 
     Ok(SceneDraft {
         id: row.get(0)?,
@@ -440,24 +495,27 @@ fn scene_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SceneDraft> {
         source_refs: serde_json::from_str(&source_refs_json)
             .map_err(|error| conversion_error(5, error))?,
         narration: row.get(6)?,
-        on_screen_text: serde_json::from_str(&on_screen_text_json)
+        narration_mode: NarrationMode::from_database(&narration_mode)
             .map_err(|error| conversion_error(7, error))?,
-        visual_plan: row.get(8)?,
-        generation_mode: GenerationMode::from_database(&generation_mode)
+        ambient_sound: row.get(8)?,
+        on_screen_text: serde_json::from_str(&on_screen_text_json)
             .map_err(|error| conversion_error(9, error))?,
-        target_duration_ms: u32::try_from(target_duration)
-            .map_err(|error| conversion_error(10, error))?,
-        asset_ids: serde_json::from_str(&asset_ids_json)
+        visual_plan: row.get(10)?,
+        generation_mode: GenerationMode::from_database(&generation_mode)
             .map_err(|error| conversion_error(11, error))?,
-        selected_version_id: row.get(12)?,
-        last_job_id: row.get(13)?,
-        last_upscale_job_id: row.get(14)?,
-        pending_request_id: row.get(15)?,
-        generation_stage: row.get(16)?,
-        status: SceneStatus::from_database(&status).map_err(|error| conversion_error(17, error))?,
+        target_duration_ms: u32::try_from(target_duration)
+            .map_err(|error| conversion_error(12, error))?,
+        asset_ids: serde_json::from_str(&asset_ids_json)
+            .map_err(|error| conversion_error(13, error))?,
+        selected_version_id: row.get(14)?,
+        last_job_id: row.get(15)?,
+        last_upscale_job_id: row.get(16)?,
+        pending_request_id: row.get(17)?,
+        generation_stage: row.get(18)?,
+        status: SceneStatus::from_database(&status).map_err(|error| conversion_error(19, error))?,
         quality: CandidateQuality::from_database(&quality)
-            .map_err(|error| conversion_error(18, error))?,
-        updated_at: row.get(19)?,
+            .map_err(|error| conversion_error(20, error))?,
+        updated_at: row.get(21)?,
     })
 }
 
@@ -510,6 +568,8 @@ mod tests {
                 quote: Some("引用".to_owned()),
             }],
             narration: "旁白".to_owned(),
+            narration_mode: NarrationMode::Tts,
+            ambient_sound: "雨声和远处雷声".to_owned(),
             on_screen_text: vec!["字幕".to_owned()],
             visual_plan: "画面描述".to_owned(),
             generation_mode: GenerationMode::R2v,

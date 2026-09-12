@@ -11,6 +11,7 @@ import { assetRepository } from "./assetRepository";
 import { currentAssetVersion } from "../domain/assets";
 import { frameProfile } from "../domain/frameProfiles";
 import { frameCompositionRepository } from "./frameCompositionRepository";
+import { compileH3Prompt } from "../domain/h3Prompt";
 
 export interface ServiceConnectionResult {
   baseUrl: string;
@@ -335,6 +336,17 @@ export class ComfyUiH3Provider implements VideoProvider {
     }
     const dimensions = candidateDimensions(request.aspectRatio);
     const profile = frameProfile(request.aspectRatio);
+    const compiledPrompt = compileH3Prompt({
+      intent: {
+        visualTimeline: request.prompt,
+        ambientSound: request.ambientSound,
+        allowHumanVoice: false,
+        nonDiegeticMusic: null,
+      },
+      mode: request.mode,
+      durationSec: request.durationSec,
+      audioPolicy: request.h3AudioPolicy,
+    });
     try {
       const probe = await serviceRepository.prepareGeneration();
       if (!probe?.comfyuiReady) {
@@ -353,11 +365,12 @@ export class ComfyUiH3Provider implements VideoProvider {
             quality: request.quality,
             aspectRatio: request.aspectRatio,
             durationSec: request.durationSec,
-            prompt: request.prompt,
-            narration: request.narration,
+            prompt: compiledPrompt.text,
+            promptCompilerVersion: compiledPrompt.version,
+            h3AudioPolicy: request.h3AudioPolicy,
             seed: request.seed,
             assetIds: request.assetIds,
-            discardH3Audio: request.discardH3Audio,
+            discardH3Audio: request.h3AudioPolicy === "off",
             width: dimensions.width,
             height: dimensions.height,
             visibleWidth: profile.visibleWidth,

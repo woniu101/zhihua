@@ -14,7 +14,7 @@ import {
   type ExportCapability,
   type ExportStatus,
 } from "../services/exportService";
-import { generationRepository, type CandidateVersion } from "../services/generationRepository";
+import { generationRepository, type CandidateAudioInspection, type CandidateVersion } from "../services/generationRepository";
 import { ttsRepository } from "../services/ttsRepository";
 import { assetRepository } from "../services/assetRepository";
 import type { AssetItem } from "../domain/assets";
@@ -22,14 +22,16 @@ import { activeProjectId } from "../services/storyboardRepository";
 import { useStoryboardStore } from "../stores/storyboard";
 
 interface MixTrack { name: string; icon: string; volume: number; fade: boolean; muted: boolean }
+type ExportPreset = "explainer" | "short" | "classroom" | "clean";
 
 const settings = reactive(defaultExportSettings());
+const exportPreset = ref<ExportPreset>("explainer");
 const storyboard = useStoryboardStore();
 const scenes = storyboard.scenes;
 const mixTracks = reactive<MixTrack[]>([
   { name: "旁白", icon: "♩", volume: 80, fade: true, muted: false },
   { name: "音乐", icon: "♫", volume: 60, fade: true, muted: false },
-  { name: "环境音", icon: "≋", volume: 50, fade: false, muted: true },
+  { name: "环境音", icon: "≋", volume: 28, fade: false, muted: false },
 ]);
 const capability = ref<ExportCapability>({ available: false, label: "正在检测 FFmpeg", reason: "正在读取桌面导出能力。" });
 const exportStatus = ref<ExportStatus>("checking");
@@ -47,6 +49,7 @@ const narrationIssueCount = ref(0);
 const lastExportPath = ref("");
 const audioAssets = ref<AssetItem[]>([]);
 const selectedCandidates = ref<Record<string, CandidateVersion>>({});
+const audioInspections = ref<Record<string, CandidateAudioInspection>>({});
 const totalDuration = computed(() => scenes.value.reduce((sum, scene) => sum + scene.targetDurationMs / 1000, 0));
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
@@ -56,13 +59,16 @@ function formatTime(seconds: number) {
 const totalDurationText = computed(() => formatTime(totalDuration.value));
 const selectedShot = computed(() => scenes.value.find((scene) => scene.id === selectedShotId.value) ?? scenes.value[0]);
 const selectedCandidate = computed(() => selectedShot.value ? selectedCandidates.value[selectedShot.value.id] : undefined);
+const selectedAudioInspection = computed(() => selectedCandidate.value ? audioInspections.value[selectedCandidate.value.id] : undefined);
+const narrationTrack = computed(() => mixTracks.find((track) => track.name === "旁白"));
+const narrationEnabled = computed(() => !narrationTrack.value?.muted && (narrationTrack.value?.volume ?? 0) > 0);
 
 const integrityItems = computed(() => inspectIntegrity({
   totalShots: scenes.value.length,
   readyShotIds: readyShotIds.value,
-  narrationComplete: scenes.value.length > 0 && narrationShotIds.value.length === scenes.value.length,
-  narrationIssueCount: narrationIssueCount.value,
-  subtitleComplete: scenes.value.length > 0 && scenes.value.every((shot) => Boolean(shot.narration.trim())),
+  narrationComplete: !narrationEnabled.value || (scenes.value.length > 0 && narrationShotIds.value.length === scenes.value.length),
+  narrationIssueCount: narrationEnabled.value ? narrationIssueCount.value : 0,
+  subtitleComplete: settings.subtitleMode === "none" || (scenes.value.length > 0 && scenes.value.every((shot) => shot.narrationMode === "none" || Boolean(shot.narration.trim()))),
   sourceRecordsComplete: scenes.value.length > 0 && scenes.value.every((shot) => shot.sourceRefs.length > 0),
   missingAssetNames: [],
 }));
@@ -76,6 +82,7 @@ const statusTone = computed(() => exportStatus.value === "succeeded" ? "success"
 function savePreferences() {
   localStorage.setItem("zhihua.export.settings", JSON.stringify(settings));
   localStorage.setItem("zhihua.export.mix", JSON.stringify(mixTracks));
+  localStorage.setItem("zhihua.export.preset", exportPreset.value);
 }
 function restorePreferences() {
   try {
@@ -83,26 +90,53 @@ function restorePreferences() {
     if (storedSettings && typeof storedSettings === "object") Object.assign(settings, storedSettings);
     const storedMix = JSON.parse(localStorage.getItem("zhihua.export.mix") ?? "null");
     if (Array.isArray(storedMix)) mixTracks.splice(0, mixTracks.length, ...storedMix);
-    const environment = mixTracks.find((track) => track.name === "环境音");
-    if (environment) {
-      environment.muted = true;
-      environment.fade = false;
-    }
+    const storedPreset = localStorage.getItem("zhihua.export.preset");
+    if (["explainer", "short", "classroom", "clean"].includes(storedPreset ?? "")) exportPreset.value = storedPreset as ExportPreset;
   } catch {
     localStorage.removeItem("zhihua.export.settings");
     localStorage.removeItem("zhihua.export.mix");
+  }
+}
+function setTrack(name: string, volume: number, muted: boolean) {
+  const track = mixTracks.find((item) => item.name === name);
+  if (track) Object.assign(track, { volume, muted });
+}
+function applyExportPreset() {
+  settings.musicAssetId = "";
+  if (exportPreset.value === "short") {
+    settings.frameRate = 30;
+    settings.subtitleMode = "burn-and-srt";
+    settings.environmentAudioPolicy = "smart";
+    setTrack("旁白", 88, false); setTrack("音乐", 55, true); setTrack("环境音", 32, false);
+  } else if (exportPreset.value === "classroom") {
+    settings.frameRate = 25;
+    settings.subtitleMode = "burn-and-srt";
+    settings.environmentAudioPolicy = "smart";
+    setTrack("旁白", 90, false); setTrack("音乐", 45, true); setTrack("环境音", 18, false);
+  } else if (exportPreset.value === "clean") {
+    settings.frameRate = 24;
+    settings.subtitleMode = "none";
+    settings.environmentAudioPolicy = "off";
+    setTrack("旁白", 80, true); setTrack("音乐", 60, true); setTrack("环境音", 28, true);
+  } else {
+    settings.frameRate = 24;
+    settings.subtitleMode = "burn-and-srt";
+    settings.environmentAudioPolicy = "smart";
+    setTrack("旁白", 82, false); setTrack("音乐", 60, true); setTrack("环境音", 28, false);
   }
 }
 function resetMix() {
   mixTracks.splice(0, mixTracks.length,
     { name: "旁白", icon: "♩", volume: 80, fade: true, muted: false },
     { name: "音乐", icon: "♫", volume: 60, fade: true, muted: false },
-    { name: "环境音", icon: "≋", volume: 50, fade: false, muted: true },
+    { name: "环境音", icon: "≋", volume: 28, fade: false, muted: false },
   );
 }
 function resetSettings() {
   Object.assign(settings, defaultExportSettings());
   settings.ratio = storyboard.settings.value.aspectRatio === "auto" ? "16:9" : storyboard.settings.value.aspectRatio;
+  exportPreset.value = "explainer";
+  applyExportPreset();
 }
 async function runChecks() {
   exportStatus.value = "checking";
@@ -129,14 +163,16 @@ async function beginExport() {
   try {
     const projectId = activeProjectId();
     if (!projectId) throw new Error("请先打开一个项目");
-    const narrationVolume = mixTracks.find((track) => track.name === "旁白")?.volume ?? 80;
+    const narration = mixTracks.find((track) => track.name === "旁白");
     const music = mixTracks.find((track) => track.name === "音乐");
+    const environment = mixTracks.find((track) => track.name === "环境音");
     const result = await requestNativeExport(
       projectId,
       { ...settings },
-      narrationVolume,
+      narration?.muted ? 0 : narration?.volume ?? 80,
       music?.muted ? 0 : music?.volume ?? 60,
       music?.fade ?? true,
+      environment?.muted ? 0 : environment?.volume ?? 28,
     );
     lastExportPath.value = result.outputPath;
     exportStatus.value = "succeeded";
@@ -169,7 +205,7 @@ async function refreshProjectArtifacts() {
         .map((byte) => byte.toString(16).padStart(2, "0"))
         .join("")
       : "";
-    const narrationReady = Boolean(
+    const narrationReady = scene.narrationMode === "none" || Boolean(
       narration
       && narration.textSha256 === narrationHash
       && narration.durationMs <= scene.targetDurationMs + 250,
@@ -183,10 +219,14 @@ async function refreshProjectArtifacts() {
       ))),
       enhancedReady: Boolean(scene.selectedVersionId && enhancedVersions.some((item) => item.sourceCandidateId === scene.selectedVersionId)),
       narrationReady,
-      narrationIssue: Boolean(narration) && !narrationReady,
+      narrationIssue: scene.narrationMode !== "none" && Boolean(narration) && !narrationReady,
     };
   }));
   selectedCandidates.value = candidateMap;
+  const inspections = await Promise.allSettled(Object.values(candidateMap).map((candidate) => generationRepository.inspectAudio(candidate.id)));
+  audioInspections.value = Object.fromEntries(inspections
+    .filter((result): result is PromiseFulfilledResult<CandidateAudioInspection> => result.status === "fulfilled")
+    .map((result) => [result.value.candidateId, result.value]));
   readyShotIds.value = states.filter((item) => item.candidateReady).map((item) => item.id);
   enhancedShotIds.value = states.filter((item) => item.enhancedReady).map((item) => item.id);
   narrationShotIds.value = states.filter((item) => item.narrationReady).map((item) => item.id);
@@ -209,7 +249,17 @@ async function buildFullPreview() {
   previewBusy.value = true;
   previewMessage.value = "正在用正式版本、旁白和字幕合成预览。";
   try {
-    const result = await requestNativePreview(projectId, settings.ratio);
+    const narration = mixTracks.find((track) => track.name === "旁白");
+    const music = mixTracks.find((track) => track.name === "音乐");
+    const environment = mixTracks.find((track) => track.name === "环境音");
+    const result = await requestNativePreview(
+      projectId,
+      { ...settings },
+      narration?.muted ? 0 : narration?.volume ?? 80,
+      music?.muted ? 0 : music?.volume ?? 60,
+      music?.fade ?? true,
+      environment?.muted ? 0 : environment?.volume ?? 28,
+    );
     fullPreviewUrl.value = convertFileSrc(result.outputPath);
     playhead.value = 0;
     previewMessage.value = `全片预览已更新 · ${formatTime(result.durationMs / 1000)} · ${result.width}×${result.height}`;
@@ -226,10 +276,12 @@ function updatePlayhead(event: Event) {
 
 watch(settings, savePreferences, { deep: true });
 watch(mixTracks, savePreferences, { deep: true });
+watch(exportPreset, savePreferences);
 onMounted(async () => {
   restorePreferences();
   await storyboard.load(true);
   settings.ratio = storyboard.settings.value.aspectRatio === "auto" ? "16:9" : storyboard.settings.value.aspectRatio;
+  settings.environmentAudioPolicy = storyboard.settings.value.h3AudioPolicy;
   selectedShotId.value = scenes.value[0]?.id ?? "";
   playhead.value = Math.min(playhead.value, totalDuration.value);
   await runChecks();
@@ -244,16 +296,16 @@ onMounted(async () => {
     </header>
     <div class="export-layout">
       <section class="export-left">
-        <div class="panel full-preview"><div class="preview-toolbar"><div><b>{{ fullPreviewUrl ? '全片预览' : selectedCandidate ? `镜头预览 · ${selectedShot?.title}` : '成片预览' }}</b><span>{{ fullPreviewUrl ? previewMessage : '合成全片前可逐镜头核对正式候选' }}</span></div><button class="btn primary" :disabled="previewBusy" @click="buildFullPreview"><RotateCw :size="16"/>{{ previewBusy ? '正在合成' : fullPreviewUrl ? '更新全片预览' : '生成全片预览' }}</button></div><div class="export-video"><video v-if="fullPreviewUrl" :src="fullPreviewUrl" controls @timeupdate="updatePlayhead"></video><video v-else-if="selectedCandidate" :key="selectedCandidate.id" :src="selectedCandidate.previewUrl" controls @timeupdate="updatePlayhead"></video><div v-else class="empty-video"><FileVideo2 :size="42"/><b>当前分镜没有正式候选</b><span>请先在分镜页选择一个候选版本作为正式版本。</span></div><span>{{ fullPreviewUrl ? resolutionText : selectedCandidate ? `${selectedCandidate.visibleWidth}×${selectedCandidate.visibleHeight}` : resolutionText }}　{{ settings.ratio }}</span><div v-if="!fullPreviewUrl && selectedCandidate" class="caption">{{ selectedShot?.narration }}</div></div></div>
+        <div class="panel full-preview"><div class="preview-toolbar"><div><b>{{ fullPreviewUrl ? '全片预览' : selectedCandidate ? `镜头预览 · ${selectedShot?.title}` : '成片预览' }}</b><span>{{ fullPreviewUrl ? previewMessage : '合成全片前可逐镜头核对正式候选' }}</span><span v-if="!fullPreviewUrl && selectedAudioInspection" class="audio-inspection" :class="{blocked:selectedAudioInspection.speechDetected}">{{ selectedAudioInspection.detail }}</span></div><button class="btn primary" :disabled="previewBusy" @click="buildFullPreview"><RotateCw :size="16"/>{{ previewBusy ? '正在合成' : fullPreviewUrl ? '更新全片预览' : '生成全片预览' }}</button></div><div class="export-video"><video v-if="fullPreviewUrl" :src="fullPreviewUrl" controls @timeupdate="updatePlayhead"></video><video v-else-if="selectedCandidate" :key="selectedCandidate.id" :src="selectedCandidate.previewUrl" controls @timeupdate="updatePlayhead"></video><div v-else class="empty-video"><FileVideo2 :size="42"/><b>当前分镜没有正式候选</b><span>请先在分镜页选择一个候选版本作为正式版本。</span></div><span>{{ fullPreviewUrl ? resolutionText : selectedCandidate ? `${selectedCandidate.visibleWidth}×${selectedCandidate.visibleHeight}` : resolutionText }}　{{ settings.ratio }}</span><div v-if="!fullPreviewUrl && selectedCandidate" class="caption">{{ selectedShot?.narration }}</div></div></div>
         <div class="shot-strip"><article v-for="(shot,index) in scenes" :key="shot.id" :class="{active:selectedShotId===shot.id}" @click="selectedShotId=shot.id"><div><video v-if="selectedCandidates[shot.id]" :src="selectedCandidates[shot.id].previewUrl" muted preload="metadata"></video><span v-else class="missing-thumb">待选择</span><b>{{ String(index+1).padStart(2,'0') }}</b><time>{{ shot.targetDurationMs / 1000 }}秒</time></div><span>{{ shot.title }}</span></article><p v-if="!scenes.length" class="empty-export">当前项目还没有分镜</p></div>
-        <div class="panel mix-panel"><div class="panel-head"><h2>音频混音</h2><button class="btn" @click="resetMix">恢复默认</button></div><div class="mix-row" v-for="track in mixTracks" :key="track.name"><span class="mix-icon">{{ track.icon }}</span><b>{{ track.name }}</b><input v-model.number="track.volume" :aria-label="`${track.name}音量`" class="native-range" type="range" min="0" max="100" :disabled="track.muted || track.name==='环境音'"/><span>{{ track.name==='环境音' ? '暂未启用' : track.muted ? '静音' : `${track.volume}%` }}</span><button class="mute-button" :disabled="track.name==='环境音'" :aria-label="`${track.name}${track.muted?'取消静音':'静音'}`" @click="track.muted=!track.muted"><VolumeX v-if="track.muted" :size="17"/><Volume2 v-else :size="17"/></button><label><input v-model="track.fade" type="checkbox" :disabled="track.name==='环境音'"/> 应用淡入淡出</label></div></div>
+        <div class="panel mix-panel"><div class="panel-head"><h2>音频混音</h2><button class="btn" @click="resetMix">恢复默认</button></div><div class="mix-row" v-for="track in mixTracks" :key="track.name"><span class="mix-icon">{{ track.icon }}</span><b>{{ track.name }}</b><input v-model.number="track.volume" :aria-label="`${track.name}音量`" class="native-range" type="range" min="0" max="100" :disabled="track.muted"/><span>{{ track.muted ? '静音' : `${track.volume}%` }}</span><button class="mute-button" :aria-label="`${track.name}${track.muted?'取消静音':'静音'}`" @click="track.muted=!track.muted"><VolumeX v-if="track.muted" :size="17"/><Volume2 v-else :size="17"/></button><label><input v-model="track.fade" type="checkbox" :disabled="track.name==='环境音'"/> {{ track.name==='环境音' ? '旁白时自动降低' : '应用淡入淡出' }}</label></div></div>
         <div class="panel final-timeline"><div class="panel-head"><h3>最终检查时间线</h3><span>{{ playheadText }}　　　　　　　　　总时长 {{ totalDurationText }}</span></div><div class="final-track"><i v-for="(shot,index) in scenes" :key="shot.id" :class="{notReady:!readyShotIds.includes(shot.id)}">{{ String(index+1).padStart(2,'0') }}<X v-if="!readyShotIds.includes(shot.id)" :size="12"/></i><span class="marker" :style="{left:`${totalDuration ? playhead/totalDuration*100 : 0}%`}"></span></div><div class="ticks"><span>0:00</span><span>25%</span><span>50%</span><span>75%</span><span>{{ totalDurationText }}</span></div></div>
       </section>
 
       <aside class="export-right">
         <section class="panel checklist"><div class="panel-head"><h2><span class="check-big" :class="{failed:!integrityPassed}"><Check v-if="integrityPassed" :size="17"/><AlertTriangle v-else :size="16"/></span>完整性检查</h2><b :class="integrityPassed?'success-text':'warning-text'">{{ integrityPassed ? '全部通过' : '存在阻塞项' }}</b></div><p v-for="item in integrityItems" :key="item.id" :class="{failed:!item.passed}"><span class="check"><Check v-if="item.passed" :size="15"/><X v-else :size="15"/></span><b>{{ item.label }}</b><span>{{ item.detail }}</span></p><small v-if="lastCheckedAt">最近检查 {{ lastCheckedAt }}</small></section>
         <section class="panel export-info"><div class="panel-head"><h2>导出信息</h2><b class="capability-badge" :class="{available:capability.available}">{{ capability.label }}</b></div><div><article><Monitor :size="31"/><span>分辨率</span><b>{{ resolutionText }}</b><small>{{ settings.ratio }}</small></article><article><Clock3 :size="31"/><span>总时长</span><b>{{ totalDuration }} 秒</b></article><article><FileVideo2 :size="31"/><span>预计文件大小</span><b>约 {{ estimatedSize }} MB</b></article></div></section>
-        <section class="panel export-settings"><div class="panel-head"><h2>导出设置</h2><button class="btn" @click="resetSettings">恢复默认</button></div><div class="settings-list"><label><FileVideo2 :size="18"/><span>导出格式</span><select v-model="settings.videoCodec"><option value="H.264">MP4 · H.264（通用，推荐）</option></select></label><label><Monitor :size="18"/><span>输出清晰度</span><select v-model="settings.rendition"><option value="candidate">候选原清晰度（快速）</option><option value="enhanced-1080p">1080p（优先增强版，缺失时高质量放大）</option></select></label><label><Music2 :size="18"/><span>背景音乐</span><select v-model="settings.musicAssetId"><option value="">不添加背景音乐</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label><label><Monitor :size="18"/><span>帧率</span><select v-model.number="settings.frameRate"><option :value="24">24 fps（电影感）</option><option :value="25">25 fps</option><option :value="30">30 fps（更流畅）</option></select></label><label><Monitor :size="18"/><span>项目画幅</span><select :value="settings.ratio" disabled title="项目画幅请在分镜页修改"><option :value="settings.ratio">{{ settings.ratio }}（跟随项目）</option></select></label><label><Subtitles :size="18"/><span>字幕处理</span><select v-model="settings.subtitleMode"><option value="burn-and-srt">嵌入画面并保存 SRT</option><option value="burn">仅嵌入画面</option><option value="srt">仅保存 SRT</option></select></label><label class="path-row"><FolderOpen :size="18"/><span>保存位置</span><input v-model.trim="settings.outputDirectory" placeholder="留空保存到项目 exports 目录" aria-label="导出保存位置"/><button type="button" @click="browseOutputDirectory">浏览</button></label></div><button class="btn primary export-btn" :disabled="exportStatus==='checking'||exportStatus==='exporting'||!integrityPassed||!capability.available" @click="beginExport"><Upload :size="20"/>{{ exportStatus==='exporting' ? '正在导出' : '导出 MP4' }}</button><div class="export-state" :class="statusTone"><b>{{ capability.available ? (integrityPassed ? '可执行导出' : '等待分镜就绪') : 'FFmpeg 不可用' }}</b><span>{{ settings.rendition === 'enhanced-1080p' ? `已有 ${enhancedShotIds.length}/${scenes.length} 个镜头具备 AI 增强版；其余将从正式候选高质量放大。` : (capability.available ? exportMessage : capability.reason) }}</span></div><small>{{ lastExportPath ? `最近导出：${lastExportPath}` : '正式内容版本与输出清晰度相互独立，可随时重新导出。' }}</small></section>
+        <section class="panel export-settings"><div class="panel-head"><h2>导出设置</h2><button class="btn" @click="resetSettings">恢复默认</button></div><div class="settings-list"><label><FileVideo2 :size="18"/><span>成片用途</span><select v-model="exportPreset" @change="applyExportPreset"><option value="explainer">讲解成片（推荐）</option><option value="short">短视频发布</option><option value="classroom">课堂演示</option><option value="clean">纯画面素材</option></select></label><label><FileVideo2 :size="18"/><span>导出格式</span><select v-model="settings.videoCodec"><option value="H.264">MP4 · H.264（通用，推荐）</option></select></label><label><Monitor :size="18"/><span>输出清晰度</span><select v-model="settings.rendition"><option value="candidate">候选原清晰度（快速）</option><option value="enhanced-1080p">1080p（优先增强版，缺失时高质量放大）</option></select></label><label><Music2 :size="18"/><span>背景音乐</span><select v-model="settings.musicAssetId"><option value="">不添加背景音乐</option><option v-for="asset in audioAssets" :key="asset.id" :value="asset.id">{{ asset.name }}</option></select></label><label><Monitor :size="18"/><span>帧率</span><select v-model.number="settings.frameRate"><option :value="24">24 fps（电影感）</option><option :value="25">25 fps</option><option :value="30">30 fps（更流畅）</option></select></label><label><Monitor :size="18"/><span>项目画幅</span><select :value="settings.ratio" disabled title="项目画幅请在分镜页修改"><option :value="settings.ratio">{{ settings.ratio }}（跟随项目）</option></select></label><label><Volume2 :size="18"/><span>H3 环境音</span><select v-model="settings.environmentAudioPolicy"><option value="smart">智能使用（推荐）</option><option value="always">始终使用</option><option value="off">不使用</option></select></label><label><Subtitles :size="18"/><span>字幕处理</span><select v-model="settings.subtitleMode"><option value="burn-and-srt">嵌入画面并保存 SRT</option><option value="burn">仅嵌入画面</option><option value="srt">仅保存 SRT</option><option value="none">关闭字幕</option></select></label><label class="path-row"><FolderOpen :size="18"/><span>保存位置</span><input v-model.trim="settings.outputDirectory" placeholder="留空保存到项目 exports 目录" aria-label="导出保存位置"/><button type="button" @click="browseOutputDirectory">浏览</button></label></div><button class="btn primary export-btn" :disabled="exportStatus==='checking'||exportStatus==='exporting'||!integrityPassed||!capability.available" @click="beginExport"><Upload :size="20"/>{{ exportStatus==='exporting' ? '正在导出' : '导出 MP4' }}</button><div class="export-state" :class="statusTone"><b>{{ capability.available ? (integrityPassed ? '可执行导出' : '等待分镜就绪') : 'FFmpeg 不可用' }}</b><span>{{ settings.rendition === 'enhanced-1080p' ? `已有 ${enhancedShotIds.length}/${scenes.length} 个镜头具备 AI 增强版；其余将从正式候选高质量放大。` : (capability.available ? exportMessage : capability.reason) }}</span></div><small>{{ lastExportPath ? `最近导出：${lastExportPath}` : '正式内容版本与输出清晰度相互独立，可随时重新导出。' }}</small></section>
       </aside>
     </div>
   </section>
@@ -262,5 +314,5 @@ onMounted(async () => {
 <style scoped>
 .export-page{display:grid;grid-template-rows:72px minmax(0,1fr);gap:10px}.export-head{display:flex;align-items:center;justify-content:space-between;padding:0 6px}.ready{display:grid;grid-template-columns:24px auto;gap:1px 9px;align-items:center}.ready .status-symbol{grid-row:1/3;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;color:white;background:var(--orange)}.ready.success .status-symbol{background:var(--green)}.ready.working .status-symbol{background:var(--blue)}.ready b{font-size:15px}.ready small{color:#697d9f;max-width:610px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.export-layout{min-height:0;display:grid;grid-template-columns:minmax(620px,1.6fr) minmax(420px,1fr);gap:14px}.export-left{min-height:0;display:grid;grid-template-rows:minmax(300px,1fr) 126px 170px 137px;gap:10px}.full-preview{overflow:hidden;display:flex;flex-direction:column}.export-video{flex:1;position:relative;min-height:0}.export-video>span,.export-video>time{position:absolute;top:12px;color:#fff;background:rgba(4,15,31,.79);padding:6px 10px;border-radius:5px;font-size:13px}.export-video>span{left:13px}.export-video>time{right:13px}.caption{position:absolute;left:50%;transform:translateX(-50%);bottom:15px;color:white;background:rgba(4,15,31,.76);padding:7px 14px;border-radius:5px;font-size:18px;white-space:nowrap}.player{height:51px;display:flex;align-items:center;gap:13px;padding:0 18px}.player button{border:0;background:transparent;color:var(--text);display:grid;place-items:center}.native-range{accent-color:var(--blue);height:7px;min-width:0}.scrub-range{flex:1}.volume-range{width:80px}.shot-strip{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:#fff}.shot-strip article{padding:4px;border-radius:7px;cursor:pointer}.shot-strip article.active{background:#edf5ff}.shot-strip article>div{height:78px;border-radius:6px;position:relative;border:2px solid transparent}.shot-strip article.active>div{border-color:var(--blue)}.shot-strip b{position:absolute;top:5px;left:5px;color:#fff;background:#06182f;padding:3px 5px;border-radius:4px}.shot-strip time{position:absolute;right:4px;bottom:4px;color:#fff;background:#06182f;padding:3px;font-size:11px}.shot-strip article>span{display:block;margin-top:4px;font-size:12px}.mix-panel{overflow:hidden}.mix-panel .panel-head{height:48px}.mix-panel .panel-head .btn{min-height:34px}.mix-row{height:29px;display:grid;grid-template-columns:30px 55px 1fr 50px 30px 150px;align-items:center;gap:8px;padding:0 24px}.mix-icon{font-size:22px;color:#274b80}.mix-row label{font-size:12px}.mix-row input{accent-color:var(--blue)}.mute-button{border:0;background:transparent;display:grid;place-items:center;color:#37537d}.final-timeline .panel-head{height:42px}.final-timeline .panel-head span{font-size:12px;color:#5b7094}.final-track{height:48px;padding:7px 18px 0;display:flex;position:relative}.final-track i{flex:1;display:flex;align-items:center;justify-content:center;gap:3px;font-style:normal;background:#cfe2ff;border-right:2px solid white}.final-track i:nth-child(2){background:#d8f2e8}.final-track i.notReady{color:#a75416;background:#ffebc6}.marker{position:absolute;top:0;bottom:-24px;width:2px;background:#ff394e}.marker:before{content:"";position:absolute;top:0;left:-4px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:8px solid #ff394e}.ticks{display:flex;justify-content:space-between;padding:0 18px;font-size:11px;color:#637797}.export-right{min-height:0;display:grid;grid-template-rows:241px 183px minmax(0,1fr);gap:12px}.checklist{overflow:hidden}.checklist .panel-head h2{display:flex;align-items:center;gap:9px}.check-big,.check{border-radius:50%;display:grid;place-items:center;color:#fff;background:var(--green)}.check-big{width:25px;height:25px}.check-big.failed,.checklist p.failed .check{background:#f0644c}.checklist p{height:45px;display:grid;grid-template-columns:34px 1fr auto;align-items:center;padding:0 20px;border-bottom:1px solid #e5ebf4}.checklist p>span:last-child{color:#6b7f9f;font-size:12px}.checklist>small{display:block;padding:6px 20px;color:#7083a1}.export-info .panel-head{gap:10px}.capability-badge{font-size:11px;color:#c34f15;background:#fff0e7;padding:5px 8px;border-radius:5px}.capability-badge.available{color:#078c57;background:#e8f8f1}.export-info>div:last-child{height:132px;display:grid;grid-template-columns:repeat(3,1fr);padding:18px 14px}.export-info article{display:flex;flex-direction:column;align-items:center;gap:4px;border-right:1px solid #dce5f0}.export-info article:last-child{border:0}.export-info svg{color:var(--blue)}.export-info article span,.export-info article small{font-size:11px;color:#5d7295}.export-info article b{font-size:17px}.export-settings{min-height:0;display:flex;flex-direction:column;padding-bottom:12px}.export-settings .panel-head .btn{min-height:34px}.settings-list{padding:9px 14px;display:flex;flex-direction:column;gap:6px}.settings-list label{height:33px;display:grid;grid-template-columns:28px 95px 1fr;align-items:center}.settings-list select,.settings-list input{height:32px;text-align:left;padding:0 10px;border:1px solid #d2deee;border-radius:6px;background:#fff;font-size:12px;min-width:0}.settings-list .path-row{grid-template-columns:28px 95px minmax(0,1fr) 52px;gap:4px}.path-row button{height:32px;border:1px solid #d2deee;border-radius:6px;background:#f3f6fa;color:#8a9ab1}.export-btn{margin:4px 14px 8px;min-height:48px;font-size:17px}.export-btn:disabled{opacity:.65;cursor:wait}.export-state{margin:0 14px;padding:8px 10px;border-radius:7px;background:#fff1e9;color:#8f3f18;display:flex;flex-direction:column;gap:3px}.export-state.success{background:#e8f8f1;color:#087d51}.export-state.working{background:#eaf3ff;color:#0a5fd5}.export-state span{font-size:11px;line-height:1.35}.export-settings>small{margin:7px 14px;color:#6e82a1}@media(max-width:1380px){.export-left{grid-template-rows:minmax(250px,1fr) 110px 150px 120px}.export-right{grid-template-rows:220px 165px minmax(0,1fr)}.shot-strip article>div{height:64px}.mix-row{padding:0 14px}.settings-list{gap:3px;padding-top:5px}.settings-list label{height:30px}.export-btn{min-height:40px;margin-bottom:5px}.checklist p{height:39px}.export-state{padding:5px 8px}.export-settings>small{margin-top:4px}}
 .export-video video{width:100%;height:100%;display:block;object-fit:contain;background:#07101f}.empty-video{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#8ea0bc;background:#0b1728}.empty-video b{color:#dfe8f5;font-size:17px}.empty-video span{position:static;color:#9fb0c8;background:transparent;padding:0}.shot-strip video{width:100%;height:100%;display:block;object-fit:cover;border-radius:4px}.missing-thumb{position:absolute;inset:0;display:grid;place-items:center;color:#7184a3;background:#edf3fa}.shot-strip article>div>b,.shot-strip article>div>time{z-index:2}
-.preview-toolbar{min-height:54px;padding:7px 12px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.preview-toolbar>div{min-width:0;display:flex;flex-direction:column;gap:3px}.preview-toolbar span{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.preview-toolbar .btn{min-height:36px;white-space:nowrap}
+.preview-toolbar{min-height:54px;padding:7px 12px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.preview-toolbar>div{min-width:0;display:flex;flex-direction:column;gap:3px}.preview-toolbar span{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.preview-toolbar .audio-inspection{color:#087d51}.preview-toolbar .audio-inspection.blocked{color:#b34b19}.preview-toolbar .btn{min-height:36px;white-space:nowrap}
 </style>

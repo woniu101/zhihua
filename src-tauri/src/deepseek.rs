@@ -165,6 +165,8 @@ pub struct StoryboardScenePlan {
     #[serde(default)]
     pub on_screen_text: Vec<String>,
     pub visual_plan: String,
+    #[serde(default)]
+    pub ambient_sound: String,
     pub target_duration_sec: u32,
 }
 
@@ -507,7 +509,7 @@ impl DeepSeekProvider {
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是中文科普短视频导演。仅使用输入的已确认知识点规划分镜，不补充外部事实。返回严格 JSON：{\"scenes\":[{\"title\":\"\",\"purpose\":\"\",\"knowledgePointIds\":[\"输入中的知识点 id\"],\"narration\":\"自然、可朗读的中文旁白\",\"onScreenText\":[\"最多两条短文字\"],\"visualPlan\":\"可直接用于视频生成的具体画面描述，不包含字幕和旁白文字\",\"targetDurationSec\":5}]}。生成约 5 个分镜；每个分镜时长只能是 5、10 或 15 秒；总时长尽量接近目标时长；每个分镜至少引用一个输入知识点。"
+                    "content": "你是中文科普短视频导演。仅使用输入的已确认知识点规划分镜，不补充外部事实。返回严格 JSON：{\"scenes\":[{\"title\":\"\",\"purpose\":\"\",\"knowledgePointIds\":[\"输入中的知识点 id\"],\"narration\":\"自然、可朗读的中文旁白\",\"onScreenText\":[\"最多两条短文字\"],\"visualPlan\":\"可直接用于视频生成的具体画面描述，不包含字幕和旁白文字\",\"ambientSound\":\"只描述与画面同步的环境声和物理声，不写对白、旁白或音乐\",\"targetDurationSec\":5}]}。生成约 5 个分镜；每个分镜时长只能是 5、10 或 15 秒；总时长尽量接近目标时长；每个分镜至少引用一个输入知识点。"
                 },
                 {
                     "role": "user",
@@ -970,6 +972,7 @@ mod tests {
                 narration: "旁白".to_owned(),
                 on_screen_text: Vec::new(),
                 visual_plan: "云层中出现闪电".to_owned(),
+                ambient_sound: "远处雷声".to_owned(),
                 target_duration_sec: 5,
             }],
         };

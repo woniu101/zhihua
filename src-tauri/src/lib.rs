@@ -1,4 +1,5 @@
 mod asset;
+mod audio_inspector;
 mod comp_share;
 mod compute_pool;
 mod deepseek;
@@ -20,6 +21,7 @@ use asset::{
     AssetError, AssetItem, AssetStorage, ImportAssetFilesInput, ImportAssetPayloadInput,
     ReplaceAssetFileInput, SetCurrentAssetVersionInput, UnlinkAssetInput, UpdateAssetInput,
 };
+use audio_inspector::{CandidateAudioInspection, InspectCandidateAudioInput};
 use comp_share::{
     BindCompShareInstanceInput, CompShareActionResult, CompShareBalance, CompShareConfiguration,
     CompShareConnectionTest, CompShareError, CompShareInstance, CompSharePowerState,
@@ -66,8 +68,8 @@ use storage::{
     CreateProjectInput, Project, ProjectStatus, ProjectStorage, StorageInfo, UpdateProjectInput,
 };
 use storyboard::{
-    CandidateQuality, GenerationMode, ReorderScenesInput, SceneDraft, SceneStatus, SourceReference,
-    StoryboardStorage,
+    CandidateQuality, GenerationMode, NarrationMode, ReorderScenesInput, SceneDraft, SceneStatus,
+    SourceReference, StoryboardStorage,
 };
 use tauri::{AppHandle, Manager, State};
 use tts::{
@@ -647,6 +649,12 @@ async fn generate_and_persist_storyboard(
             purpose: plan.purpose,
             source_refs,
             narration: plan.narration,
+            narration_mode: NarrationMode::Tts,
+            ambient_sound: if plan.ambient_sound.trim().is_empty() {
+                "与画面同步的自然环境声".to_owned()
+            } else {
+                plan.ambient_sound
+            },
             on_screen_text: plan.on_screen_text,
             visual_plan: plan.visual_plan,
             generation_mode: GenerationMode::T2v,
@@ -1066,6 +1074,14 @@ fn list_enhanced_versions(
 }
 
 #[tauri::command]
+fn inspect_candidate_audio(
+    storage: State<'_, GenerationStorage>,
+    input: InspectCandidateAudioInput,
+) -> Result<CandidateAudioInspection, String> {
+    audio_inspector::inspect_candidate(storage.inner(), input)
+}
+
+#[tauri::command]
 fn select_candidate_version(
     storage: State<'_, GenerationStorage>,
     input: SelectCandidateVersionInput,
@@ -1128,6 +1144,17 @@ async fn download_completed_job(
     if artifacts.len() > 8 {
         return Err("远端任务返回的视频数量异常，已停止自动下载。".to_owned());
     }
+    let generation_parameters = queue
+        .request_parameters(&job.id)
+        .unwrap_or(serde_json::Value::Null);
+    let prompt_compiler_version = generation_parameters
+        .get("promptCompilerVersion")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let h3_audio_policy = generation_parameters
+        .get("h3AudioPolicy")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
 
     let mut candidates = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
@@ -1157,6 +1184,8 @@ async fn download_completed_job(
                     job_id: job.id.clone(),
                     workflow_id: job.workflow_id.clone(),
                     prompt_id: job.prompt_id.clone(),
+                    prompt_compiler_version: prompt_compiler_version.clone(),
+                    h3_audio_policy: h3_audio_policy.clone(),
                     artifact_id: artifact.artifact_id,
                     filename,
                     media_type: artifact.media_type,
@@ -1713,6 +1742,7 @@ pub fn run() {
             download_service_artifact,
             list_candidate_versions,
             list_enhanced_versions,
+            inspect_candidate_audio,
             select_candidate_version,
             download_completed_job,
             download_completed_image_job,

@@ -3,7 +3,7 @@ use crate::{
     frame_profile::{FrameAspectRatio, FrameSize},
     generation::GenerationStorage,
     storage::ProjectStorage,
-    storyboard::StoryboardStorage,
+    storyboard::{NarrationMode, StoryboardStorage},
     tts::{narration_text_sha256, SystemTtsProvider},
 };
 use chrono::{SecondsFormat, Utc};
@@ -61,6 +61,15 @@ pub enum SubtitleMode {
     BurnAndSrt,
     Burn,
     Srt,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvironmentAudioPolicy {
+    Smart,
+    Always,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -83,6 +92,8 @@ pub struct ExportProjectInput {
     pub music_asset_id: Option<String>,
     pub music_volume: u32,
     pub music_fade: bool,
+    pub environment_audio_policy: EnvironmentAudioPolicy,
+    pub environment_volume: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,7 +102,14 @@ pub struct PreviewProjectInput {
     pub project_id: String,
     pub frame_rate: u32,
     pub aspect_ratio: FrameAspectRatio,
+    pub rendition: OutputRendition,
+    pub subtitle_mode: SubtitleMode,
     pub narration_volume: u32,
+    pub music_asset_id: Option<String>,
+    pub music_volume: u32,
+    pub music_fade: bool,
+    pub environment_audio_policy: EnvironmentAudioPolicy,
+    pub environment_volume: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,7 +136,8 @@ struct ExportScene {
     narration: String,
     duration_ms: u32,
     video_path: PathBuf,
-    audio_path: PathBuf,
+    narration_path: Option<PathBuf>,
+    include_environment: bool,
     uses_enhanced_source: bool,
 }
 
@@ -197,13 +216,15 @@ impl FfmpegExporter {
                 project_id: input.project_id,
                 output_directory,
                 frame_rate: input.frame_rate,
-                subtitle_mode: SubtitleMode::Burn,
+                subtitle_mode: input.subtitle_mode,
                 aspect_ratio: input.aspect_ratio,
-                rendition: OutputRendition::Candidate,
+                rendition: input.rendition,
                 narration_volume: input.narration_volume,
-                music_asset_id: None,
-                music_volume: 0,
-                music_fade: false,
+                music_asset_id: input.music_asset_id,
+                music_volume: input.music_volume,
+                music_fade: input.music_fade,
+                environment_audio_policy: input.environment_audio_policy,
+                environment_volume: input.environment_volume,
             },
         )
     }
@@ -219,6 +240,7 @@ impl FfmpegExporter {
         if !matches!(input.frame_rate, 24 | 25 | 30)
             || input.narration_volume > 100
             || input.music_volume > 100
+            || input.environment_volume > 100
         {
             return Err(ExportError::new(
                 "INVALID_EXPORT_SETTINGS",
@@ -289,43 +311,70 @@ impl FfmpegExporter {
                     format!("分镜“{}”的正式版本文件已丢失", scene.title),
                 ));
             }
-            let narration = tts
-                .get_artifact(&input.project_id, &scene.id)
-                .map_err(|error| ExportError::new("TTS_ERROR", error.message))?
-                .ok_or_else(|| {
-                    ExportError::new(
-                        "MISSING_NARRATION",
-                        format!("分镜“{}”尚未生成系统旁白", scene.title),
-                    )
-                })?;
-            if !narration.local_path.is_file() {
-                return Err(ExportError::new(
-                    "MISSING_NARRATION_FILE",
-                    format!("分镜“{}”的旁白文件已丢失", scene.title),
-                ));
-            }
-            if narration.text_sha256 != narration_text_sha256(&scene.narration) {
-                return Err(ExportError::new(
-                    "STALE_NARRATION",
-                    format!("分镜“{}”的旁白文案已修改，请重新生成旁白", scene.title),
-                ));
-            }
-            if narration.duration_ms > scene.target_duration_ms as u64 + 250 {
-                return Err(ExportError::new(
-                    "NARRATION_TOO_LONG",
-                    format!(
-                        "分镜“{}”的旁白为 {:.1} 秒，超过镜头时长 {:.1} 秒，请精简文案或延长镜头",
-                        scene.title,
-                        narration.duration_ms as f64 / 1000.0,
-                        scene.target_duration_ms as f64 / 1000.0
-                    ),
-                ));
-            }
+            let narration_path = if input.narration_volume == 0
+                || matches!(scene.narration_mode, NarrationMode::None)
+            {
+                None
+            } else {
+                if scene.narration.trim().is_empty() {
+                    return Err(ExportError::new(
+                        "MISSING_NARRATION_TEXT",
+                        format!("分镜“{}”已启用旁白，但旁白文案为空", scene.title),
+                    ));
+                }
+                let narration = tts
+                    .get_artifact(&input.project_id, &scene.id)
+                    .map_err(|error| ExportError::new("TTS_ERROR", error.message))?
+                    .ok_or_else(|| {
+                        ExportError::new(
+                            "MISSING_NARRATION",
+                            format!("分镜“{}”尚未生成或导入旁白", scene.title),
+                        )
+                    })?;
+                if !narration.local_path.is_file() {
+                    return Err(ExportError::new(
+                        "MISSING_NARRATION_FILE",
+                        format!("分镜“{}”的旁白文件已丢失", scene.title),
+                    ));
+                }
+                if narration.text_sha256 != narration_text_sha256(&scene.narration) {
+                    return Err(ExportError::new(
+                        "STALE_NARRATION",
+                        format!("分镜“{}”的旁白文案已修改，请重新生成旁白", scene.title),
+                    ));
+                }
+                if narration.duration_ms > scene.target_duration_ms as u64 + 250 {
+                    return Err(ExportError::new(
+                        "NARRATION_TOO_LONG",
+                        format!(
+                            "分镜“{}”的旁白为 {:.1} 秒，超过镜头时长 {:.1} 秒，请精简文案或延长镜头",
+                            scene.title,
+                            narration.duration_ms as f64 / 1000.0,
+                            scene.target_duration_ms as f64 / 1000.0
+                        ),
+                    ));
+                }
+                Some(narration.local_path)
+            };
+            let include_environment = match input.environment_audio_policy {
+                EnvironmentAudioPolicy::Off => false,
+                EnvironmentAudioPolicy::Always => has_audio_stream(&video_path),
+                EnvironmentAudioPolicy::Smart => {
+                    crate::audio_inspector::inspect_audio_path(candidate.id.clone(), &video_path)
+                        .map(|inspection| inspection.smart_eligible)
+                        .unwrap_or(false)
+                }
+            };
             export_scenes.push(ExportScene {
-                narration: scene.narration.clone(),
+                narration: if matches!(scene.narration_mode, NarrationMode::None) {
+                    String::new()
+                } else {
+                    scene.narration.clone()
+                },
                 duration_ms: scene.target_duration_ms,
                 video_path,
-                audio_path: narration.local_path,
+                narration_path,
+                include_environment,
                 uses_enhanced_source,
             });
         }
@@ -399,48 +448,69 @@ impl FfmpegExporter {
         for (index, scene) in scenes.iter().enumerate() {
             let path = workspace.join(format!("scene-{index:03}.mp4"));
             let duration = format!("{:.3}", scene.duration_ms as f64 / 1000.0);
-            let volume = format!("{:.2}", input.narration_volume as f64 / 100.0);
+            let narration_volume = input.narration_volume as f64 / 100.0;
+            let environment_volume = input.environment_volume as f64 / 100.0;
             let frame_rate = input.frame_rate.to_string();
-            let filters = format!(
-                "[0:v]scale={}:{}:flags=lanczos,setsar=1,fps={frame_rate},tpad=stop_mode=clone:stop_duration=15,trim=duration={duration}[v];[1:a]volume={volume},apad,atrim=0:{duration}[a]",
+            let video_filter = format!(
+                "[0:v]scale={}:{}:flags=lanczos,setsar=1,fps={frame_rate},tpad=stop_mode=clone:stop_duration=15,trim=duration={duration}[v]",
                 dimensions.width,
                 dimensions.height,
             );
-            run_ffmpeg(&[
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                path_text(&scene.video_path)?,
-                "-i",
-                path_text(&scene.audio_path)?,
-                "-filter_complex",
-                &filters,
-                "-map",
-                "[v]",
-                "-map",
-                "[a]",
-                "-t",
-                &duration,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
-                path_text(&path)?,
-            ])?;
+            let filters = match (scene.include_environment, scene.narration_path.is_some()) {
+                (true, true) => format!(
+                    "{video_filter};[0:a]volume={environment_volume:.2},apad,atrim=0:{duration}[env];[1:a]volume={narration_volume:.2},apad,atrim=0:{duration},asplit=2[voice][side];[env][side]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[ducked];[ducked][voice]amix=inputs=2:normalize=0:duration=longest[a]"
+                ),
+                (true, false) => format!(
+                    "{video_filter};[0:a]volume={environment_volume:.2},apad,atrim=0:{duration}[a]"
+                ),
+                (false, true) => format!(
+                    "{video_filter};[1:a]volume={narration_volume:.2},apad,atrim=0:{duration}[a]"
+                ),
+                (false, false) => format!(
+                    "{video_filter};anullsrc=r=48000:cl=stereo,atrim=0:{duration}[a]"
+                ),
+            };
+            let mut args = vec![
+                "-y".to_owned(),
+                "-hide_banner".to_owned(),
+                "-loglevel".to_owned(),
+                "error".to_owned(),
+                "-i".to_owned(),
+                path_text(&scene.video_path)?.to_owned(),
+            ];
+            if let Some(narration_path) = &scene.narration_path {
+                args.push("-i".to_owned());
+                args.push(path_text(narration_path)?.to_owned());
+            }
+            args.extend([
+                "-filter_complex".to_owned(),
+                filters,
+                "-map".to_owned(),
+                "[v]".to_owned(),
+                "-map".to_owned(),
+                "[a]".to_owned(),
+                "-t".to_owned(),
+                duration.clone(),
+                "-c:v".to_owned(),
+                "libx264".to_owned(),
+                "-preset".to_owned(),
+                "medium".to_owned(),
+                "-crf".to_owned(),
+                "18".to_owned(),
+                "-pix_fmt".to_owned(),
+                "yuv420p".to_owned(),
+                "-c:a".to_owned(),
+                "aac".to_owned(),
+                "-b:a".to_owned(),
+                "192k".to_owned(),
+                "-ar".to_owned(),
+                "48000".to_owned(),
+                "-ac".to_owned(),
+                "2".to_owned(),
+                path_text(&path)?.to_owned(),
+            ]);
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            run_ffmpeg(&arg_refs)?;
             normalized.push(path);
         }
         let concat_path = workspace.join("concat.txt");
@@ -522,12 +592,19 @@ impl FfmpegExporter {
         };
         let subtitle_path =
             output_directory.join(format!("{}-{}.srt", safe_name(project_title), timestamp()));
-        fs::write(&subtitle_path, build_srt(scenes)).map_err(io_error)?;
+        let subtitle_content = build_srt(scenes);
+        let has_subtitles = !subtitle_content.trim().is_empty()
+            && !matches!(input.subtitle_mode, SubtitleMode::None);
+        if has_subtitles {
+            fs::write(&subtitle_path, &subtitle_content).map_err(io_error)?;
+        }
         let output_path = subtitle_path.with_extension("mp4");
-        if matches!(
-            input.subtitle_mode,
-            SubtitleMode::Burn | SubtitleMode::BurnAndSrt
-        ) {
+        if has_subtitles
+            && matches!(
+                input.subtitle_mode,
+                SubtitleMode::Burn | SubtitleMode::BurnAndSrt
+            )
+        {
             let filter_path = subtitle_path
                 .to_string_lossy()
                 .replace('\\', "/")
@@ -557,12 +634,13 @@ impl FfmpegExporter {
         } else {
             fs::copy(&delivery_input, &output_path).map_err(io_error)?;
         }
-        let visible_subtitle = if matches!(input.subtitle_mode, SubtitleMode::Burn) {
-            let _ = fs::remove_file(&subtitle_path);
-            None
-        } else {
-            Some(subtitle_path)
-        };
+        let visible_subtitle =
+            if !has_subtitles || matches!(input.subtitle_mode, SubtitleMode::Burn) {
+                let _ = fs::remove_file(&subtitle_path);
+                None
+            } else {
+                Some(subtitle_path)
+            };
         let bytes = fs::read(&output_path).map_err(io_error)?;
         Ok(ProjectExport {
             output_path,
@@ -586,27 +664,57 @@ impl FfmpegExporter {
 }
 
 fn build_srt(scenes: &[ExportScene]) -> String {
-    let mut cursor = 0u64;
-    scenes
-        .iter()
-        .enumerate()
-        .map(|(index, scene)| {
-            let start = cursor;
-            cursor += scene.duration_ms as u64;
-            let text = scene
-                .narration
-                .replace(['\r', '\n'], " ")
-                .replace('<', "＜")
-                .replace('>', "＞");
-            format!(
+    let mut scene_start = 0u64;
+    let mut cue_index = 1usize;
+    let mut output = String::new();
+    for scene in scenes {
+        let sentences = split_subtitle_sentences(&scene.narration);
+        let scene_duration = scene.duration_ms as u64;
+        let total_weight = sentences
+            .iter()
+            .map(|sentence| sentence.chars().count().max(1) as u64)
+            .sum::<u64>();
+        let mut cue_start = scene_start;
+        for (index, sentence) in sentences.iter().enumerate() {
+            let cue_end = if index + 1 == sentences.len() {
+                scene_start + scene_duration
+            } else {
+                cue_start
+                    + scene_duration * sentence.chars().count().max(1) as u64 / total_weight.max(1)
+            };
+            output.push_str(&format!(
                 "{}\n{} --> {}\n{}\n\n",
-                index + 1,
-                srt_time(start),
-                srt_time(cursor),
-                text.trim()
-            )
-        })
-        .collect()
+                cue_index,
+                srt_time(cue_start),
+                srt_time(cue_end.max(cue_start + 1)),
+                sentence.replace('<', "＜").replace('>', "＞")
+            ));
+            cue_index += 1;
+            cue_start = cue_end;
+        }
+        scene_start += scene_duration;
+    }
+    output
+}
+
+fn split_subtitle_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for character in text.replace(['\r', '\n'], " ").chars() {
+        current.push(character);
+        if matches!(character, '。' | '！' | '？' | '；' | '!' | '?' | ';') {
+            let sentence = current.trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_owned());
+            }
+            current.clear();
+        }
+    }
+    let remainder = current.trim();
+    if !remainder.is_empty() {
+        sentences.push(remainder.to_owned());
+    }
+    sentences
 }
 
 fn srt_time(milliseconds: u64) -> String {
@@ -615,6 +723,28 @@ fn srt_time(milliseconds: u64) -> String {
     let seconds = milliseconds / 1_000 % 60;
     let millis = milliseconds % 1_000;
     format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
+}
+
+fn has_audio_stream(path: &Path) -> bool {
+    let Ok(path) = path_text(path) else {
+        return false;
+    };
+    command_output(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            path,
+        ],
+    )
+    .map(|output| output.status.success() && !output.stdout.is_empty())
+    .unwrap_or(false)
 }
 
 fn run_ffmpeg(args: &[&str]) -> ExportResult<()> {
@@ -701,23 +831,26 @@ mod tests {
     fn builds_monotonic_srt_and_sanitizes_markup() {
         let scenes = vec![
             ExportScene {
-                narration: "第一句".into(),
+                narration: "第一句。第二句！".into(),
                 duration_ms: 5_000,
                 video_path: "a".into(),
-                audio_path: "b".into(),
+                narration_path: Some("b".into()),
+                include_environment: false,
                 uses_enhanced_source: false,
             },
             ExportScene {
                 narration: "第二句 <b>".into(),
                 duration_ms: 10_000,
                 video_path: "c".into(),
-                audio_path: "d".into(),
+                narration_path: Some("d".into()),
+                include_environment: false,
                 uses_enhanced_source: false,
             },
         ];
         let srt = build_srt(&scenes);
-        assert!(srt.contains("00:00:00,000 --> 00:00:05,000"));
-        assert!(srt.contains("00:00:05,000 --> 00:00:15,000"));
+        assert!(srt.contains("1\n00:00:00,000 --> 00:00:02,500\n第一句。"));
+        assert!(srt.contains("2\n00:00:02,500 --> 00:00:05,000\n第二句！"));
+        assert!(srt.contains("3\n00:00:05,000 --> 00:00:15,000"));
         assert!(srt.contains("第二句 ＜b＞"));
     }
 
@@ -750,8 +883,15 @@ mod tests {
             "lavfi",
             "-i",
             "color=c=blue:s=320x180:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:duration=1",
             "-c:v",
             "libx264",
+            "-c:a",
+            "aac",
+            "-shortest",
             "-pix_fmt",
             "yuv420p",
             path_text(&video).expect("video path"),
@@ -794,7 +934,8 @@ mod tests {
                     narration: "这是字幕测试。".to_owned(),
                     duration_ms: 1_000,
                     video_path: video,
-                    audio_path: audio,
+                    narration_path: Some(audio),
+                    include_environment: true,
                     uses_enhanced_source: false,
                 }],
                 Some(&music),
@@ -809,6 +950,8 @@ mod tests {
                     music_asset_id: Some("unused-in-render".into()),
                     music_volume: 60,
                     music_fade: true,
+                    environment_audio_policy: EnvironmentAudioPolicy::Smart,
+                    environment_volume: 28,
                 },
             )
             .expect("render export");

@@ -38,6 +38,8 @@ pub struct CandidateVersion {
     pub job_id: String,
     pub workflow_id: String,
     pub prompt_id: Option<String>,
+    pub prompt_compiler_version: Option<String>,
+    pub h3_audio_policy: Option<String>,
     pub artifact_id: String,
     pub filename: String,
     pub media_type: String,
@@ -81,6 +83,8 @@ pub struct RecordCandidateInput {
     pub job_id: String,
     pub workflow_id: String,
     pub prompt_id: Option<String>,
+    pub prompt_compiler_version: Option<String>,
+    pub h3_audio_policy: Option<String>,
     pub artifact_id: String,
     pub filename: String,
     pub media_type: String,
@@ -124,8 +128,8 @@ impl GenerationStorage {
             database_path: project_storage.info().database_path,
             project_storage,
         };
-        storage
-            .connection()?
+        let connection = storage.connection()?;
+        connection
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS candidate_versions (
@@ -135,6 +139,8 @@ impl GenerationStorage {
                 job_id      TEXT NOT NULL,
                 workflow_id TEXT NOT NULL,
                 prompt_id   TEXT,
+                prompt_compiler_version TEXT,
+                h3_audio_policy TEXT,
                 artifact_id TEXT NOT NULL,
                 filename    TEXT NOT NULL,
                 media_type  TEXT NOT NULL,
@@ -183,6 +189,36 @@ impl GenerationStorage {
             ",
             )
             .map_err(database_error)?;
+        let candidate_columns = connection
+            .prepare("PRAGMA table_info(candidate_versions)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(database_error)?;
+        if !candidate_columns
+            .iter()
+            .any(|column| column == "prompt_compiler_version")
+        {
+            connection
+                .execute(
+                    "ALTER TABLE candidate_versions ADD COLUMN prompt_compiler_version TEXT",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        if !candidate_columns
+            .iter()
+            .any(|column| column == "h3_audio_policy")
+        {
+            connection
+                .execute(
+                    "ALTER TABLE candidate_versions ADD COLUMN h3_audio_policy TEXT",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
         Ok(storage)
     }
 
@@ -212,6 +248,7 @@ impl GenerationStorage {
         let mut statement = connection
             .prepare(
                 "SELECT c.id, c.project_id, c.scene_id, c.job_id, c.workflow_id, c.prompt_id,
+                        c.prompt_compiler_version, c.h3_audio_policy,
                         c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
                         c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
                         f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
@@ -286,13 +323,15 @@ impl GenerationStorage {
             .execute(
                 "INSERT INTO candidate_versions (
                     id, project_id, scene_id, job_id, workflow_id, prompt_id,
-                    artifact_id, filename, media_type, local_path, size_bytes,
-                    sha256, selected, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13)
+                    prompt_compiler_version, h3_audio_policy, artifact_id, filename,
+                    media_type, local_path, size_bytes, sha256, selected, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0, ?15)
                  ON CONFLICT(job_id, artifact_id) DO UPDATE SET
                     local_path = excluded.local_path,
                     size_bytes = excluded.size_bytes,
-                    sha256 = excluded.sha256",
+                    sha256 = excluded.sha256,
+                    prompt_compiler_version = excluded.prompt_compiler_version,
+                    h3_audio_policy = excluded.h3_audio_policy",
                 params![
                     id,
                     input.project_id,
@@ -300,6 +339,8 @@ impl GenerationStorage {
                     input.job_id,
                     input.workflow_id,
                     input.prompt_id,
+                    input.prompt_compiler_version,
+                    input.h3_audio_policy,
                     input.artifact_id,
                     input.filename,
                     input.media_type,
@@ -394,6 +435,7 @@ impl GenerationStorage {
         self.connection()?
             .query_row(
                 "SELECT c.id, c.project_id, c.scene_id, c.job_id, c.workflow_id, c.prompt_id,
+                        c.prompt_compiler_version, c.h3_audio_policy,
                         c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
                         c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
                         f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
@@ -414,6 +456,7 @@ impl GenerationStorage {
         self.connection()?
             .query_row(
                 "SELECT c.id, c.project_id, c.scene_id, c.job_id, c.workflow_id, c.prompt_id,
+                        c.prompt_compiler_version, c.h3_audio_policy,
                         c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
                         c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
                         f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
@@ -510,21 +553,23 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateVers
         job_id: row.get(3)?,
         workflow_id: row.get(4)?,
         prompt_id: row.get(5)?,
-        artifact_id: row.get(6)?,
-        filename: row.get(7)?,
-        media_type: row.get(8)?,
-        local_path: PathBuf::from(row.get::<_, String>(9)?),
-        size_bytes: row.get(10)?,
-        sha256: row.get(11)?,
-        selected: row.get(12)?,
-        created_at: row.get(13)?,
-        aspect_ratio: row.get(14)?,
-        work_width: row.get(15)?,
-        work_height: row.get(16)?,
-        visible_width: row.get(17)?,
-        visible_height: row.get(18)?,
-        crop_x: row.get(19)?,
-        crop_y: row.get(20)?,
+        prompt_compiler_version: row.get(6)?,
+        h3_audio_policy: row.get(7)?,
+        artifact_id: row.get(8)?,
+        filename: row.get(9)?,
+        media_type: row.get(10)?,
+        local_path: PathBuf::from(row.get::<_, String>(11)?),
+        size_bytes: row.get(12)?,
+        sha256: row.get(13)?,
+        selected: row.get(14)?,
+        created_at: row.get(15)?,
+        aspect_ratio: row.get(16)?,
+        work_width: row.get(17)?,
+        work_height: row.get(18)?,
+        visible_width: row.get(19)?,
+        visible_height: row.get(20)?,
+        crop_x: row.get(21)?,
+        crop_y: row.get(22)?,
     })
 }
 
@@ -589,6 +634,8 @@ mod tests {
                 purpose: String::new(),
                 source_refs: vec![],
                 narration: String::new(),
+                narration_mode: crate::storyboard::NarrationMode::None,
+                ambient_sound: "雷声".to_owned(),
                 on_screen_text: vec![],
                 visual_plan: "闪电".to_owned(),
                 generation_mode: GenerationMode::T2v,
@@ -615,6 +662,8 @@ mod tests {
                 job_id: "job-1".to_owned(),
                 workflow_id: "h3-t2v-turbo-v1".to_owned(),
                 prompt_id: Some("prompt-1".to_owned()),
+                prompt_compiler_version: Some("h3-prompt-v1".to_owned()),
+                h3_audio_policy: Some("smart".to_owned()),
                 artifact_id: "video-0".to_owned(),
                 filename: "clip.mp4".to_owned(),
                 media_type: "video/mp4".to_owned(),
@@ -636,6 +685,11 @@ mod tests {
         let versions = storage.list(&project.id, &scene.id).expect("versions");
         assert_eq!(versions.len(), 1);
         assert!(versions[0].selected);
+        assert_eq!(
+            versions[0].prompt_compiler_version.as_deref(),
+            Some("h3-prompt-v1")
+        );
+        assert_eq!(versions[0].h3_audio_policy.as_deref(), Some("smart"));
         assert_eq!(
             storyboards.list(&project.id).expect("scenes")[0].selected_version_id,
             Some(candidate.id.clone())

@@ -9,6 +9,8 @@ export interface CandidateVersion {
   jobId: string;
   workflowId: string;
   promptId?: string;
+  promptCompilerVersion?: string;
+  h3AudioPolicy?: string;
   artifactId: string;
   filename: string;
   mediaType: string;
@@ -25,6 +27,17 @@ export interface CandidateVersion {
   visibleHeight: number;
   cropX: number;
   cropY: number;
+}
+
+export interface CandidateAudioInspection {
+  candidateId: string;
+  hasAudio: boolean;
+  speechDetected: boolean;
+  voicedDurationMs: number;
+  voicedRatio: number;
+  peakVoiceProbability: number;
+  smartEligible: boolean;
+  detail: string;
 }
 
 export interface EnhancedVersion {
@@ -63,6 +76,10 @@ function enhancedFromNative(value: NativeEnhancedVersion): EnhancedVersion {
 }
 
 export const generationRepository = {
+  inspectAudio: (candidateId: string) =>
+    invokeNative<CandidateAudioInspection>("inspect_candidate_audio", {
+      input: { candidateId },
+    }),
   async list(projectId: string, sceneId: string): Promise<CandidateVersion[]> {
     const result = await invokeNative<NativeCandidateVersion[]>(
       "list_candidate_versions",

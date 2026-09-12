@@ -5,6 +5,7 @@ use crate::{
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use serde_json::Value;
 use std::{fmt, path::PathBuf, time::Duration};
 
 #[derive(Debug, Clone, Serialize)]
@@ -357,6 +358,23 @@ impl JobQueueStorage {
         rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
     }
 
+    pub fn request_parameters(&self, remote_job_id: &str) -> QueueResult<Value> {
+        let request_json = self
+            .connection()?
+            .query_row(
+                "SELECT request_json FROM generation_jobs WHERE remote_job_id=?1",
+                [remote_job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(database_error)?;
+        serde_json::from_str(&request_json).map_err(|error| {
+            JobQueueError::new(
+                "DESERIALIZE_ERROR",
+                format!("本地任务生成参数无法读取：{error}"),
+            )
+        })
+    }
+
     fn find_by_request(&self, request_id: &str) -> QueueResult<LocalJob> {
         self.connection()?
             .query_row(
@@ -433,6 +451,8 @@ mod tests {
                 purpose: String::new(),
                 source_refs: Vec::new(),
                 narration: "旁白".into(),
+                narration_mode: crate::storyboard::NarrationMode::Tts,
+                ambient_sound: "环境声".into(),
                 on_screen_text: Vec::new(),
                 visual_plan: "画面".into(),
                 generation_mode: GenerationMode::T2v,
