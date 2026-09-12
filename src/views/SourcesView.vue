@@ -58,8 +58,8 @@ async function submitText() {
 async function extractKnowledge() {
   if (!activeSources.value.length) { notice.value = "请先启用至少一份已解析完成的资料"; return; }
   try {
-    notice.value = "DeepSeek 正在分析资料……";
-    notice.value = await store.extractKnowledge() ? "知识点已从 DeepSeek 返回并保存" : "请在设置与算力中配置 DeepSeek API Key";
+    notice.value = "大模型正在分析资料……";
+    notice.value = await store.extractKnowledge() ? "知识点已由大模型提取并保存" : "请在设置与算力中配置大模型 API Key";
   } catch (error) {
     const value = error as { message?: string };
     notice.value = value?.message ?? String(error);
@@ -74,7 +74,7 @@ function focusPoint(id: string) {
 async function createStoryboard() {
   if (store.unresolvedCount.value) return;
   try {
-    notice.value = "DeepSeek 正在生成分镜初稿……";
+    notice.value = "大模型正在生成分镜初稿……";
     const count = await store.createStoryboard();
     if (!count) {
       notice.value = "桌面端分镜生成尚不可用";
@@ -118,7 +118,7 @@ async function createStoryboard() {
       </section>
 
       <aside class="panel insight-panel">
-        <div class="ai-head"><span class="deepseek">鲸</span><span class="dot"></span><div><strong>DeepSeek 内容规划</strong><small>{{ store.enabledReadyCount.value }} 份资料可用于提取</small></div><button @click="extractKnowledge">重新提取</button></div>
+        <div class="ai-head"><span class="deepseek">鲸</span><span class="dot"></span><div><strong>大模型内容规划</strong><small>{{ store.enabledReadyCount.value }} 份资料可用于提取</small></div><button @click="extractKnowledge">重新提取</button></div>
         <div class="insight-scroll">
           <div class="two-fields"><label>目标受众<span>{{ store.project.value?.audience || '未设置' }}</span></label><label>目标时长<span><Clock3 :size="17"/>{{ store.project.value?.targetDurationSeconds ? `${store.project.value.targetDurationSeconds} 秒` : '未设置' }}</span></label></div>
           <div class="subhead"><h3>核心知识点（{{ store.points.value.length }}）</h3><button @click="store.addPoint"><Plus :size="15"/>自定义添加</button></div>

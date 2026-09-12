@@ -11,6 +11,10 @@ export interface CandidateVersion {
   promptId?: string;
   promptCompilerVersion?: string;
   h3AudioPolicy?: string;
+  promptText?: string;
+  seed?: number;
+  audioIntent?: string;
+  targetDurationSec?: number;
   artifactId: string;
   filename: string;
   mediaType: string;
@@ -76,6 +80,7 @@ function enhancedFromNative(value: NativeEnhancedVersion): EnhancedVersion {
 }
 
 export const generationRepository = {
+  openLocation: (candidateId: string) => invokeNative<void>("open_candidate_location", { candidateId }),
   inspectAudio: (candidateId: string) =>
     invokeNative<CandidateAudioInspection>("inspect_candidate_audio", {
       input: { candidateId },

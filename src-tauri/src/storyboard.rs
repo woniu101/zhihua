@@ -134,6 +134,72 @@ pub enum NarrationMode {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioIntent {
+    #[default]
+    Environment,
+    Dialogue,
+    Silent,
+}
+
+impl AudioIntent {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Dialogue => "dialogue",
+            Self::Silent => "silent",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoryboardError> {
+        match value {
+            "environment" => Ok(Self::Environment),
+            "dialogue" => Ok(Self::Dialogue),
+            "silent" => Ok(Self::Silent),
+            _ => Err(StoryboardError::new(format!("未知的原声音频意图：{value}"))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VisualIntent {
+    pub subject: String,
+    pub action: String,
+    pub scene: String,
+    pub composition: String,
+    pub camera: String,
+    pub lighting: String,
+    pub timeline: String,
+    pub negative: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptMode {
+    #[default]
+    Quick,
+    Advanced,
+}
+
+impl PromptMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Advanced => "advanced",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoryboardError> {
+        match value {
+            "quick" => Ok(Self::Quick),
+            "advanced" => Ok(Self::Advanced),
+            _ => Err(StoryboardError::new(format!("未知的提示词模式：{value}"))),
+        }
+    }
+}
+
 impl NarrationMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -176,6 +242,14 @@ pub struct SceneDraft {
     pub ambient_sound: String,
     pub on_screen_text: Vec<String>,
     pub visual_plan: String,
+    #[serde(default)]
+    pub visual_intent: VisualIntent,
+    #[serde(default)]
+    pub prompt_mode: PromptMode,
+    #[serde(default)]
+    pub audio_intent: AudioIntent,
+    #[serde(default)]
+    pub locked: bool,
     pub generation_mode: GenerationMode,
     pub target_duration_ms: u32,
     pub asset_ids: Vec<String>,
@@ -194,6 +268,14 @@ pub struct SceneDraft {
 pub struct ReorderScenesInput {
     pub project_id: String,
     pub ordered_scene_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryboardEditInput {
+    pub project_id: String,
+    pub expected: Vec<SceneDraft>,
+    pub scenes: Vec<SceneDraft>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +317,10 @@ impl StoryboardStorage {
                 status                TEXT NOT NULL,
                 quality               TEXT NOT NULL,
                 updated_at            TEXT NOT NULL,
+                locked                INTEGER NOT NULL DEFAULT 0,
+                audio_intent          TEXT NOT NULL DEFAULT 'environment',
+                visual_intent_json    TEXT NOT NULL DEFAULT '{}',
+                prompt_mode           TEXT NOT NULL DEFAULT 'quick',
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_storyboard_scenes_project_order
@@ -273,6 +359,30 @@ impl StoryboardStorage {
                 [],
             )?;
         }
+        if !columns.iter().any(|column| column == "locked") {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "audio_intent") {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN audio_intent TEXT NOT NULL DEFAULT 'environment'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "visual_intent_json") {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN visual_intent_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "prompt_mode") {
+            connection.execute(
+                "ALTER TABLE storyboard_scenes ADD COLUMN prompt_mode TEXT NOT NULL DEFAULT 'quick'",
+                [],
+            )?;
+        }
         Ok(storage)
     }
 
@@ -287,35 +397,200 @@ impl StoryboardStorage {
     pub fn list(&self, project_id: &str) -> Result<Vec<SceneDraft>, StoryboardError> {
         self.ensure_project(project_id)?;
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, project_id, order_index, title, purpose, source_refs_json,
-                    narration, narration_mode, ambient_sound, on_screen_text_json, visual_plan, generation_mode,
-                    target_duration_ms, asset_ids_json, selected_version_id, last_job_id,
-                    last_upscale_job_id, pending_request_id, generation_stage, status, quality, updated_at
-             FROM storyboard_scenes WHERE project_id = ?1
-             ORDER BY order_index ASC, id ASC",
-        )?;
-        let rows = statement.query_map([project_id], scene_from_row)?;
-        rows.map(|row| row.map_err(StoryboardError::from)).collect()
+        list_with_connection(&connection, project_id)
     }
 
     pub fn upsert(&self, mut scene: SceneDraft) -> Result<SceneDraft, StoryboardError> {
         self.ensure_project(&scene.project_id)?;
         validate_scene(&scene)?;
-        scene.updated_at = now_iso();
-        let source_refs = serde_json::to_string(&scene.source_refs)?;
-        let on_screen_text = serde_json::to_string(&scene.on_screen_text)?;
-        let asset_ids = serde_json::to_string(&scene.asset_ids)?;
         let connection = self.connection()?;
-        let changed = connection.execute(
+        let existing = list_with_connection(&connection, &scene.project_id)?
+            .into_iter()
+            .find(|item| item.id == scene.id);
+        if let Some(existing) = existing {
+            let mut unlock_only = scene.clone();
+            unlock_only.locked = existing.locked;
+            unlock_only.updated_at = existing.updated_at.clone();
+            if existing.locked && unlock_only != existing {
+                return Err(StoryboardError::new("分镜已锁定，请先解除锁定再修改内容"));
+            }
+            if (existing.status == SceneStatus::Generating || existing.pending_request_id.is_some())
+                && (!same_authored_content(&existing, &scene) || existing.locked != scene.locked)
+            {
+                return Err(StoryboardError::new(
+                    "分镜正在生成，暂时不能修改内容或锁定状态",
+                ));
+            }
+        }
+        scene.updated_at = now_iso();
+        write_scene(&connection, scene)
+    }
+
+    pub fn delete(&self, project_id: &str, id: &str) -> Result<(), StoryboardError> {
+        self.ensure_project(project_id)?;
+        validate_identifier(id, "分镜 ID")?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = list_with_connection(&transaction, project_id)?
+            .into_iter()
+            .find(|scene| scene.id == id)
+            .ok_or_else(|| StoryboardError::new("分镜不存在或不属于当前项目"))?;
+        if existing.locked
+            || existing.status == SceneStatus::Generating
+            || existing.pending_request_id.is_some()
+        {
+            return Err(StoryboardError::new("锁定或正在生成的分镜不能删除"));
+        }
+        let changed = transaction.execute(
+            "DELETE FROM storyboard_scenes WHERE id = ?1 AND project_id = ?2",
+            params![id, project_id],
+        )?;
+        if changed != 1 {
+            return Err(StoryboardError::new("分镜不存在或不属于当前项目"));
+        }
+        normalize_order(&transaction, project_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn reorder(&self, input: ReorderScenesInput) -> Result<Vec<SceneDraft>, StoryboardError> {
+        self.ensure_project(&input.project_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        validate_complete_order(&transaction, &input.project_id, &input.ordered_scene_ids)?;
+        for (order, id) in input.ordered_scene_ids.iter().enumerate() {
+            transaction.execute(
+                "UPDATE storyboard_scenes SET order_index = ?1, updated_at = ?2
+                 WHERE id = ?3 AND project_id = ?4",
+                params![order as u32, now_iso(), id, input.project_id],
+            )?;
+        }
+        transaction.commit()?;
+        self.list(&input.project_id)
+    }
+
+    pub fn apply_edit(
+        &self,
+        input: StoryboardEditInput,
+    ) -> Result<Vec<SceneDraft>, StoryboardError> {
+        self.ensure_project(&input.project_id)?;
+        if input.scenes.len() > 200 {
+            return Err(StoryboardError::new("单个项目最多 200 个分镜"));
+        }
+        let mut connection = self.connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = list_with_connection(&transaction, &input.project_id)?;
+        if current != input.expected {
+            return Err(StoryboardError::new(
+                "分镜已发生变化，请刷新后再试；当前内容未被覆盖",
+            ));
+        }
+        let mut ids = HashSet::new();
+        for scene in &input.scenes {
+            validate_scene(scene)?;
+            if scene.project_id != input.project_id || !ids.insert(scene.id.clone()) {
+                return Err(StoryboardError::new("分镜项目或编号无效"));
+            }
+        }
+        for existing in &current {
+            let next = input.scenes.iter().find(|scene| scene.id == existing.id);
+            let changed = next
+                .map(|scene| {
+                    let mut normalized = scene.clone();
+                    normalized.order = existing.order;
+                    normalized.updated_at = existing.updated_at.clone();
+                    normalized != *existing
+                })
+                .unwrap_or(true);
+            if changed
+                && (existing.locked
+                    || existing.status == SceneStatus::Generating
+                    || existing.pending_request_id.is_some())
+            {
+                return Err(StoryboardError::new(
+                    "锁定或正在生成的分镜不能拆分、合并或删除",
+                ));
+            }
+        }
+        for existing in &current {
+            if !ids.contains(&existing.id) {
+                transaction.execute(
+                    "DELETE FROM storyboard_scenes WHERE id = ?1 AND project_id = ?2",
+                    params![existing.id, input.project_id],
+                )?;
+            }
+        }
+        for (order, mut scene) in input.scenes.into_iter().enumerate() {
+            scene.order = order as u32;
+            scene.updated_at = now_iso();
+            write_scene(&transaction, scene)?;
+        }
+        transaction.commit()?;
+        self.list(&input.project_id)
+    }
+
+    fn ensure_project(&self, project_id: &str) -> Result<(), StoryboardError> {
+        self.project_storage
+            .get_project(project_id)
+            .map(|_| ())
+            .map_err(|error| StoryboardError::new(error.to_string()))
+    }
+}
+
+fn list_with_connection(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<SceneDraft>, StoryboardError> {
+    let mut statement = connection.prepare(
+        "SELECT id, project_id, order_index, title, purpose, source_refs_json,
+                narration, narration_mode, ambient_sound, on_screen_text_json, visual_plan, generation_mode,
+                target_duration_ms, asset_ids_json, selected_version_id, last_job_id,
+                last_upscale_job_id, pending_request_id, generation_stage, status, quality, updated_at,
+                locked, audio_intent, visual_intent_json, prompt_mode
+         FROM storyboard_scenes WHERE project_id = ?1
+         ORDER BY order_index ASC, id ASC",
+    )?;
+    let rows = statement.query_map([project_id], scene_from_row)?;
+    rows.map(|row| row.map_err(StoryboardError::from)).collect()
+}
+
+fn same_authored_content(left: &SceneDraft, right: &SceneDraft) -> bool {
+    left.id == right.id
+        && left.project_id == right.project_id
+        && left.order == right.order
+        && left.title == right.title
+        && left.purpose == right.purpose
+        && left.source_refs == right.source_refs
+        && left.narration == right.narration
+        && left.narration_mode == right.narration_mode
+        && left.ambient_sound == right.ambient_sound
+        && left.on_screen_text == right.on_screen_text
+        && left.visual_plan == right.visual_plan
+        && left.visual_intent == right.visual_intent
+        && left.prompt_mode == right.prompt_mode
+        && left.audio_intent == right.audio_intent
+        && left.generation_mode == right.generation_mode
+        && left.target_duration_ms == right.target_duration_ms
+        && left.asset_ids == right.asset_ids
+        && left.quality == right.quality
+}
+
+fn write_scene(connection: &Connection, scene: SceneDraft) -> Result<SceneDraft, StoryboardError> {
+    let source_refs = serde_json::to_string(&scene.source_refs)?;
+    let on_screen_text = serde_json::to_string(&scene.on_screen_text)?;
+    let asset_ids = serde_json::to_string(&scene.asset_ids)?;
+    let visual_intent = serde_json::to_string(&scene.visual_intent)?;
+    let changed = connection.execute(
             "INSERT INTO storyboard_scenes (
                 id, project_id, order_index, title, purpose, source_refs_json, narration,
                 narration_mode, ambient_sound, on_screen_text_json, visual_plan, generation_mode, target_duration_ms,
                 asset_ids_json, selected_version_id, last_job_id, last_upscale_job_id,
-                pending_request_id, generation_stage, status, quality, updated_at
+                pending_request_id, generation_stage, status, quality, updated_at,
+                locked, audio_intent, visual_intent_json, prompt_mode
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
              )
              ON CONFLICT(id) DO UPDATE SET
                 order_index = excluded.order_index,
@@ -337,7 +612,11 @@ impl StoryboardStorage {
                 generation_stage = excluded.generation_stage,
                 status = excluded.status,
                 quality = excluded.quality,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                locked = excluded.locked,
+                audio_intent = excluded.audio_intent,
+                visual_intent_json = excluded.visual_intent_json,
+                prompt_mode = excluded.prompt_mode
              WHERE storyboard_scenes.project_id = excluded.project_id",
             params![
                 scene.id,
@@ -362,53 +641,18 @@ impl StoryboardStorage {
                 scene.status.as_str(),
                 scene.quality.as_str(),
                 scene.updated_at,
+                scene.locked,
+                scene.audio_intent.as_str(),
+                visual_intent,
+                scene.prompt_mode.as_str(),
             ],
         )?;
-        if changed != 1 {
-            return Err(StoryboardError::new(
-                "分镜 ID 已属于其他项目，不能移动到当前项目",
-            ));
-        }
-        Ok(scene)
+    if changed != 1 {
+        return Err(StoryboardError::new(
+            "分镜 ID 已属于其他项目，不能移动到当前项目",
+        ));
     }
-
-    pub fn delete(&self, project_id: &str, id: &str) -> Result<(), StoryboardError> {
-        self.ensure_project(project_id)?;
-        validate_identifier(id, "分镜 ID")?;
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            "DELETE FROM storyboard_scenes WHERE id = ?1 AND project_id = ?2",
-            params![id, project_id],
-        )?;
-        if changed != 1 {
-            return Err(StoryboardError::new("分镜不存在或不属于当前项目"));
-        }
-        normalize_order(&connection, project_id)?;
-        Ok(())
-    }
-
-    pub fn reorder(&self, input: ReorderScenesInput) -> Result<Vec<SceneDraft>, StoryboardError> {
-        self.ensure_project(&input.project_id)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        validate_complete_order(&transaction, &input.project_id, &input.ordered_scene_ids)?;
-        for (order, id) in input.ordered_scene_ids.iter().enumerate() {
-            transaction.execute(
-                "UPDATE storyboard_scenes SET order_index = ?1, updated_at = ?2
-                 WHERE id = ?3 AND project_id = ?4",
-                params![order as u32, now_iso(), id, input.project_id],
-            )?;
-        }
-        transaction.commit()?;
-        self.list(&input.project_id)
-    }
-
-    fn ensure_project(&self, project_id: &str) -> Result<(), StoryboardError> {
-        self.project_storage
-            .get_project(project_id)
-            .map(|_| ())
-            .map_err(|error| StoryboardError::new(error.to_string()))
-    }
+    Ok(scene)
 }
 
 fn validate_scene(scene: &SceneDraft) -> Result<(), StoryboardError> {
@@ -419,8 +663,10 @@ fn validate_scene(scene: &SceneDraft) -> Result<(), StoryboardError> {
     if scene.title.chars().count() > 200 {
         return Err(StoryboardError::new("分镜标题不能超过 200 个字符"));
     }
-    if !matches!(scene.target_duration_ms, 5_000 | 10_000 | 15_000) {
-        return Err(StoryboardError::new("分镜时长只能是 5、10 或 15 秒"));
+    if !(4_000..=15_000).contains(&scene.target_duration_ms)
+        || scene.target_duration_ms % 1_000 != 0
+    {
+        return Err(StoryboardError::new("分镜时长必须是 4 到 15 秒的整数"));
     }
     Ok(())
 }
@@ -485,6 +731,9 @@ fn scene_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SceneDraft> {
     let generation_mode: String = row.get(11)?;
     let status: String = row.get(19)?;
     let quality: String = row.get(20)?;
+    let audio_intent: String = row.get(23)?;
+    let visual_intent_json: String = row.get(24)?;
+    let prompt_mode: String = row.get(25)?;
 
     Ok(SceneDraft {
         id: row.get(0)?,
@@ -501,6 +750,13 @@ fn scene_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SceneDraft> {
         on_screen_text: serde_json::from_str(&on_screen_text_json)
             .map_err(|error| conversion_error(9, error))?,
         visual_plan: row.get(10)?,
+        visual_intent: serde_json::from_str(&visual_intent_json)
+            .map_err(|error| conversion_error(24, error))?,
+        prompt_mode: PromptMode::from_database(&prompt_mode)
+            .map_err(|error| conversion_error(25, error))?,
+        audio_intent: AudioIntent::from_database(&audio_intent)
+            .map_err(|error| conversion_error(23, error))?,
+        locked: row.get(22)?,
         generation_mode: GenerationMode::from_database(&generation_mode)
             .map_err(|error| conversion_error(11, error))?,
         target_duration_ms: u32::try_from(target_duration)
@@ -572,6 +828,10 @@ mod tests {
             ambient_sound: "雨声和远处雷声".to_owned(),
             on_screen_text: vec!["字幕".to_owned()],
             visual_plan: "画面描述".to_owned(),
+            visual_intent: VisualIntent::default(),
+            prompt_mode: PromptMode::Quick,
+            audio_intent: AudioIntent::Environment,
+            locked: false,
             generation_mode: GenerationMode::R2v,
             target_duration_ms: 10_000,
             asset_ids: vec!["asset-1".to_owned()],
@@ -584,6 +844,17 @@ mod tests {
             quality: CandidateQuality::High,
             updated_at: String::new(),
         }
+    }
+
+    fn editable_scene(project_id: &str, id: &str, order: u32) -> SceneDraft {
+        let mut scene = scene(project_id, id, order);
+        scene.selected_version_id = None;
+        scene.last_job_id = None;
+        scene.last_upscale_job_id = None;
+        scene.pending_request_id = None;
+        scene.generation_stage = None;
+        scene.status = SceneStatus::Draft;
+        scene
     }
 
     #[test]
@@ -700,31 +971,91 @@ mod tests {
     }
 
     #[test]
-    fn validates_allowed_mvp_duration_and_normalizes_order_after_delete() {
+    fn validates_integer_duration_range_and_normalizes_order_after_delete() {
         let (_directory, projects, storyboard) = storage();
         let project = project(&projects, "雷电");
-        let mut invalid = scene(&project.id, "invalid", 0);
-        invalid.target_duration_ms = 8_000;
+        let mut invalid = editable_scene(&project.id, "invalid", 0);
+        invalid.target_duration_ms = 3_500;
         assert!(storyboard
             .upsert(invalid)
             .expect_err("invalid duration")
             .to_string()
-            .contains("5、10 或 15"));
+            .contains("4 到 15 秒"));
+
+        let mut adjustable = editable_scene(&project.id, "adjustable", 0);
+        adjustable.target_duration_ms = 8_000;
+        storyboard.upsert(adjustable).expect("8 second scene");
 
         storyboard
-            .upsert(scene(&project.id, "a", 0))
+            .upsert(editable_scene(&project.id, "a", 0))
             .expect("insert a");
         storyboard
-            .upsert(scene(&project.id, "b", 1))
+            .upsert(editable_scene(&project.id, "b", 1))
             .expect("insert b");
         storyboard
-            .upsert(scene(&project.id, "c", 2))
+            .upsert(editable_scene(&project.id, "c", 2))
             .expect("insert c");
         storyboard.delete(&project.id, "b").expect("delete b");
         let listed = storyboard.list(&project.id).expect("list scenes");
         assert_eq!(
             listed.iter().map(|scene| scene.order).collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn applies_structural_edits_atomically_and_rejects_stale_snapshots() {
+        let (_directory, projects, storyboard) = storage();
+        let project = project(&projects, "雷电");
+        storyboard
+            .upsert(editable_scene(&project.id, "a", 0))
+            .expect("insert a");
+        storyboard
+            .upsert(editable_scene(&project.id, "b", 1))
+            .expect("insert b");
+        let expected = storyboard.list(&project.id).expect("initial snapshot");
+        let reordered = storyboard
+            .apply_edit(StoryboardEditInput {
+                project_id: project.id.clone(),
+                expected: expected.clone(),
+                scenes: vec![expected[1].clone(), expected[0].clone()],
+            })
+            .expect("atomic reorder");
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|scene| scene.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+
+        let error = storyboard
+            .apply_edit(StoryboardEditInput {
+                project_id: project.id.clone(),
+                expected,
+                scenes: Vec::new(),
+            })
+            .expect_err("stale snapshot must fail");
+        assert!(error.to_string().contains("已发生变化"));
+        assert_eq!(storyboard.list(&project.id).expect("unchanged"), reordered);
+    }
+
+    #[test]
+    fn structural_edit_does_not_remove_locked_scene() {
+        let (_directory, projects, storyboard) = storage();
+        let project = project(&projects, "雷电");
+        let mut locked = editable_scene(&project.id, "locked", 0);
+        locked.locked = true;
+        storyboard.upsert(locked).expect("insert locked scene");
+        let expected = storyboard.list(&project.id).expect("locked snapshot");
+        let error = storyboard
+            .apply_edit(StoryboardEditInput {
+                project_id: project.id.clone(),
+                expected: expected.clone(),
+                scenes: Vec::new(),
+            })
+            .expect_err("locked scene must survive");
+        assert!(error.to_string().contains("锁定"));
+        assert_eq!(storyboard.list(&project.id).expect("unchanged"), expected);
     }
 }

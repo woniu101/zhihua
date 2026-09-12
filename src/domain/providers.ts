@@ -1,4 +1,4 @@
-import type { AspectRatio, CandidateQuality, GenerationMode, H3AudioPolicy } from "./storyboard";
+import type { AspectRatio, AudioIntent, CandidateQuality, GenerationMode, H3AudioPolicy, SceneDurationSeconds } from "./storyboard";
 
 export type GpuStartMode = "gpu" | "cpu_no_gpu";
 export type GpuRuntimeState =
@@ -77,9 +77,10 @@ export interface VideoGenerationRequest {
   mode: GenerationMode;
   quality: CandidateQuality;
   aspectRatio: AspectRatio;
-  durationSec: 5 | 10 | 15;
+  durationSec: SceneDurationSeconds;
   prompt: string;
   ambientSound: string;
+  audioIntent: AudioIntent;
   seed: number;
   assetIds: string[];
   h3AudioPolicy: H3AudioPolicy;

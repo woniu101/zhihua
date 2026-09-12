@@ -563,9 +563,14 @@ fn create_project_directories(project_dir: &Path) -> Result<(), StorageError> {
         "assets/images",
         "assets/audio",
         "assets/video",
+        "generated/images",
+        "generated/videos",
+        "generated/audio",
         "scenes",
         "subtitles",
-        "exports",
+        "exports/clips",
+        "exports/packages",
+        "exports/final",
         "cache",
     ] {
         fs::create_dir_all(project_dir.join(relative))?;
@@ -634,9 +639,14 @@ mod tests {
             "extracted",
             "assets/images",
             "assets/audio",
+            "generated/images",
+            "generated/videos",
+            "generated/audio",
             "scenes",
             "subtitles",
-            "exports",
+            "exports/clips",
+            "exports/packages",
+            "exports/final",
             "cache",
         ] {
             assert!(project.project_dir.join(relative).is_dir(), "{relative}");

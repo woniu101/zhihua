@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, LoaderCircle, Maximize2, Music2, Play, Plus, RotateCcw, Sparkles, Star, Subtitles, Trash2, Volume2, X } from "lucide-vue-next";
+import { ArrowDown, ArrowUp, ChevronDown, Copy, Film, FolderOpen, Lock, LoaderCircle, Maximize2, Merge, Music2, Play, Plus, RotateCcw, Scissors, Sparkles, Star, Subtitles, Trash2, Unlock, Volume2, X } from "lucide-vue-next";
 import type { GenerationJob } from "../domain/providers";
-import type { AspectRatio, CandidateQuality, GenerationMode } from "../domain/storyboard";
+import type { AspectRatio, CandidateQuality, GenerationMode, SceneDraft, SceneDurationSeconds, VisualIntent } from "../domain/storyboard";
 import { frameProfile } from "../domain/frameProfiles";
 import type { AssetItem, AssetMediaType } from "../domain/assets";
 import { assetRepository } from "../services/assetRepository";
 import { generationRepository, type CandidateVersion, type EnhancedVersion } from "../services/generationRepository";
+import { llmRepository, normalizeLlmError, type SceneRevisionProposal } from "../services/llmRepository";
 import { ComfyUiH3Provider, normalizeConnectionFailure, serviceRepository } from "../services/serviceRepository";
 import { ttsRepository, type NarrationArtifact, type SystemVoice } from "../services/ttsRepository";
 import { requestNativePreview } from "../services/exportService";
@@ -16,7 +17,7 @@ import { useWorkspaceStore } from "../stores/workspace";
 import ComputeStatus from "../components/ComputeStatus.vue";
 import { projectStylePrompt } from "../domain/projects";
 
-const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, select, update, save, updateSelected, add, duplicateSelected, removeSelected, moveSelected } = useStoryboardStore();
+const { scenes, settings, selectedScene, selectedSceneId, loading, loadError, load, select, update, save, updateSelected, add, duplicateSelected, removeSelected, moveSelected, insertBeforeSelected, insertAfterSelected, splitSelected, mergeSelectedWithNext, toggleSelectedLock } = useStoryboardStore();
 const workspace = useWorkspaceStore();
 void workspace.refresh();
 const provider = new ComfyUiH3Provider();
@@ -37,6 +38,11 @@ const fullPreviewUrl = ref("");
 const fullPreviewOpen = ref(false);
 const enhancing = ref(false);
 const taskKind = ref<"candidate" | "enhancement">("candidate");
+const revisionOpen = ref(false);
+const revisionInstruction = ref("");
+const revisionProposal = ref<SceneRevisionProposal>();
+const revisionBusy = ref(false);
+const revisionError = ref("");
 const systemVoices = ref<SystemVoice[]>([]);
 const selectedVoiceId = ref("");
 const narrationArtifact = ref<NarrationArtifact>();
@@ -48,10 +54,26 @@ const pollTimers = new Map<string, number>();
 const pollRetryDelays = new Map<string, number>();
 const pollingJobs = new Set<string>();
 
-function generationPrompt(visualPlan: string): string {
-  const style = projectStylePrompt(workspace.project.value?.styleProfile);
-  return [visualPlan.trim(), style && `项目视觉规范：${style}`].filter(Boolean).join("。\n");
+function effectiveVisualPlan(scene: SceneDraft): string {
+  const intent = scene.visualIntent;
+  const structured = [
+    intent.subject && `主体：${intent.subject}`,
+    intent.action && `动作：${intent.action}`,
+    intent.scene && `场景：${intent.scene}`,
+    intent.composition && `构图：${intent.composition}`,
+    intent.camera && `镜头：${intent.camera}`,
+    intent.lighting && `光线：${intent.lighting}`,
+    intent.timeline && `时间线：${intent.timeline}`,
+    intent.negative && `避免：${intent.negative}`,
+  ].filter(Boolean).join("；");
+  return scene.promptMode === "advanced" ? structured : scene.visualPlan;
 }
+
+function generationPrompt(scene: SceneDraft): string {
+  const style = projectStylePrompt(workspace.project.value?.styleProfile);
+  return [effectiveVisualPlan(scene).trim(), style && `项目视觉规范：${style}`].filter(Boolean).join("。\n");
+}
+
 let recoveredProjectId = "";
 const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
   { id: "t2v", label: "自由生成", symbol: "✦" },
@@ -61,14 +83,17 @@ const modes: Array<{ id: GenerationMode; label: string; symbol: string }> = [
 ];
 const statusLabel = { draft: "待生成", ready: "已就绪", generating: "生成中", generated: "候选版本", approved: "正式版本", failed: "生成失败" } as const;
 const statusTone = { draft: "muted", ready: "success", generating: "warning", generated: "primary", approved: "success", failed: "warning" } as const;
-const durationLabel = computed(() => `${Math.round((selectedScene.value?.targetDurationMs ?? 5000) / 1000)}秒`);
+const selectedDurationSeconds = computed(() => Math.round((selectedScene.value?.targetDurationMs ?? 5000) / 1000));
 const totalDurationSeconds = computed(() => scenes.value.reduce((total, scene) => total + scene.targetDurationMs / 1000, 0));
 function formatTimelineTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   return `${String(minutes).padStart(2, "0")}:${String(Math.round(seconds % 60)).padStart(2, "0")}`;
 }
 const timelineTicks = computed(() => Array.from({ length: 5 }, (_, index) => formatTimelineTime(totalDurationSeconds.value * index / 4)));
-const setDuration = (seconds: 5 | 10 | 15) => updateSelected({ targetDurationMs: (seconds * 1000) as 5000 | 10000 | 15000 });
+const setDuration = (seconds: number) => {
+  const normalized = Math.max(4, Math.min(15, Math.round(Number(seconds) || 5)));
+  updateSelected({ targetDurationMs: normalized * 1000 });
+};
 const setQuality = (quality: CandidateQuality) => updateSelected({ quality });
 const taskPercent = computed(() => Math.max(0, Math.min(100, Math.round((task.value?.progress ?? 0) * 100))));
 const taskStatusLabel = computed(() => {
@@ -104,15 +129,28 @@ const previewVersion = computed(() => candidateVersions.value.find((item) => ite
 const enhancedForOfficial = computed(() => latestCandidate(enhancedVersions.value.filter((item) => item.sourceCandidateId === selectedScene.value?.selectedVersionId)));
 const previewEnhanced = computed(() => enhancedVersions.value.find((item) => item.id === previewEnhancedId.value));
 const previewMedia = computed(() => previewEnhanced.value ?? previewVersion.value);
+const previewTargetDuration = computed(() => {
+  if (previewEnhanced.value) {
+    return candidateVersions.value.find((item) => item.id === previewEnhanced.value?.sourceCandidateId)?.targetDurationSec;
+  }
+  return previewVersion.value?.targetDurationSec;
+});
+const previewMediaUrl = computed(() => {
+  const url = previewMedia.value?.previewUrl;
+  const duration = previewTargetDuration.value;
+  return url && duration ? `${url}#t=0,${duration}` : url;
+});
 const activeFrameProfile = computed(() => frameProfile(settings.value.aspectRatio));
 const canSelectOfficial = computed(() => Boolean(
   previewVersion.value
   && previewVersion.value.aspectRatio === activeFrameProfile.value.aspectRatio
+  && !selectedScene.value?.locked
   && selectedScene.value?.selectedVersionId !== previewVersion.value.id,
 ));
 const isTaskActive = computed(() => Boolean(task.value && !["completed", "failed", "cancelled", "interrupted"].includes(task.value.status)));
 const canMakeEnhancement = computed(() => Boolean(
   selectedScene.value?.selectedVersionId
+  && !selectedScene.value?.locked
   && settings.value.aspectRatio === "16:9"
   && !submitting.value
   && !enhancing.value
@@ -274,6 +312,98 @@ function updateOnScreenText(event: Event) {
 
 function updateAmbientSound(event: Event) {
   updateSelected({ ambientSound: (event.target as HTMLTextAreaElement).value });
+}
+
+function updateVisualIntent(field: keyof VisualIntent, event: Event) {
+  if (!selectedScene.value) return;
+  updateSelected({
+    visualIntent: {
+      ...selectedScene.value.visualIntent,
+      [field]: (event.target as HTMLInputElement | HTMLTextAreaElement).value,
+    },
+  });
+}
+
+const promptWarnings = computed(() => {
+  const intent = selectedScene.value?.visualIntent;
+  if (!selectedScene.value || selectedScene.value.promptMode === "quick") return [];
+  const warnings: string[] = [];
+  if (!intent?.subject.trim()) warnings.push("补充主体");
+  if (!intent?.action.trim()) warnings.push("补充动作");
+  if (!intent?.camera.trim()) warnings.push("补充镜头运动或机位");
+  if (selectedScene.value.targetDurationMs >= 10000 && !intent?.timeline.trim()) warnings.push("长镜头建议写清时间线");
+  if (selectedScene.value.audioIntent === "dialogue" && /不说话|不要说话|人物说话|对白/.test(intent?.negative ?? "")) warnings.push("“避免出现”与画内对白可能冲突");
+  return warnings;
+});
+
+function openRevisionDialog() {
+  if (!selectedScene.value || selectedScene.value.locked) return;
+  revisionInstruction.value = "";
+  revisionProposal.value = undefined;
+  revisionError.value = "";
+  revisionOpen.value = true;
+}
+
+async function requestSceneRevision() {
+  const scene = selectedScene.value;
+  if (!scene || !revisionInstruction.value.trim()) {
+    revisionError.value = "请写清希望修改的内容。";
+    return;
+  }
+  revisionBusy.value = true;
+  revisionError.value = "";
+  try {
+    revisionProposal.value = await llmRepository.reviseScene(
+      scene.projectId,
+      scene.id,
+      revisionInstruction.value.trim(),
+    );
+  } catch (error) {
+    revisionError.value = normalizeLlmError(error).message;
+  } finally {
+    revisionBusy.value = false;
+  }
+}
+
+async function acceptSceneRevision() {
+  const scene = selectedScene.value;
+  const proposal = revisionProposal.value;
+  if (!scene || !proposal || scene.locked) return;
+  const saved = await save(scene.id, {
+    title: proposal.title,
+    purpose: proposal.purpose,
+    narration: proposal.narration,
+    onScreenText: proposal.onScreenText,
+    visualPlan: proposal.visualPlan,
+    promptMode: "quick",
+    ambientSound: proposal.ambientSound,
+    targetDurationMs: proposal.targetDurationSec * 1000,
+    status: scene.selectedVersionId ? "generated" : "draft",
+    generationStage: scene.selectedVersionId
+      ? "分镜已修订；原正式版本基于旧提示词，可重新生成或继续使用"
+      : "已接受大模型修订提案",
+  });
+  if (!saved) {
+    revisionError.value = loadError.value || "修订提案保存失败，请重试。";
+    return;
+  }
+  revisionOpen.value = false;
+  if (scene.selectedVersionId) {
+    taskError.value = "分镜内容已更新；原正式版本仍可导出，但它基于旧提示词。";
+  }
+}
+
+function referenceInputSatisfied(scene: SceneDraft): boolean {
+  if (scene.generationMode === "t2v") return true;
+  if (scene.generationMode === "flf2v" || scene.generationMode === "r2v") return scene.assetIds.length >= 2;
+  return scene.assetIds.length >= 1;
+}
+
+function generationReadinessError(scene: SceneDraft): string | undefined {
+  if (!effectiveVisualPlan(scene).trim()) return "请先填写当前分镜的画面描述。";
+  if (!referenceInputSatisfied(scene)) return "当前生成方式需要补齐参考素材。";
+  if (scene.audioIntent === "dialogue" && !scene.ambientSound.trim()) return "画内对白必须写清说话者、语言和台词。";
+  return undefined;
 }
 
 async function loadScenePreview(scene: typeof scenes.value[number]) {
@@ -451,7 +581,7 @@ async function refreshEnhancementTask(sceneId: string, jobId: string, sourceCand
 async function selectOfficialVersion() {
   const scene = selectedScene.value;
   const version = previewVersion.value;
-  if (!scene || !version) return;
+  if (!scene || !version || scene.locked) return;
   if (version.aspectRatio !== activeFrameProfile.value.aspectRatio) {
     taskError.value = `该候选是 ${version.aspectRatio}，当前项目画幅为 ${activeFrameProfile.value.aspectRatio}，请按当前画幅重新生成。`;
     return;
@@ -462,12 +592,8 @@ async function selectOfficialVersion() {
       ...item,
       selected: item.id === version.id,
     }));
-    await save(scene.id, {
-      selectedVersionId: version.id,
-      lastUpscaleJobId: undefined,
-      status: "approved",
-      generationStage: "已设为正式版本",
-    });
+    await load(true);
+    select(scene.id);
     scenePreviewUrls.value = { ...scenePreviewUrls.value, [scene.id]: version.previewUrl };
   } catch (error) {
     taskError.value = normalizeConnectionFailure(error).message;
@@ -476,17 +602,22 @@ async function selectOfficialVersion() {
 
 async function generateSelected() {
   const scene = selectedScene.value;
-  if (!scene || submitting.value) return;
+  if (!scene || scene.locked || submitting.value) return;
   taskError.value = "";
-  if (!scene.visualPlan.trim()) {
-    taskError.value = "请先填写当前分镜的画面描述。";
+  const readinessError = generationReadinessError(scene);
+  if (readinessError) {
+    taskError.value = readinessError;
     return;
   }
   submitting.value = true;
   taskKind.value = "candidate";
   previewEnhancedId.value = "";
   const requestId = scene.pendingRequestId ?? crypto.randomUUID();
-  await save(scene.id, { pendingRequestId: requestId, status: "generating", generationStage: "正在提交任务" });
+  if (!await save(scene.id, { pendingRequestId: requestId, status: "generating", generationStage: "正在提交任务" })) {
+    taskError.value = loadError.value || "无法保存生成任务，请重试。";
+    submitting.value = false;
+    return;
+  }
   try {
     const submitted = await provider.submit({
       clientRequestId: requestId,
@@ -495,9 +626,10 @@ async function generateSelected() {
       mode: scene.generationMode,
       quality: scene.quality,
       aspectRatio: settings.value.aspectRatio,
-      durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
-      prompt: generationPrompt(scene.visualPlan),
+      durationSec: (scene.targetDurationMs / 1000) as SceneDurationSeconds,
+      prompt: generationPrompt(scene),
       ambientSound: scene.ambientSound,
+      audioIntent: scene.audioIntent,
       seed: crypto.getRandomValues(new Uint32Array(1))[0],
       assetIds: scene.assetIds,
       h3AudioPolicy: settings.value.h3AudioPolicy,
@@ -518,15 +650,25 @@ async function generateSelected() {
   }
 }
 
+async function openPreviewLocation() {
+  const media = previewMedia.value;
+  if (!media) return;
+  try {
+    await generationRepository.openLocation(media.id);
+  } catch (error) {
+    taskError.value = normalizeConnectionFailure(error).message;
+  }
+}
+
 async function generateIncompleteScenes() {
   if (batchSubmitting.value || submitting.value || enhancing.value) return;
   const candidates = scenes.value.filter((scene) =>
-    !["generated", "approved", "generating"].includes(scene.status)
+    !scene.locked && !["generated", "approved", "generating"].includes(scene.status)
   );
-  const valid = candidates.filter((scene) => scene.visualPlan.trim());
+  const valid = candidates.filter((scene) => !generationReadinessError(scene));
   if (!valid.length) {
     batchNotice.value = candidates.length
-      ? "未完成分镜还没有画面描述，请先补充后再生成。"
+      ? `未完成分镜尚未满足生成条件：${generationReadinessError(candidates[0]) ?? "请检查内容"}`
       : "全部分镜都已有候选或正式版本。";
     return;
   }
@@ -537,11 +679,14 @@ async function generateIncompleteScenes() {
   const failures: string[] = [];
   for (const scene of valid) {
     const requestId = scene.pendingRequestId ?? crypto.randomUUID();
-    await save(scene.id, {
+    if (!await save(scene.id, {
       pendingRequestId: requestId,
       status: "generating",
       generationStage: "正在批量提交任务",
-    });
+    })) {
+      failures.push(`${scene.title}：无法保存任务状态`);
+      continue;
+    }
     try {
       const submitted = await provider.submit({
         clientRequestId: requestId,
@@ -550,9 +695,10 @@ async function generateIncompleteScenes() {
         mode: scene.generationMode,
         quality: scene.quality,
         aspectRatio: settings.value.aspectRatio,
-        durationSec: (scene.targetDurationMs / 1000) as 5 | 10 | 15,
-        prompt: generationPrompt(scene.visualPlan),
+        durationSec: (scene.targetDurationMs / 1000) as SceneDurationSeconds,
+        prompt: generationPrompt(scene),
         ambientSound: scene.ambientSound,
+        audioIntent: scene.audioIntent,
         seed: crypto.getRandomValues(new Uint32Array(1))[0],
         assetIds: scene.assetIds,
         h3AudioPolicy: settings.value.h3AudioPolicy,
@@ -596,7 +742,7 @@ async function openFullPreview() {
 async function makeEnhancement() {
   const scene = selectedScene.value;
   const source = candidateVersions.value.find((item) => item.id === scene?.selectedVersionId);
-  if (!scene || !source || enhancing.value) return;
+  if (!scene || !source || scene.locked || enhancing.value) return;
   taskError.value = "";
   if (settings.value.aspectRatio !== "16:9") {
     taskError.value = "当前已验证的 SeedVR2 增强流程仅支持 16:9；其他画幅验证完成后再开放。";
@@ -605,11 +751,15 @@ async function makeEnhancement() {
   enhancing.value = true;
   taskKind.value = "enhancement";
   const requestId = scene.pendingRequestId ?? crypto.randomUUID();
-  await save(scene.id, {
+  if (!await save(scene.id, {
     pendingRequestId: requestId,
     status: "generating",
     generationStage: "正在准备 SeedVR2 1080p 任务",
-  });
+  })) {
+    taskError.value = loadError.value || "无法保存增强任务，请重试。";
+    enhancing.value = false;
+    return;
+  }
   try {
     const submitted = await provider.submitUpscale({
       clientRequestId: requestId,
@@ -726,17 +876,17 @@ const confirmRemove = () => {
   <section class="page storyboard-page">
     <header class="story-head">
       <div><p class="breadcrumb">{{ workspace.projectTitle.value }}　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><ComputeStatus context="提交生成时自动切换 GPU"/></div></div>
-      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="18"/>{{ previewBusy ? '正在合成' : '预览全片' }}</button></div>
+      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene || selectedScene.locked" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="18"/>{{ previewBusy ? '正在合成' : '预览全片' }}</button></div>
     </header>
 
     <div class="story-workspace">
       <aside class="panel shot-panel">
-        <div class="panel-head"><h2>{{ scenes.length }} 个分镜</h2><div class="shot-actions"><button title="上移" @click="moveSelected(-1)"><ArrowUp :size="16"/></button><button title="下移" @click="moveSelected(1)"><ArrowDown :size="16"/></button><button title="复制" @click="duplicateSelected"><Copy :size="16"/></button><button title="删除" @click="confirmRemove"><Trash2 :size="16"/></button><button class="add" title="新增分镜" @click="add"><Plus :size="18"/></button></div></div>
+        <div class="panel-head"><h2>{{ scenes.length }} 个分镜</h2><div class="shot-actions"><button title="上移" @click="moveSelected(-1)"><ArrowUp :size="16"/></button><button title="下移" @click="moveSelected(1)"><ArrowDown :size="16"/></button><button title="前面插入" @click="insertBeforeSelected"><Plus :size="15"/></button><button title="后面插入" @click="insertAfterSelected"><Plus :size="15"/></button><button title="复制" @click="duplicateSelected"><Copy :size="16"/></button><button title="拆分镜头" :disabled="!selectedScene || selectedScene.locked || selectedScene.status==='generating' || Boolean(selectedScene.pendingRequestId) || selectedScene.targetDurationMs<8000" @click="splitSelected"><Scissors :size="15"/></button><button title="与下一镜头合并" :disabled="!selectedScene || selectedScene.locked || selectedScene.status==='generating' || Boolean(selectedScene.pendingRequestId)" @click="mergeSelectedWithNext"><Merge :size="15"/></button><button :title="selectedScene?.locked ? '解除锁定' : '锁定，避免误改和批量重写'" :disabled="selectedScene?.status==='generating' || Boolean(selectedScene?.pendingRequestId)" @click="toggleSelectedLock"><Unlock v-if="selectedScene?.locked" :size="15"/><Lock v-else :size="15"/></button><button title="删除" :disabled="selectedScene?.locked || selectedScene?.status==='generating' || Boolean(selectedScene?.pendingRequestId)" @click="confirmRemove"><Trash2 :size="16"/></button><button class="add" title="末尾新增分镜" @click="add"><Plus :size="18"/></button></div></div>
         <div v-if="loading" class="empty-storyboard"><LoaderCircle class="spin" :size="25"/><b>正在读取项目分镜</b></div>
         <div v-else-if="!scenes.length" class="empty-storyboard"><Film :size="30"/><b>{{ loadError || '当前项目还没有分镜' }}</b><span>新增一条分镜，填写画面与旁白后即可提交生成。</span><button class="btn primary" :disabled="Boolean(loadError && loadError.includes('先'))" @click="add"><Plus :size="16"/>新增分镜</button></div>
         <div v-else class="shot-list">
           <article v-for="(shot,index) in scenes" :key="shot.id" :class="{selected:selectedSceneId===shot.id}" @click="select(shot.id)">
-            <span class="grab">⠿</span><div class="shot-thumb"><video v-if="scenePreviewUrls[shot.id]" :src="scenePreviewUrls[shot.id]" muted preload="metadata"></video><span v-else><Film :size="23"/></span><b>{{ String(index + 1).padStart(2, '0') }}</b></div><div class="shot-copy"><strong>{{ shot.title }}</strong><p>{{ shot.narration || shot.purpose || '填写旁白与画面描述' }}</p><span :class="`${statusTone[shot.status]}-text`"><i class="dot" :class="statusTone[shot.status]"></i>{{ statusLabel[shot.status] }}</span></div><time>{{ shot.targetDurationMs / 1000 }}秒</time>
+            <span class="grab">⠿</span><div class="shot-thumb"><video v-if="scenePreviewUrls[shot.id]" :src="scenePreviewUrls[shot.id]" muted preload="metadata"></video><span v-else><Film :size="23"/></span><b>{{ String(index + 1).padStart(2, '0') }}</b></div><div class="shot-copy"><strong>{{ shot.title }} <Lock v-if="shot.locked" :size="12"/></strong><p>{{ shot.narration || shot.purpose || '填写旁白与画面描述' }}</p><span :class="`${statusTone[shot.status]}-text`"><i class="dot" :class="statusTone[shot.status]"></i>{{ statusLabel[shot.status] }}</span></div><time>{{ shot.targetDurationMs / 1000 }}秒</time>
           </article>
         </div>
       </aside>
@@ -744,20 +894,25 @@ const confirmRemove = () => {
       <section class="preview-column">
         <div class="video-card panel">
           <div class="video-preview">
-            <video v-if="previewMedia" :key="previewMedia.id" :src="previewMedia.previewUrl" controls preload="metadata"></video>
+            <video v-if="previewMedia" :key="previewMedia.id" :src="previewMediaUrl" controls preload="metadata"></video>
             <div v-else class="empty-preview"><Film :size="46"/><b>等待生成候选视频</b><span>填写右侧画面描述，然后点击“生成选中分镜”。</span></div>
             <span class="video-label">{{ settings.aspectRatio }} · {{ previewEnhanced ? '1080p 增强版' : previewVersion ? previewVersion.workflowId : '候选预览' }}</span>
           </div>
           <div v-if="!previewVersion" class="player"><button><Play :size="19" fill="currentColor"/></button><button>Ⅰ◀</button><button>▶Ⅰ</button><strong>00:00</strong><span>/ --:--</span><div class="scrub"><i style="width:0"></i></div><Volume2 :size="19"/><div class="volume"><i style="width:55%"></i></div><Maximize2 :size="18"/></div>
         </div>
+        <div v-if="previewVersion" class="candidate-detail">
+          <div><b>{{ previewVersion.workflowId }}</b><span>{{ previewVersion.visibleWidth }}×{{ previewVersion.visibleHeight }}</span><span>{{ previewVersion.targetDurationSec ? `${previewVersion.targetDurationSec} 秒目标` : '旧时长记录' }}</span><span>Seed {{ previewVersion.seed ?? '未记录' }}</span><span>{{ previewVersion.audioIntent === 'dialogue' ? '画内对白' : previewVersion.audioIntent === 'silent' ? '静音' : '环境声' }}</span><span>{{ previewVersion.promptCompilerVersion ?? '旧提示词' }}</span></div>
+          <p :title="previewVersion.promptText ?? ''">提示词：{{ previewVersion.promptText || '该候选未记录提示词正文' }}</p>
+        </div>
         <div class="version-row">
           <div class="version-strip">
-            <button v-for="(version,index) in candidateVersions" :key="version.id" class="version" :class="{ active: !previewEnhanced && previewVersion?.id === version.id }" @click="previewVersionId=version.id; previewEnhancedId='' "><b>V{{ index + 1 }}</b><span>{{ version.selected ? '正式版本' : '候选版本' }}</span></button>
+            <button v-for="(version,index) in candidateVersions" :key="version.id" class="version" :class="{ active: !previewEnhanced && previewVersion?.id === version.id }" @click="previewVersionId=version.id; previewEnhancedId='' "><b>V{{ index + 1 }}</b><span>{{ version.selected && selectedScene?.status === 'approved' ? '正式版本' : version.selected ? '原正式版本' : '候选版本' }}</span></button>
             <button v-if="enhancedForOfficial" class="version final-version" :class="{ active: previewEnhanced?.id === enhancedForOfficial.id }" @click="previewEnhancedId=enhancedForOfficial.id"><b>1080p</b><span>增强版已就绪</span></button>
             <button v-if="!candidateVersions.length" class="version" disabled><b>V1</b><span>等待候选</span></button>
           </div>
-          <button class="btn" :disabled="submitting || enhancing || isTaskActive" @click="generateSelected"><Plus :size="16"/>重新生成候选</button>
+          <button class="btn" :disabled="submitting || enhancing || isTaskActive || selectedScene?.locked" @click="generateSelected"><Plus :size="16"/>重新生成候选</button>
           <button class="btn" :disabled="!canSelectOfficial" @click="selectOfficialVersion"><Star :size="16"/>设为正式版本</button>
+          <button class="btn" :disabled="!previewMedia" @click="openPreviewLocation"><FolderOpen :size="16"/>打开素材位置</button>
           <button class="btn primary" :disabled="!canMakeEnhancement" :title="settings.aspectRatio === '16:9' ? '为正式版本制作可选的 1920×1080 AI 增强文件' : '当前仅开放已验证的 16:9 SeedVR2 增强流程'" @click="makeEnhancement"><LoaderCircle v-if="enhancing" class="spin" :size="16"/>{{ enhancedForOfficial ? '重新制作 1080p 增强版' : enhancing ? '正在提交' : '制作 1080p 增强版' }}</button>
         </div>
       </section>
@@ -769,7 +924,8 @@ const confirmRemove = () => {
           <button :class="{active:activeInspector==='generation'}" @click="activeInspector='generation'">生成</button>
         </div>
         <div v-if="!selectedScene" class="inspector-empty"><Film :size="32"/><b>请选择或新增分镜</b></div>
-        <div v-else class="inspector-body">
+        <div v-else class="inspector-body" :class="{ 'scene-locked': selectedScene.locked }">
+          <div v-if="selectedScene.locked" class="locked-note"><Lock :size="14"/>此分镜已锁定。解除锁定后才能修改内容或重新生成。</div>
           <template v-if="activeInspector==='content'">
             <label class="editor-field"><span>镜头标题</span><input :value="selectedScene.title" maxlength="80" @input="updateTextField('title',$event)"/></label>
             <label class="editor-field"><span>本镜头目的</span><textarea :value="selectedScene.purpose" placeholder="说明这段画面要帮助观众理解什么" @input="updateTextField('purpose',$event)"></textarea></label>
@@ -784,7 +940,19 @@ const confirmRemove = () => {
           </template>
 
           <template v-else-if="activeInspector==='visual'">
-            <label class="editor-field visual-plan"><span>画面描述</span><textarea :value="selectedScene.visualPlan" placeholder="描述主体、动作、场景、镜头和光线；此内容会用于生成候选视频" @input="updateTextField('visualPlan',$event)"></textarea></label>
+            <div class="field-head"><label class="section-label">画面提示词</label><div class="prompt-controls"><button class="ai-revise" type="button" :disabled="selectedScene.locked" @click="openRevisionDialog"><Sparkles :size="13"/>AI 修订</button><div class="prompt-mode"><button :class="{active:selectedScene.promptMode==='quick'}" @click="updateSelected({promptMode:'quick'})">快速描述</button><button :class="{active:selectedScene.promptMode==='advanced'}" @click="updateSelected({promptMode:'advanced'})">分项控制</button></div></div></div>
+            <label v-if="selectedScene.promptMode==='quick'" class="editor-field visual-plan"><span>直接描述想要的画面</span><textarea :value="selectedScene.visualPlan" placeholder="例如：雨夜山谷上空乌云翻涌，一道闪电从云层劈向地面，镜头缓慢推进" @input="updateTextField('visualPlan',$event)"></textarea></label>
+            <div v-else class="intent-editor">
+              <label><span>主体</span><input :value="selectedScene.visualIntent.subject" placeholder="谁或什么是画面主角" @input="updateVisualIntent('subject',$event)"/></label>
+              <label><span>动作</span><input :value="selectedScene.visualIntent.action" placeholder="主体正在做什么" @input="updateVisualIntent('action',$event)"/></label>
+              <label><span>场景</span><input :value="selectedScene.visualIntent.scene" placeholder="地点、天气、时间" @input="updateVisualIntent('scene',$event)"/></label>
+              <label><span>构图</span><input :value="selectedScene.visualIntent.composition" placeholder="全景、近景、主体位置" @input="updateVisualIntent('composition',$event)"/></label>
+              <label><span>镜头</span><input :value="selectedScene.visualIntent.camera" placeholder="机位和镜头运动" @input="updateVisualIntent('camera',$event)"/></label>
+              <label><span>光线</span><input :value="selectedScene.visualIntent.lighting" placeholder="光线方向、色调和氛围" @input="updateVisualIntent('lighting',$event)"/></label>
+              <label class="wide"><span>时间线</span><textarea :value="selectedScene.visualIntent.timeline" placeholder="例如：0-2 秒乌云翻涌；2-4 秒闪电落下；4-5 秒余光消散" @input="updateVisualIntent('timeline',$event)"></textarea></label>
+              <label class="wide"><span>避免出现</span><input :value="selectedScene.visualIntent.negative" placeholder="文字、水印、人物说话、构图错误等" @input="updateVisualIntent('negative',$event)"/></label>
+              <div class="prompt-preview wide"><b>将提交的画面意图</b><p>{{ effectiveVisualPlan(selectedScene) || '填写上方分项后，这里会实时组合成可检查的提示词。' }}</p><span v-if="promptWarnings.length">建议：{{ promptWarnings.join('、') }}</span><span v-else class="ready">结构已足够，可继续选择生成方式。</span></div>
+            </div>
             <label class="section-label">生成方式</label>
             <div class="mode-grid"><button v-for="item in modes" :key="item.id" :class="{active:selectedScene.generationMode===item.id}" @click="chooseMode(item.id)"><span>{{ item.symbol }}</span>{{ item.label }}</button></div>
             <div v-if="selectedScene.generationMode !== 't2v'" class="reference-inputs">
@@ -800,16 +968,17 @@ const confirmRemove = () => {
               </template>
               <p v-if="!referenceAssets.length">当前项目暂无可用素材，请先到素材页导入。</p>
             </div>
-            <div class="visual-summary"><b>提交前检查</b><span>{{ selectedScene.visualPlan.trim() ? '画面描述已填写' : '还需填写画面描述' }}</span><span>{{ selectedScene.generationMode === 't2v' || selectedScene.assetIds.length ? '参考输入已满足' : '还需选择参考素材' }}</span></div>
+            <div class="visual-summary"><b>提交前检查</b><span>{{ effectiveVisualPlan(selectedScene).trim() ? '画面描述已填写' : '还需填写画面描述' }}</span><span>{{ referenceInputSatisfied(selectedScene) ? '参考输入已满足' : '还需补齐当前生成方式所需素材' }}</span></div>
           </template>
 
           <template v-else>
-            <div class="field-head"><label class="section-label">片段时长</label><span>当前 {{ durationLabel }}</span></div>
-            <div class="segmented duration-options"><button v-for="seconds in [5,10,15] as const" :key="seconds" :class="{active:durationLabel===`${seconds}秒`}" @click="setDuration(seconds)">{{ seconds }} 秒</button></div>
+            <div class="field-head"><label class="section-label">片段时长</label><span>4～15 秒逐秒可调 · 当前 {{ selectedDurationSeconds }} 秒</span></div>
+            <div class="duration-picker"><input :value="selectedDurationSeconds" type="range" min="4" max="15" step="1" aria-label="视频时长" @input="setDuration(Number(($event.target as HTMLInputElement).value))"/><div class="duration-scale"><span>4</span><span>8</span><span>12</span><span>15 秒</span></div><label><input :value="selectedDurationSeconds" type="number" min="4" max="15" step="1" aria-label="视频时长秒数" @change="setDuration(Number(($event.target as HTMLInputElement).value))"/><span>秒</span></label></div>
             <div class="field-head"><label class="section-label">质量模式</label><span class="warning-text">耗时受冷启动和队列影响</span></div>
             <div class="quality-grid"><button :class="{active:selectedScene.quality==='fast'}" @click="setQuality('fast')"><b>快速 8 步</b><span>适合构图和动作候选</span></button><button :class="{active:selectedScene.quality==='high'}" @click="setQuality('high')"><b>高质量 20 步</b><span>生成新的高质量候选</span></button></div>
-            <div class="field-head"><label class="section-label">H3 原生环境音</label><span>不作为正式旁白</span></div>
-            <label class="editor-field ambient-field"><span>希望听到的声音</span><textarea :value="selectedScene.ambientSound" placeholder="例如：细雨、远处雷声，闪电出现时一声清晰雷鸣" @input="updateAmbientSound"></textarea></label>
+            <div class="field-head"><label class="section-label">H3 原生音轨意图</label><span>候选版本可单独试听</span></div>
+            <div class="segmented audio-intents"><button :class="{active:selectedScene.audioIntent==='environment'}" @click="updateSelected({audioIntent:'environment'})">环境声</button><button :class="{active:selectedScene.audioIntent==='dialogue'}" @click="updateSelected({audioIntent:'dialogue'})">画内对白</button><button :class="{active:selectedScene.audioIntent==='silent'}" @click="updateSelected({audioIntent:'silent'})">静音</button></div>
+            <label v-if="selectedScene.audioIntent!=='silent'" class="editor-field ambient-field"><span>{{ selectedScene.audioIntent==='dialogue' ? '对白和现场声音' : '希望听到的环境声' }}</span><textarea :value="selectedScene.ambientSound" :placeholder="selectedScene.audioIntent==='dialogue' ? '写清说话者、语言、台词和现场声音，例如：孩童用普通话朗读“春眠不觉晓”，窗外有轻微鸟鸣' : '例如：细雨、远处雷声，闪电出现时一声清晰雷鸣'" @input="updateAmbientSound"></textarea></label>
             <div class="audio-policy-grid"><button :class="{active:settings.h3AudioPolicy==='smart'}" @click="settings.h3AudioPolicy='smart'"><b>智能使用</b><span>默认保留候选音轨，成片检查后低音量混入</span></button><button :class="{active:settings.h3AudioPolicy==='always'}" @click="settings.h3AudioPolicy='always'"><b>始终使用</b><span>保留原声，由你试听决定</span></button><button :class="{active:settings.h3AudioPolicy==='off'}" @click="settings.h3AudioPolicy='off'"><b>不使用</b><span>生成静音候选</span></button></div>
             <div class="generation-contract"><span>项目画幅</span><b>{{ settings.aspectRatio }}</b><span>候选尺寸</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b><span>1080p</span><b>{{ settings.aspectRatio === '16:9' ? '可选增强' : '暂未开放' }}</b></div>
             <div class="task-card"><div class="field-head"><h3>当前任务 · {{ taskKind === 'enhancement' ? '1080p 增强版' : '候选生成' }}</h3><button v-if="task && !['completed','failed','cancelled','interrupted'].includes(task.status)" class="task-cancel" type="button" @click="cancelTask"><X :size="14"/>取消任务</button></div><div class="task-main"><div class="task-thumb"><Film :size="23"/></div><div><b>{{ task ? taskStatusLabel : taskError ? '任务未提交' : '当前没有生成任务' }}</b><div class="progress"><i :style="{ width: `${taskPercent}%` }"></i></div><span :class="{ 'task-error': taskError }">{{ taskDescription }}</span></div><strong>{{ task ? `${taskPercent}%` : taskError ? '需处理' : '空闲' }}</strong></div><footer><span class="dot" :class="{ gray: !task || ['completed','failed','cancelled','interrupted'].includes(task.status) }"></span><b>知画服务队列</b><span>|　{{ task?.id ? `任务 ${task.id.slice(0, 8)}` : '提交前不会启动 GPU' }}</span></footer></div>
@@ -826,6 +995,22 @@ const confirmRemove = () => {
         <div class="track-content"><div class="video-track"><i v-for="(shot,index) in scenes" :key="shot.id"><video v-if="scenePreviewUrls[shot.id]" :src="scenePreviewUrls[shot.id]" muted preload="metadata"></video><span><b>{{ String(index + 1).padStart(2, '0') }}</b> {{ shot.title }}</span></i></div><div class="voice-track"><i v-for="shot in scenes" :key="shot.id">▥　{{ shot.narration ? shot.title : '尚未生成旁白' }}</i></div><div class="subtitle-track"><i v-for="shot in scenes" :key="shot.id">{{ shot.narration || '尚无字幕文本' }}</i></div><div class="music-track">♫　背景音乐在导出页按需选择</div></div>
       </div>
     </section>
+
+    <div v-if="revisionOpen" class="revision-backdrop" @click.self="!revisionBusy && (revisionOpen=false)">
+      <section class="revision-dialog" role="dialog" aria-modal="true" aria-labelledby="revision-title">
+        <header><div><h2 id="revision-title">AI 修订当前分镜</h2><p>只生成提案；点击接受后才写入当前分镜，锁定和来源不会被改动。</p></div><button type="button" aria-label="关闭" :disabled="revisionBusy" @click="revisionOpen=false"><X :size="20"/></button></header>
+        <div class="revision-body">
+          <label><span>希望怎么修改</span><textarea v-model="revisionInstruction" maxlength="2000" placeholder="例如：保留知识点和旁白，把画面改成雨夜山谷的近景，并让 0-3 秒先展示云层，3-5 秒出现闪电。"></textarea></label>
+          <div v-if="revisionProposal && selectedScene" class="revision-compare">
+            <article><b>当前内容</b><h3>{{ selectedScene.title }}</h3><p>{{ effectiveVisualPlan(selectedScene) }}</p><small>{{ selectedScene.narration || '无旁白' }}</small></article>
+            <article class="proposed"><b>修订提案</b><h3>{{ revisionProposal.title }}</h3><p>{{ revisionProposal.visualPlan }}</p><small>{{ revisionProposal.narration || '无旁白' }}</small></article>
+          </div>
+          <div v-if="revisionProposal" class="revision-summary"><b>{{ revisionProposal.changeSummary }}</b><span>{{ revisionProposal.providerId }} · {{ revisionProposal.model }} · {{ revisionProposal.templateVersion }}</span></div>
+          <p v-if="revisionError" class="revision-error">{{ revisionError }}</p>
+        </div>
+        <footer><button class="btn" type="button" :disabled="revisionBusy" @click="revisionOpen=false">取消</button><button class="btn" type="button" :disabled="revisionBusy || !revisionInstruction.trim()" @click="requestSceneRevision"><LoaderCircle v-if="revisionBusy" class="spin" :size="16"/><Sparkles v-else :size="16"/>{{ revisionProposal ? '重新生成提案' : '生成修订提案' }}</button><button class="btn primary" type="button" :disabled="revisionBusy || !revisionProposal" @click="acceptSceneRevision">接受提案</button></footer>
+      </section>
+    </div>
 
     <div v-if="fullPreviewOpen" class="full-preview-backdrop" @click.self="fullPreviewOpen=false">
       <section class="full-preview-dialog">
@@ -844,7 +1029,12 @@ const confirmRemove = () => {
 .reference-inputs{margin:-3px 0 12px;padding:9px 10px;border:1px solid #d9e4f1;border-radius:8px;background:#f8fbff;display:grid;grid-template-columns:1fr 1fr;gap:7px}.reference-inputs .field-head{grid-column:1/-1;margin:0 0 2px}.reference-inputs .field-head a{color:var(--blue);font-size:12px}.reference-inputs label{display:flex;flex-direction:column;gap:4px;color:#52698c;font-size:11px}.reference-inputs select{height:34px;min-width:0;border:1px solid #cfdced;border-radius:6px;background:#fff;padding:0 8px;color:#203b65}.reference-inputs p{grid-column:1/-1;color:#7385a2;font-size:11px}
 .narration-import-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;margin-top:7px}.narration-import-row .select{height:34px}.narration-import-row a{color:var(--blue);font-size:11px;white-space:nowrap}
 .narration-modes{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:8px}.narration-off-note{padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);color:var(--muted);font-size:12px;line-height:1.6}.ambient-field{margin-bottom:8px}.ambient-field textarea{height:58px}.audio-policy-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.audio-policy-grid button{min-height:68px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);text-align:left;color:var(--text)}.audio-policy-grid b,.audio-policy-grid span{display:block}.audio-policy-grid span{margin-top:4px;color:var(--muted);font-size:10px;line-height:1.35}.audio-policy-grid button.active{border-color:var(--blue);background:#edf5ff;color:var(--blue)}
+.locked-note{margin-bottom:10px;padding:9px 11px;border:1px solid #efc36a;border-radius:7px;display:flex;align-items:center;gap:7px;background:#fff8e8;color:#8b5a08;font-size:12px}.scene-locked>:not(.locked-note){opacity:.58;pointer-events:none}.shot-actions button:disabled{opacity:.35;cursor:not-allowed}.prompt-mode{display:flex;gap:3px;padding:2px;border-radius:7px;background:#eef3f9}.prompt-mode button{height:28px;border:0;border-radius:5px;padding:0 9px;background:transparent;color:var(--muted);font-size:11px}.prompt-mode button.active{background:#fff;color:var(--blue);box-shadow:0 1px 4px #cbd8e9}.intent-editor{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}.intent-editor label{display:flex;flex-direction:column;gap:5px;color:var(--text);font-size:11px;font-weight:700}.intent-editor input,.intent-editor textarea{min-width:0;border:1px solid var(--line);border-radius:7px;background:var(--surface);padding:8px;color:var(--text)}.intent-editor input{height:36px}.intent-editor textarea{height:64px;resize:vertical}.intent-editor .wide{grid-column:1/-1}.prompt-preview{padding:9px 10px;border:1px solid #cfe0f7;border-radius:8px;background:#f6faff;font-size:11px}.prompt-preview p{margin:5px 0;color:#405a80;line-height:1.5}.prompt-preview span{color:#b36a15}.prompt-preview .success-text{color:#13835a}.audio-intents{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:9px}
 .full-preview-backdrop{position:fixed;z-index:95;inset:30px 0 0;display:grid;place-items:center;background:rgba(5,18,40,.72);backdrop-filter:blur(3px)}.full-preview-dialog{width:min(1050px,82vw);overflow:hidden;border:1px solid #6d7f9b;border-radius:13px;background:#071326;box-shadow:0 26px 80px rgba(0,0,0,.38)}.full-preview-dialog header{height:68px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;color:#fff;background:#0d1c33}.full-preview-dialog header h2{color:#fff}.full-preview-dialog header p{margin-top:4px;color:#aab9cf;font-size:12px}.full-preview-dialog header button{width:38px;height:38px;border:0;border-radius:8px;display:grid;place-items:center;color:#d7e2f1;background:transparent}.full-preview-dialog header button:hover{background:#1a2d49}.full-preview-dialog video{display:block;width:100%;max-height:calc(82vh - 98px);aspect-ratio:16/9;object-fit:contain;background:#000}
 .shot-thumb{overflow:hidden;background:#e9f0f8}.shot-thumb video{width:100%;height:100%;display:block;object-fit:cover}.shot-thumb>span{width:100%;height:100%;display:grid;place-items:center;color:#7c8fae}.empty-preview{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#8395af;background:#0a1728}.empty-preview b{font-size:18px;color:#e2eaf5}.empty-preview span{font-size:13px}.task-thumb{display:grid;place-items:center;background:#eaf2fb;color:#5c7da8}.video-track i{position:relative;overflow:hidden;background:#203b64}.video-track i video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.video-track i>span{position:relative;z-index:1;text-shadow:0 1px 4px #07162c}.video-track i:not(:has(video)){background:#dbe6f3;color:#496482}.video-track i:not(:has(video))>span{text-shadow:none}
 .inspector-empty{height:calc(100% - 44px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--muted)}.editor-field{display:flex;flex-direction:column;gap:7px;margin-bottom:14px;font-size:13px;font-weight:700}.editor-field input,.editor-field textarea{width:100%;border:1px solid #d4dfef;border-radius:7px;background:var(--surface);padding:9px 11px}.editor-field input{height:42px}.editor-field textarea{height:80px}.editor-field.visual-plan textarea{height:148px;font-size:14px}.editor-field input:focus,.editor-field textarea:focus{outline:2px solid #d7e8ff;border-color:var(--blue)}.visual-summary{margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);display:flex;flex-direction:column;gap:6px}.visual-summary span{font-size:12px;color:var(--muted)}.duration-options{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:15px}.timeline-note{margin-left:auto;color:var(--muted);font-size:12px}.timeline-toolbar>button:disabled{opacity:.5;cursor:not-allowed}
+.prompt-preview .ready{color:#13835a}
+.candidate-detail{min-height:52px;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--surface);display:flex;flex-direction:column;justify-content:center;gap:5px}.candidate-detail>div{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--muted)}.candidate-detail>div b{max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}.candidate-detail>div span{padding-left:10px;border-left:1px solid var(--line)}.candidate-detail p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#476184;font-size:11px}
+.prompt-controls{display:flex;align-items:center;gap:7px}.ai-revise{height:30px;padding:0 9px;border:1px solid #bfd6f6;border-radius:6px;background:#f3f8ff;color:var(--blue);display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700}.ai-revise:disabled{opacity:.5;cursor:not-allowed}.revision-backdrop{position:fixed;z-index:110;inset:30px 0 0;background:rgba(5,20,45,.48);display:grid;place-items:center;padding:24px}.revision-dialog{width:min(860px,calc(100vw - 80px));max-height:calc(100vh - 90px);overflow:auto;border:1px solid #cbd9eb;border-radius:13px;background:var(--surface);box-shadow:0 26px 80px rgba(8,32,70,.28)}.revision-dialog>header{min-height:82px;padding:17px 21px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;justify-content:space-between}.revision-dialog>header p{margin-top:6px;color:var(--muted);font-size:12px}.revision-dialog>header button{width:34px;height:34px;border:0;border-radius:7px;background:transparent;color:var(--text);display:grid;place-items:center}.revision-body{padding:18px 21px;display:flex;flex-direction:column;gap:14px}.revision-body>label{display:flex;flex-direction:column;gap:7px;font-weight:700}.revision-body>label textarea{height:100px}.revision-compare{display:grid;grid-template-columns:1fr 1fr;gap:12px}.revision-compare article{min-height:188px;padding:14px;border:1px solid var(--line);border-radius:9px;background:var(--surface-soft)}.revision-compare article.proposed{border-color:#9ec3f6;background:#f1f7ff}.revision-compare h3{margin:8px 0;font-size:16px}.revision-compare p{min-height:72px;color:#405a80;font-size:13px;line-height:1.55;white-space:pre-wrap}.revision-compare small{display:block;margin-top:9px;color:var(--muted);line-height:1.5}.revision-summary{padding:10px 12px;border-radius:8px;background:#eaf7f1;color:#196e51;display:flex;flex-direction:column;gap:5px}.revision-summary span{font-size:11px}.revision-error{padding:9px 11px;border-radius:7px;background:#fff0ee;color:#b23c36;font-size:12px}.revision-dialog>footer{min-height:68px;padding:11px 21px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:9px}
+.duration-picker{position:relative;margin:0 0 15px;padding-right:78px}.duration-picker>input[type="range"]{width:100%;height:26px;accent-color:var(--blue)}.duration-scale{display:flex;justify-content:space-between;color:var(--muted);font-size:10px}.duration-picker>label{position:absolute;right:0;top:0;width:66px;height:42px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);display:flex;align-items:center;justify-content:center;gap:3px}.duration-picker>label input{width:34px;border:0;background:transparent;color:var(--text);font-size:16px;font-weight:800;text-align:right;outline:none}.duration-picker>label span{color:var(--muted);font-size:11px}
 </style>

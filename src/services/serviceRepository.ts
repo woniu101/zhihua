@@ -167,8 +167,10 @@ function candidateDimensions(aspectRatio: VideoGenerationRequest["aspectRatio"])
   return { width: profile.workWidth, height: profile.workHeight };
 }
 
-function frameLength(durationSec: 5 | 10 | 15): 124 | 243 | 362 {
-  return { 5: 124, 10: 243, 15: 362 }[durationSec] as 124 | 243 | 362;
+export function h3FrameLength(durationSec: number): number {
+  const requestedFrames = Math.ceil(Math.max(4, Math.min(15, durationSec)) * 24);
+  const snappedFrames = requestedFrames + ((5 - (requestedFrames % 17) + 17) % 17);
+  return Math.max(124, Math.min(362, snappedFrames));
 }
 
 export async function testServiceConnection(
@@ -340,7 +342,7 @@ export class ComfyUiH3Provider implements VideoProvider {
       intent: {
         visualTimeline: request.prompt,
         ambientSound: request.ambientSound,
-        allowHumanVoice: false,
+        audioIntent: request.audioIntent,
         nonDiegeticMusic: null,
       },
       mode: request.mode,
@@ -368,6 +370,7 @@ export class ComfyUiH3Provider implements VideoProvider {
             prompt: compiledPrompt.text,
             promptCompilerVersion: compiledPrompt.version,
             h3AudioPolicy: request.h3AudioPolicy,
+            audioIntent: request.audioIntent,
             seed: request.seed,
             assetIds: request.assetIds,
             discardH3Audio: request.h3AudioPolicy === "off",
@@ -377,7 +380,8 @@ export class ComfyUiH3Provider implements VideoProvider {
             visibleHeight: profile.visibleHeight,
             cropX: profile.cropX,
             cropY: profile.cropY,
-            length: frameLength(request.durationSec),
+            length: h3FrameLength(request.durationSec),
+            targetDurationSec: request.durationSec,
           },
         },
       });

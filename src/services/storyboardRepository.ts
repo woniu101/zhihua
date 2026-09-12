@@ -70,4 +70,23 @@ export const storyboardRepository = {
       .filter((scene): scene is SceneDraft => Boolean(scene));
     persistLocal(projectId, next);
   },
+
+  async applyEdit(
+    projectId: string,
+    expected: SceneDraft[],
+    scenes: SceneDraft[],
+  ): Promise<SceneDraft[]> {
+    const native = await invokeNative<SceneDraft[]>("apply_storyboard_edit", {
+      input: { projectId, expected, scenes },
+    });
+    if (native) return native;
+    const current = localList(projectId);
+    if (JSON.stringify(current) !== JSON.stringify(expected)) {
+      throw new Error("分镜已发生变化，请刷新后再试；当前内容未被覆盖");
+    }
+    const now = new Date().toISOString();
+    const saved = scenes.map((scene, order) => ({ ...scene, order, updatedAt: now }));
+    persistLocal(projectId, saved);
+    return saved;
+  },
 };

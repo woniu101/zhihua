@@ -40,6 +40,10 @@ pub struct CandidateVersion {
     pub prompt_id: Option<String>,
     pub prompt_compiler_version: Option<String>,
     pub h3_audio_policy: Option<String>,
+    pub prompt_text: Option<String>,
+    pub seed: Option<u32>,
+    pub audio_intent: Option<String>,
+    pub target_duration_sec: Option<u32>,
     pub artifact_id: String,
     pub filename: String,
     pub media_type: String,
@@ -85,6 +89,10 @@ pub struct RecordCandidateInput {
     pub prompt_id: Option<String>,
     pub prompt_compiler_version: Option<String>,
     pub h3_audio_policy: Option<String>,
+    pub prompt_text: Option<String>,
+    pub seed: Option<u32>,
+    pub audio_intent: Option<String>,
+    pub target_duration_sec: Option<u32>,
     pub artifact_id: String,
     pub filename: String,
     pub media_type: String,
@@ -141,6 +149,10 @@ impl GenerationStorage {
                 prompt_id   TEXT,
                 prompt_compiler_version TEXT,
                 h3_audio_policy TEXT,
+                prompt_text TEXT,
+                seed INTEGER,
+                audio_intent TEXT,
+                target_duration_sec INTEGER,
                 artifact_id TEXT NOT NULL,
                 filename    TEXT NOT NULL,
                 media_type  TEXT NOT NULL,
@@ -210,6 +222,44 @@ impl GenerationStorage {
         }
         if !candidate_columns
             .iter()
+            .any(|column| column == "prompt_text")
+        {
+            connection
+                .execute(
+                    "ALTER TABLE candidate_versions ADD COLUMN prompt_text TEXT",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        if !candidate_columns.iter().any(|column| column == "seed") {
+            connection
+                .execute("ALTER TABLE candidate_versions ADD COLUMN seed INTEGER", [])
+                .map_err(database_error)?;
+        }
+        if !candidate_columns
+            .iter()
+            .any(|column| column == "audio_intent")
+        {
+            connection
+                .execute(
+                    "ALTER TABLE candidate_versions ADD COLUMN audio_intent TEXT",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        if !candidate_columns
+            .iter()
+            .any(|column| column == "target_duration_sec")
+        {
+            connection
+                .execute(
+                    "ALTER TABLE candidate_versions ADD COLUMN target_duration_sec INTEGER",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        if !candidate_columns
+            .iter()
             .any(|column| column == "h3_audio_policy")
         {
             connection
@@ -251,7 +301,8 @@ impl GenerationStorage {
                         c.prompt_compiler_version, c.h3_audio_policy,
                         c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
                         c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
-                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
+                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y,
+                        c.prompt_text, c.seed, c.audio_intent, c.target_duration_sec
                  FROM candidate_versions c
                  JOIN candidate_frame_profiles f ON f.candidate_id = c.id
                  WHERE c.project_id = ?1 AND c.scene_id = ?2
@@ -323,15 +374,20 @@ impl GenerationStorage {
             .execute(
                 "INSERT INTO candidate_versions (
                     id, project_id, scene_id, job_id, workflow_id, prompt_id,
-                    prompt_compiler_version, h3_audio_policy, artifact_id, filename,
+                    prompt_compiler_version, h3_audio_policy, prompt_text, seed, audio_intent, target_duration_sec,
+                    artifact_id, filename,
                     media_type, local_path, size_bytes, sha256, selected, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0, ?15)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19)
                  ON CONFLICT(job_id, artifact_id) DO UPDATE SET
                     local_path = excluded.local_path,
                     size_bytes = excluded.size_bytes,
                     sha256 = excluded.sha256,
                     prompt_compiler_version = excluded.prompt_compiler_version,
-                    h3_audio_policy = excluded.h3_audio_policy",
+                    h3_audio_policy = excluded.h3_audio_policy,
+                    prompt_text = excluded.prompt_text,
+                    seed = excluded.seed,
+                    audio_intent = excluded.audio_intent,
+                    target_duration_sec = excluded.target_duration_sec",
                 params![
                     id,
                     input.project_id,
@@ -341,6 +397,10 @@ impl GenerationStorage {
                     input.prompt_id,
                     input.prompt_compiler_version,
                     input.h3_audio_policy,
+                    input.prompt_text,
+                    input.seed,
+                    input.audio_intent,
+                    input.target_duration_sec,
                     input.artifact_id,
                     input.filename,
                     input.media_type,
@@ -412,6 +472,23 @@ impl GenerationStorage {
                 "找不到要设为正式版本的候选视频",
             ));
         }
+        let scene_editable: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM storyboard_scenes
+                    WHERE id = ?1 AND project_id = ?2
+                      AND locked = 0 AND status <> 'generating' AND pending_request_id IS NULL
+                 )",
+                params![scene_id, project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if !scene_editable {
+            return Err(GenerationError::new(
+                "scene_not_editable",
+                "锁定或正在生成的分镜不能更换正式版本",
+            ));
+        }
         transaction
             .execute(
                 "UPDATE candidate_versions SET selected = CASE WHEN id = ?1 THEN 1 ELSE 0 END
@@ -422,7 +499,8 @@ impl GenerationStorage {
         transaction
             .execute(
                 "UPDATE storyboard_scenes
-                 SET selected_version_id = ?1, status = 'approved', updated_at = ?2
+                 SET selected_version_id = ?1, status = 'approved',
+                     generation_stage = '已设为正式版本', updated_at = ?2
                  WHERE id = ?3 AND project_id = ?4",
                 params![version_id, Utc::now().to_rfc3339(), scene_id, project_id],
             )
@@ -438,12 +516,26 @@ impl GenerationStorage {
                         c.prompt_compiler_version, c.h3_audio_policy,
                         c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
                         c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
-                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
+                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y,
+                        c.prompt_text, c.seed, c.audio_intent, c.target_duration_sec
                  FROM candidate_versions c
                  JOIN candidate_frame_profiles f ON f.candidate_id = c.id
                  WHERE c.id = ?1",
                 [id],
                 candidate_from_row,
+            )
+            .map_err(database_error)
+    }
+
+    pub fn find_enhanced(&self, id: &str) -> GenerationResult<EnhancedVersion> {
+        self.connection()?
+            .query_row(
+                "SELECT id, project_id, scene_id, source_candidate_id, job_id,
+                        workflow_id, prompt_id, artifact_id, filename, media_type,
+                        local_path, size_bytes, sha256, created_at
+                 FROM enhanced_versions WHERE id = ?1",
+                [id],
+                enhanced_from_row,
             )
             .map_err(database_error)
     }
@@ -459,7 +551,8 @@ impl GenerationStorage {
                         c.prompt_compiler_version, c.h3_audio_policy,
                         c.artifact_id, c.filename, c.media_type, c.local_path, c.size_bytes,
                         c.sha256, c.selected, c.created_at, f.aspect_ratio, f.work_width,
-                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y
+                        f.work_height, f.visible_width, f.visible_height, f.crop_x, f.crop_y,
+                        c.prompt_text, c.seed, c.audio_intent, c.target_duration_sec
                  FROM candidate_versions c
                  JOIN candidate_frame_profiles f ON f.candidate_id = c.id
                  WHERE c.job_id = ?1 AND c.artifact_id = ?2",
@@ -570,6 +663,10 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateVers
         visible_height: row.get(20)?,
         crop_x: row.get(21)?,
         crop_y: row.get(22)?,
+        prompt_text: row.get(23)?,
+        seed: row.get(24)?,
+        audio_intent: row.get(25)?,
+        target_duration_sec: row.get(26)?,
     })
 }
 
@@ -638,6 +735,10 @@ mod tests {
                 ambient_sound: "雷声".to_owned(),
                 on_screen_text: vec![],
                 visual_plan: "闪电".to_owned(),
+                visual_intent: crate::storyboard::VisualIntent::default(),
+                prompt_mode: crate::storyboard::PromptMode::Quick,
+                audio_intent: crate::storyboard::AudioIntent::Environment,
+                locked: false,
                 generation_mode: GenerationMode::T2v,
                 target_duration_ms: 5_000,
                 asset_ids: vec![],
@@ -662,8 +763,12 @@ mod tests {
                 job_id: "job-1".to_owned(),
                 workflow_id: "h3-t2v-turbo-v1".to_owned(),
                 prompt_id: Some("prompt-1".to_owned()),
-                prompt_compiler_version: Some("h3-prompt-v1".to_owned()),
+                prompt_compiler_version: Some("h3-prompt-v2".to_owned()),
                 h3_audio_policy: Some("smart".to_owned()),
+                prompt_text: Some("lynchpin prompt".to_owned()),
+                seed: Some(42),
+                audio_intent: Some("environment".to_owned()),
+                target_duration_sec: Some(5),
                 artifact_id: "video-0".to_owned(),
                 filename: "clip.mp4".to_owned(),
                 media_type: "video/mp4".to_owned(),
@@ -687,9 +792,13 @@ mod tests {
         assert!(versions[0].selected);
         assert_eq!(
             versions[0].prompt_compiler_version.as_deref(),
-            Some("h3-prompt-v1")
+            Some("h3-prompt-v2")
         );
         assert_eq!(versions[0].h3_audio_policy.as_deref(), Some("smart"));
+        assert_eq!(versions[0].prompt_text.as_deref(), Some("lynchpin prompt"));
+        assert_eq!(versions[0].seed, Some(42));
+        assert_eq!(versions[0].audio_intent.as_deref(), Some("environment"));
+        assert_eq!(versions[0].target_duration_sec, Some(5));
         assert_eq!(
             storyboards.list(&project.id).expect("scenes")[0].selected_version_id,
             Some(candidate.id.clone())

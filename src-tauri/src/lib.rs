@@ -2,7 +2,6 @@ mod asset;
 mod audio_inspector;
 mod comp_share;
 mod compute_pool;
-mod deepseek;
 mod export;
 mod frame_composition;
 mod frame_profile;
@@ -10,6 +9,7 @@ mod generation;
 mod job_queue;
 #[cfg(test)]
 mod live_validation;
+mod llm;
 mod service;
 mod source;
 mod ssh_tunnel;
@@ -29,11 +29,6 @@ use comp_share::{
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
 use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
-use deepseek::{
-    AnalyzeSourcesInput, CreateStoryboardInput, DeepSeekConfiguration, DeepSeekConnectionTest,
-    DeepSeekError, DeepSeekProvider, DeepSeekSource, KnowledgePoint,
-    SaveDeepSeekConfigurationInput,
-};
 use export::{
     ExportCapability, ExportError, ExportProjectInput, FfmpegExporter, PreviewProjectInput,
     ProjectExport,
@@ -47,6 +42,11 @@ use generation::{
     RecordEnhancedInput,
 };
 use job_queue::{JobQueueError, JobQueueStorage, LocalJob};
+use llm::{
+    AnalyzeSourcesInput, CreateStoryboardInput, KnowledgePoint, LlmConfiguration,
+    LlmConnectionTest, LlmError, LlmProvider, LlmSource, ReviseSceneInput,
+    SaveLlmConfigurationInput, SceneRevisionProposal,
+};
 use service::{
     DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceArtifactDownload,
     ServiceClient, ServiceConnectionError, ServiceConnectionInfo, ServiceConnectionResult,
@@ -517,58 +517,56 @@ fn delete_source(storage: State<'_, SourceStorage>, id: String) -> Result<(), St
 }
 
 #[tauri::command]
-fn get_deepseek_configuration(
-    provider: State<'_, DeepSeekProvider>,
-) -> Result<DeepSeekConfiguration, DeepSeekError> {
+fn get_llm_configuration(provider: State<'_, LlmProvider>) -> Result<LlmConfiguration, LlmError> {
     provider.configuration()
 }
 
 #[tauri::command]
-fn save_deepseek_configuration(
-    provider: State<'_, DeepSeekProvider>,
-    input: SaveDeepSeekConfigurationInput,
-) -> Result<DeepSeekConfiguration, DeepSeekError> {
-    provider.save_configuration(input)
+async fn save_llm_configuration(
+    provider: State<'_, LlmProvider>,
+    input: SaveLlmConfigurationInput,
+) -> Result<LlmConfiguration, LlmError> {
+    provider.verify_and_save_configuration(input).await
 }
 
 #[tauri::command]
-fn clear_deepseek_api_key(provider: State<'_, DeepSeekProvider>) -> Result<(), DeepSeekError> {
+fn clear_llm_api_key(provider: State<'_, LlmProvider>) -> Result<(), LlmError> {
     provider.clear_api_key()
 }
 
 #[tauri::command]
-async fn test_deepseek_connection(
-    provider: State<'_, DeepSeekProvider>,
-) -> Result<DeepSeekConnectionTest, DeepSeekError> {
+async fn test_llm_connection(
+    provider: State<'_, LlmProvider>,
+) -> Result<LlmConnectionTest, LlmError> {
     provider.test_connection().await
 }
 
 #[tauri::command]
 fn knowledge_point_list(
-    provider: State<'_, DeepSeekProvider>,
+    provider: State<'_, LlmProvider>,
     project_id: String,
-) -> Result<Vec<KnowledgePoint>, DeepSeekError> {
+) -> Result<Vec<KnowledgePoint>, LlmError> {
     provider.list_knowledge_points(&project_id)
 }
 
 #[tauri::command]
 fn knowledge_points_replace(
-    provider: State<'_, DeepSeekProvider>,
+    provider: State<'_, LlmProvider>,
     project_id: String,
     points: Vec<KnowledgePoint>,
-) -> Result<Vec<KnowledgePoint>, DeepSeekError> {
+) -> Result<Vec<KnowledgePoint>, LlmError> {
     provider.replace_knowledge_points(&project_id, &points)
 }
 
 #[tauri::command]
 async fn knowledge_extract(
-    provider: State<'_, DeepSeekProvider>,
+    provider: State<'_, LlmProvider>,
     source_storage: State<'_, SourceStorage>,
     input: AnalyzeSourcesInput,
-) -> Result<Vec<KnowledgePoint>, DeepSeekError> {
+) -> Result<Vec<KnowledgePoint>, LlmError> {
     let available = source_storage
         .list_sources(&input.project_id)
-        .map_err(|error| DeepSeekError {
+        .map_err(|error| LlmError {
             code: "SOURCE_ERROR".to_owned(),
             message: error.to_string(),
         })?;
@@ -583,11 +581,11 @@ async fn knowledge_extract(
         }
         let text = source_storage
             .read_text(&source.id)
-            .map_err(|error| DeepSeekError {
+            .map_err(|error| LlmError {
                 code: "SOURCE_ERROR".to_owned(),
                 message: error.to_string(),
             })?;
-        sources.push(DeepSeekSource {
+        sources.push(LlmSource {
             id: source.id,
             name: source.name,
             text,
@@ -598,27 +596,48 @@ async fn knowledge_extract(
 
 #[tauri::command]
 async fn storyboard_generate_from_knowledge(
-    provider: State<'_, DeepSeekProvider>,
+    provider: State<'_, LlmProvider>,
     storyboard: State<'_, StoryboardStorage>,
     input: CreateStoryboardInput,
-) -> Result<Vec<SceneDraft>, DeepSeekError> {
+) -> Result<Vec<SceneDraft>, LlmError> {
     generate_and_persist_storyboard(provider.inner(), storyboard.inner(), input).await
 }
 
+#[tauri::command]
+async fn storyboard_revise_scene(
+    provider: State<'_, LlmProvider>,
+    storyboard: State<'_, StoryboardStorage>,
+    input: ReviseSceneInput,
+) -> Result<SceneRevisionProposal, LlmError> {
+    let scene = storyboard
+        .list(&input.project_id)
+        .map_err(|error| LlmError {
+            code: "STORYBOARD_ERROR".to_owned(),
+            message: error.to_string(),
+        })?
+        .into_iter()
+        .find(|scene| scene.id == input.scene_id)
+        .ok_or_else(|| LlmError {
+            code: "SCENE_NOT_FOUND".to_owned(),
+            message: "找不到要修订的分镜".to_owned(),
+        })?;
+    provider.revise_scene(&scene, &input.instruction).await
+}
+
 async fn generate_and_persist_storyboard(
-    provider: &DeepSeekProvider,
+    provider: &LlmProvider,
     storyboard: &StoryboardStorage,
     input: CreateStoryboardInput,
-) -> Result<Vec<SceneDraft>, DeepSeekError> {
+) -> Result<Vec<SceneDraft>, LlmError> {
     if !storyboard
         .list(&input.project_id)
-        .map_err(|error| DeepSeekError {
+        .map_err(|error| LlmError {
             code: "STORYBOARD_ERROR".to_owned(),
             message: error.to_string(),
         })?
         .is_empty()
     {
-        return Err(DeepSeekError {
+        return Err(LlmError {
             code: "STORYBOARD_NOT_EMPTY".to_owned(),
             message: "当前项目已有分镜，为避免覆盖，请先在分镜页处理现有内容。".to_owned(),
         });
@@ -657,6 +676,10 @@ async fn generate_and_persist_storyboard(
             },
             on_screen_text: plan.on_screen_text,
             visual_plan: plan.visual_plan,
+            visual_intent: crate::storyboard::VisualIntent::default(),
+            prompt_mode: crate::storyboard::PromptMode::Quick,
+            audio_intent: crate::storyboard::AudioIntent::Environment,
+            locked: false,
             generation_mode: GenerationMode::T2v,
             target_duration_ms: plan.target_duration_sec * 1_000,
             asset_ids: Vec::new(),
@@ -675,7 +698,7 @@ async fn generate_and_persist_storyboard(
                 for inserted in &saved {
                     let _ = storyboard.delete(&input.project_id, &inserted.id);
                 }
-                return Err(DeepSeekError {
+                return Err(LlmError {
                     code: "STORYBOARD_ERROR".to_owned(),
                     message: error.to_string(),
                 });
@@ -707,13 +730,14 @@ mod live_flow_tests {
                 target_duration_sec: Some(30),
             })
             .expect("create project");
-        let provider = DeepSeekProvider::initialize(
+        let provider = LlmProvider::initialize(
             directory.path().join("settings"),
             projects.info().database_path,
         )
         .expect("initialize DeepSeek provider");
         provider
-            .save_configuration(SaveDeepSeekConfigurationInput {
+            .save_configuration(SaveLlmConfigurationInput {
+                provider_id: "deepseek".to_owned(),
                 base_url: "https://api.deepseek.com".to_owned(),
                 model: "deepseek-chat".to_owned(),
                 api_key,
@@ -729,7 +753,7 @@ mod live_flow_tests {
                     target_audience: project.audience.clone(),
                     target_duration_sec: project.target_duration_sec,
                 },
-                vec![DeepSeekSource {
+                vec![LlmSource {
                     id: source_id.clone(),
                     name: "雷电基础资料.txt".to_owned(),
                     text: "云中的冰晶和水滴碰撞，使云层不同区域积累不同电荷。电势差足够大时，空气被击穿，形成明亮的闪电通道。闪电会把周围空气迅速加热，空气快速膨胀并形成声波，这就是雷声。光传播得比声音快，所以人们通常先看到闪电，后听到雷声。"
@@ -777,7 +801,8 @@ mod live_flow_tests {
             !scene.title.trim().is_empty()
                 && !scene.narration.trim().is_empty()
                 && !scene.visual_plan.trim().is_empty()
-                && matches!(scene.target_duration_ms, 5_000 | 10_000 | 15_000)
+                && (4_000..=15_000).contains(&scene.target_duration_ms)
+                && scene.target_duration_ms % 1_000 == 0
                 && scene.status == SceneStatus::Draft
         }));
         assert_eq!(
@@ -1058,6 +1083,14 @@ async fn download_service_artifact(
 }
 
 #[tauri::command]
+fn apply_storyboard_edit(
+    storage: State<'_, StoryboardStorage>,
+    input: storyboard::StoryboardEditInput,
+) -> Result<Vec<SceneDraft>, String> {
+    storage.apply_edit(input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn list_candidate_versions(
     storage: State<'_, GenerationStorage>,
     input: CandidateVersionsInput,
@@ -1079,6 +1112,33 @@ fn inspect_candidate_audio(
     input: InspectCandidateAudioInput,
 ) -> Result<CandidateAudioInspection, String> {
     audio_inspector::inspect_candidate(storage.inner(), input)
+}
+
+#[tauri::command]
+fn open_candidate_location(
+    storage: State<'_, GenerationStorage>,
+    candidate_id: String,
+) -> Result<(), String> {
+    let local_path = storage
+        .find(&candidate_id)
+        .map(|candidate| candidate.local_path)
+        .or_else(|_| {
+            storage
+                .find_enhanced(&candidate_id)
+                .map(|enhanced| enhanced.local_path)
+        })
+        .map_err(|error| error.message)?;
+    if !local_path.is_file() {
+        return Err("候选文件已移动或不存在。".to_owned());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", local_path.to_string_lossy()))
+            .spawn()
+            .map_err(|error| format!("无法打开文件位置：{error}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1155,14 +1215,30 @@ async fn download_completed_job(
         .get("h3AudioPolicy")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let prompt_text = generation_parameters
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let seed = generation_parameters
+        .get("seed")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let audio_intent = generation_parameters
+        .get("audioIntent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let target_duration_sec = generation_parameters
+        .get("targetDurationSec")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
 
     let mut candidates = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
         let destination = project
             .project_dir
-            .join("cache")
-            .join("drafts")
+            .join("generated")
+            .join("videos")
             .join(safe_path_component(&job.scene_id)?)
             .join(safe_path_component(&job.id)?)
             .join(&filename);
@@ -1186,6 +1262,10 @@ async fn download_completed_job(
                     prompt_id: job.prompt_id.clone(),
                     prompt_compiler_version: prompt_compiler_version.clone(),
                     h3_audio_policy: h3_audio_policy.clone(),
+                    prompt_text: prompt_text.clone(),
+                    seed,
+                    audio_intent: audio_intent.clone(),
+                    target_duration_sec,
                     artifact_id: artifact.artifact_id,
                     filename,
                     media_type: artifact.media_type,
@@ -1380,9 +1460,10 @@ async fn download_completed_enhancement(
         let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
         let destination = project
             .project_dir
-            .join("cache")
-            .join("enhanced")
+            .join("generated")
+            .join("videos")
             .join(safe_path_component(&scene.id)?)
+            .join("1080p")
             .join(safe_path_component(&job.id)?)
             .join(&filename);
         let downloaded = service
@@ -1652,9 +1733,8 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|error| format!("无法确定应用数据目录：{error}"))?;
-            let deepseek =
-                DeepSeekProvider::initialize(app_data_dir.clone(), storage.info().database_path)
-                    .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let llm = LlmProvider::initialize(app_data_dir.clone(), storage.info().database_path)
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let service = ServiceClient::new(app_data_dir.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let comp_share = CompShareProvider::new(app_data_dir.clone())
@@ -1670,7 +1750,7 @@ pub fn run() {
             app.manage(job_queue);
             app.manage(tts);
             app.manage(exporter);
-            app.manage(deepseek);
+            app.manage(llm);
             app.manage(ComputeLifecycle::default());
             app.manage(service);
             app.manage(comp_share);
@@ -1708,14 +1788,15 @@ pub fn run() {
             read_source_text,
             set_source_enabled,
             delete_source,
-            get_deepseek_configuration,
-            save_deepseek_configuration,
-            clear_deepseek_api_key,
-            test_deepseek_connection,
+            get_llm_configuration,
+            save_llm_configuration,
+            clear_llm_api_key,
+            test_llm_connection,
             knowledge_point_list,
             knowledge_points_replace,
             knowledge_extract,
             storyboard_generate_from_knowledge,
+            storyboard_revise_scene,
             list_storyboard_scenes,
             upsert_storyboard_scene,
             delete_storyboard_scene,
@@ -1740,9 +1821,11 @@ pub fn run() {
             upload_service_input,
             delete_service_input,
             download_service_artifact,
+            apply_storyboard_edit,
             list_candidate_versions,
             list_enhanced_versions,
             inspect_candidate_audio,
+            open_candidate_location,
             select_candidate_version,
             download_completed_job,
             download_completed_image_job,
