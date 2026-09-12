@@ -200,3 +200,92 @@ async fn generate_image_then_video_through_desktop_service_client() {
         .expect("delete uploaded first frame");
     tunnel.stop().await.expect("stop validation tunnel");
 }
+
+#[tokio::test]
+#[ignore = "requires the configured paid GPU instance and compares H3 native ambience with H3 Chinese voiceover"]
+async fn generate_h3_native_audio_comparison() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let output_dir = PathBuf::from(required("ZHIHUA_TEST_OUTPUT_DIR"));
+    let image_path = output_dir.join("qwen-lightning-1344x768.png");
+    assert!(
+        image_path.is_file(),
+        "run the image generation validation first"
+    );
+    std::fs::create_dir_all(&output_dir).expect("create validation output directory");
+
+    let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
+    let tunnel_status = tunnel.start().await.expect("start SSH tunnel");
+    let service = ServiceClient::new(app_data_dir).expect("initialize service client");
+    service
+        .retarget(tunnel_status.local_url.expect("local tunnel URL"))
+        .expect("retarget service to validation tunnel");
+    let probe = service.probe().await.expect("probe generation service");
+    assert!(probe.comfyui_ready);
+
+    let suffix = uuid::Uuid::new_v4();
+    let cases = [
+        (
+            "ambience",
+            20260913_u64,
+            "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\nintegrated_multimodal_description: [Shot 1] 2D educational animation, preserve the storm clouds, mountains, colors, and composition from <Picture 1>. The camera slowly pushes toward the clouds. At 00:02.300, one bright lightning bolt strikes from the cloud to the ground and briefly lights the mountains. There are no people, no human voices, no dialogue, and no singing.\n\noverall_soundscape: Steady rain and low wind continue across the landscape. A sharp thunder crack occurs exactly with the lightning strike at 00:02.300, followed by a short natural rumble. No speech or human vocal sounds.\n\nnon_diegetic_music: N/A.",
+        ),
+        (
+            "chinese-voiceover",
+            20260914_u64,
+            "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\nintegrated_multimodal_description: [Shot 1] 2D educational animation, preserve the storm clouds, mountains, colors, and composition from <Picture 1>. The camera slowly pushes toward the clouds while one lightning bolt illuminates the landscape. A calm adult Chinese narrator with a clear standard Mandarin voice (S1) says in an off-screen voiceover: <d>[Chinese] 电势差足够大时，空气会被击穿，形成闪电。</d>\n\noverall_soundscape: Soft rain and distant thunder remain low beneath the off-screen narration.\n\nnon_diegetic_music: N/A.",
+        ),
+    ];
+    for (label, seed, prompt) in cases {
+        let destination = output_dir.join(format!("h3-lightning-{label}-1344x756.mp4"));
+        if destination.is_file() {
+            continue;
+        }
+        let uploaded = service
+            .upload_input(&image_path.to_string_lossy())
+            .await
+            .unwrap_or_else(|error| panic!("upload first frame for H3 {label}: {error:?}"));
+        let job = service
+            .submit_job(SubmitServiceJobInput {
+                client_request_id: format!("live-h3-audio-{label}-{suffix}"),
+                project_id: "live-audio-validation".to_owned(),
+                scene_id: format!("lightning-{label}"),
+                kind: "video_candidate".to_owned(),
+                workflow_id: "h3-i2v-turbo-v1".to_owned(),
+                parameters: json!({
+                    "prompt": prompt,
+                    "seed": seed,
+                    "firstFrameFile": uploaded.remote_file,
+                    "width": 1344,
+                    "height": 768,
+                    "visibleWidth": 1344,
+                    "visibleHeight": 756,
+                    "cropX": 0,
+                    "cropY": 6,
+                    "length": 124,
+                    "discardH3Audio": false
+                }),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("submit H3 {label} job: {error:?}"));
+        let job = wait_for_job(&service, &job.id, 12).await;
+        let artifact = job
+            .result_manifest
+            .unwrap_or_else(|| panic!("{label} result manifest"))
+            .artifacts
+            .into_iter()
+            .find(|artifact| artifact.kind == "video")
+            .unwrap_or_else(|| panic!("{label} video artifact"));
+        service
+            .download_artifact(DownloadServiceArtifactInput {
+                job_id: job.id,
+                artifact_id: artifact.artifact_id,
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("download H3 {label}: {error:?}"));
+        let _ = service.delete_input(&uploaded.input_id).await;
+    }
+    tunnel.stop().await.expect("stop validation tunnel");
+}
