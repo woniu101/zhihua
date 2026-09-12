@@ -70,6 +70,51 @@ export interface CompShareInstance {
   projectId?: string;
 }
 
+export interface CompShareCreateSpec {
+  region: string;
+  zone: string;
+  gpuType: string;
+  gpuCount: number;
+  cpu: number;
+  memoryMb: number;
+  imageId: string;
+  machineType?: string;
+  minimalCpuPlatform?: string;
+  chargeType?: string;
+  bootDiskType?: string;
+  bootDiskSizeGb?: number;
+  projectId?: string;
+}
+
+export interface CompShareCapacitySpec {
+  cpu: number;
+  memoryGb: number;
+  gpuCount: number;
+  resourceEnough: boolean;
+}
+
+export interface CompShareCreatePreflight {
+  spec: CompShareCreateSpec;
+  checkedAt: string;
+  capacityAvailable: boolean;
+  compatibleSpecs: CompShareCapacitySpec[];
+  priceDetails: unknown;
+  estimatedHourlyPrice?: number;
+}
+
+export interface ComputeOperation {
+  id: string;
+  idempotencyKey: string;
+  instanceId?: string;
+  action: "create" | "terminate";
+  status: "pending" | "succeeded" | "failed" | "unknown";
+  requestUuid?: string;
+  errorMessage?: string;
+  payload: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ManagedComputeInstance {
   instanceId: string;
   name?: string;
@@ -173,6 +218,22 @@ export const compShareRepository = {
         input: { region, zone },
       }),
       "优云智算接口仅可在桌面客户端中使用。",
+    ),
+  preflightCreate: async (spec: CompShareCreateSpec) =>
+    required(
+      await invokeNative<CompShareCreatePreflight>("preflight_compshare_create", { spec }),
+      "实例创建预检仅可在桌面客户端中使用。",
+    ),
+  createManagedInstance: async (input: {
+    idempotencyKey: string;
+    name: string;
+    spec: CompShareCreateSpec;
+    role: "elastic" | "test";
+    confirmed: boolean;
+  }) =>
+    required(
+      await invokeNative<ComputeOperation>("create_managed_compshare_instance", { input }),
+      "实例创建仅可在桌面客户端中使用。",
     ),
   managedInstances: async () =>
     required(

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
-import { CalendarClock, Calculator, Database, ExternalLink, FolderOpen, HardDrive, KeyRound, Laptop, Monitor, Moon, Palette, Power, RefreshCw, Server, ShieldCheck, Sun, Wallet, Wrench, X } from "lucide-vue-next";
+import { computed, onMounted, reactive, ref, watch } from "vue";
+import { CalendarClock, Calculator, Database, ExternalLink, FolderOpen, HardDrive, KeyRound, Laptop, Monitor, Moon, Palette, Plus, Power, RefreshCw, Server, ShieldCheck, Sun, Wallet, Wrench, X } from "lucide-vue-next";
 import {
   normalizeConnectionFailure,
   serviceRepository,
@@ -12,6 +12,8 @@ import {
   normalizeCompShareError,
   type CompShareBalance,
   type CompShareConfiguration,
+  type CompShareCreatePreflight,
+  type CompShareCreateSpec,
   type CompShareInstance,
   type ComputeReleaseEligibility,
   type ComputeKeepAlivePolicy,
@@ -41,6 +43,7 @@ const connectionInfo = ref<ServiceConnectionInfo>();
 const probe = ref<ServiceProbe>();
 const tunnelStatus = ref<TunnelStatus>({ configured: false, phase: "stopped" });
 const computeOpen = ref(false);
+const elasticCreateOpen = ref(false);
 const llmOpen = ref(false);
 const busy = ref(false);
 const connectionError = ref("");
@@ -54,6 +57,21 @@ const releaseEligibility = ref<Record<string, ComputeReleaseEligibility>>({});
 const computePolicy = ref<ComputePolicySnapshot>({ policy: "economy", idleShutdownMinutes: 3, hardLimitMinutes: 60 });
 const computeNotice = ref("");
 const computeNoticeTone = ref<"success" | "error" | "neutral">("neutral");
+const elasticCreateBusy = ref(false);
+const elasticCreateNotice = ref("");
+const elasticCreateNoticeTone = ref<"success" | "error" | "neutral">("neutral");
+const elasticPreflight = ref<CompShareCreatePreflight>();
+const elasticIdempotencyKey = ref("");
+const elasticForm = reactive({
+  name: "",
+  region: "",
+  zone: "",
+  gpuType: "",
+  cpu: 0,
+  memoryGb: 0,
+  imageId: "",
+  projectId: "",
+});
 const llmConfiguration = ref<LlmConfiguration>();
 const llmForm = reactive({ providerId: "deepseek" as LlmProviderId, baseUrl: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "" });
 const llmNotice = ref("");
@@ -188,6 +206,125 @@ function setComputeNotice(message: string, tone: "success" | "error" | "neutral"
   computeNotice.value = message;
   computeNoticeTone.value = tone;
 }
+
+const elasticTemplateAvailable = computed(() => Boolean(
+  computeInstance.value?.region
+  && computeInstance.value.zone
+  && computeInstance.value.gpuType
+  && computeInstance.value.cpu
+  && computeInstance.value.memoryMb
+  && computeInstance.value.imageId,
+));
+
+function elasticCreateSpec(): CompShareCreateSpec {
+  return {
+    region: elasticForm.region.trim(),
+    zone: elasticForm.zone.trim(),
+    gpuType: elasticForm.gpuType.trim(),
+    gpuCount: 1,
+    cpu: Math.max(1, Math.round(elasticForm.cpu)),
+    memoryMb: Math.max(1, Math.round(elasticForm.memoryGb * 1024)),
+    imageId: elasticForm.imageId.trim(),
+    chargeType: "Postpay",
+    projectId: elasticForm.projectId.trim() || undefined,
+  };
+}
+
+function openElasticCreate() {
+  const template = computeInstance.value;
+  if (!template || !elasticTemplateAvailable.value) {
+    setComputeNotice("主实例缺少地域、GPU、CPU、内存或镜像信息，当前不能生成可核验的扩容方案。", "error");
+    return;
+  }
+  Object.assign(elasticForm, {
+    name: `zhihua-elastic-${new Date().toISOString().slice(5, 16).replace(/[-T:]/g, "")}`,
+    region: template.region,
+    zone: template.zone,
+    gpuType: template.gpuType ?? "",
+    cpu: template.cpu ?? 0,
+    memoryGb: Math.round((template.memoryMb ?? 0) / 1024),
+    imageId: template.imageId ?? "",
+    projectId: template.projectId ?? "",
+  });
+  elasticPreflight.value = undefined;
+  elasticIdempotencyKey.value = crypto.randomUUID();
+  elasticCreateNotice.value = "先查询实时库存与按量报价；预检不会创建实例或产生 GPU 费用。";
+  elasticCreateNoticeTone.value = "neutral";
+  computeOpen.value = false;
+  elasticCreateOpen.value = true;
+}
+
+function closeElasticCreate() {
+  if (elasticCreateBusy.value) return;
+  elasticCreateOpen.value = false;
+  computeOpen.value = true;
+}
+
+async function preflightElasticCreate() {
+  elasticCreateBusy.value = true;
+  elasticCreateNotice.value = "正在查询实时库存和报价…";
+  elasticCreateNoticeTone.value = "neutral";
+  try {
+    elasticPreflight.value = await compShareRepository.preflightCreate(elasticCreateSpec());
+    elasticCreateNotice.value = elasticPreflight.value.capacityAvailable
+      ? "预检通过。请核对下方地域、规格、镜像和费率，再确认创建。"
+      : "当前没有完全匹配的空闲实例，未创建任何资源。";
+    elasticCreateNoticeTone.value = elasticPreflight.value.capacityAvailable ? "success" : "error";
+  } catch (error) {
+    elasticPreflight.value = undefined;
+    elasticCreateNotice.value = normalizeCompShareError(error).message;
+    elasticCreateNoticeTone.value = "error";
+  } finally {
+    elasticCreateBusy.value = false;
+  }
+}
+
+async function confirmElasticCreate() {
+  if (!elasticPreflight.value?.capacityAvailable || elasticCreateBusy.value) return;
+  elasticCreateBusy.value = true;
+  elasticCreateNotice.value = "已确认费用，正在幂等创建一台弹性实例…";
+  elasticCreateNoticeTone.value = "neutral";
+  try {
+    const operation = await compShareRepository.createManagedInstance({
+      idempotencyKey: elasticIdempotencyKey.value,
+      name: elasticForm.name.trim(),
+      spec: elasticCreateSpec(),
+      role: "elastic",
+      confirmed: true,
+    });
+    if (operation.status === "succeeded") {
+      elasticCreateNotice.value = `实例 ${operation.instanceId ?? ""} 已提交创建，并已纳入弹性实例管理。`;
+      elasticCreateNoticeTone.value = "success";
+      await refreshCompute();
+      elasticCreateOpen.value = false;
+      computeOpen.value = true;
+      setComputeNotice("弹性实例已创建。服务准备完成前不会领取生成任务。", "success");
+    } else if (operation.status === "unknown") {
+      elasticCreateNotice.value = "平台创建结果暂不确定。已停止重复提交，请返回实例中心刷新对账。";
+      elasticCreateNoticeTone.value = "neutral";
+    } else {
+      elasticCreateNotice.value = operation.errorMessage ?? "弹性实例创建失败，未再次提交。";
+      elasticCreateNoticeTone.value = "error";
+    }
+  } catch (error) {
+    elasticCreateNotice.value = normalizeCompShareError(error).message;
+    elasticCreateNoticeTone.value = "error";
+  } finally {
+    elasticCreateBusy.value = false;
+  }
+}
+
+watch(
+  () => [elasticForm.region, elasticForm.zone, elasticForm.gpuType, elasticForm.cpu, elasticForm.memoryGb, elasticForm.imageId, elasticForm.projectId],
+  () => {
+    if (elasticPreflight.value) {
+      elasticPreflight.value = undefined;
+      elasticIdempotencyKey.value = crypto.randomUUID();
+      elasticCreateNotice.value = "规格已经变化，请重新查询实时库存和报价。";
+      elasticCreateNoticeTone.value = "neutral";
+    }
+  },
+);
 
 async function refreshCompute() {
   try {
@@ -512,7 +649,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
           </template>
           <template v-else>
             <p class="compute-summary">账户已连接　·　可用余额 <b>{{ computeBalance?.amountAvailable ? `¥ ${computeBalance.amountAvailable}` : '--' }}</b></p>
-            <div class="instance-center-head"><span>共 {{ managedInstances.length }} 个实例</span><small>单击“设为主实例”后用于日常生成</small></div>
+            <div class="instance-center-head"><span>共 {{ managedInstances.length }} 个实例</span><div><small>主实例配置作为扩容模板</small><button class="mini-btn create" type="button" :disabled="busy || !elasticTemplateAvailable" @click="openElasticCreate"><Plus :size="14"/>新增弹性实例</button></div></div>
             <div class="instance-picker managed-picker">
               <article v-for="item in managedInstances" :key="item.instanceId" :class="{ selected: item.instanceId === computeConfiguration?.boundInstanceId, uncertain: item.lifecycleState === 'unknown' }">
                 <div class="instance-row-main">
@@ -528,6 +665,29 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
           <p v-if="computeNotice" class="connection-notice" :class="computeNoticeTone">{{ computeNotice }}</p>
         </div>
         <footer><span></span><span></span><button class="btn" type="button" :disabled="busy" @click="refreshCompute">刷新</button><button v-if="!computeConfigured" class="btn primary" type="button" :disabled="busy" @click="saveComputeCredentials">保存并验证</button><button v-else class="btn primary" type="button" @click="computeOpen=false">完成</button></footer>
+      </section>
+    </div>
+
+    <div v-if="elasticCreateOpen" class="connection-backdrop" role="presentation" @click.self="closeElasticCreate">
+      <section class="connection-dialog elastic-create-dialog" role="dialog" aria-modal="true" aria-labelledby="elastic-create-title">
+        <header><div><h2 id="elastic-create-title">创建弹性实例</h2><p>复用当前主实例的地域、镜像和单卡规格。预检只查询库存与报价，最终确认后才创建按量实例。</p></div><button type="button" aria-label="关闭" :disabled="elasticCreateBusy" @click="closeElasticCreate"><X :size="20"/></button></header>
+        <div class="connection-form elastic-create-form">
+          <label><span>实例名称</span><input v-model.trim="elasticForm.name" maxlength="63" autocomplete="off"/></label>
+          <div class="elastic-summary-grid">
+            <article><span>地域 / 可用区</span><b>{{ elasticForm.region }} / {{ elasticForm.zone }}</b></article>
+            <article><span>GPU</span><b>1 × RTX {{ elasticForm.gpuType }}</b></article>
+            <article><span>CPU / 内存</span><b>{{ elasticForm.cpu }} 核 / {{ elasticForm.memoryGb }} GB</b></article>
+            <article><span>计费方式</span><b>按量后付费</b></article>
+          </div>
+          <label><span>镜像 ID</span><input v-model.trim="elasticForm.imageId" autocomplete="off"/><small>弹性 worker 必须使用已经包含知画服务的兼容镜像；创建后仍会执行版本与模型清单检查。</small></label>
+          <div v-if="elasticPreflight" class="preflight-result" :class="{ unavailable: !elasticPreflight.capacityAvailable }">
+            <span>{{ elasticPreflight.capacityAvailable ? '库存匹配' : '当前无匹配库存' }}</span>
+            <b>{{ elasticPreflight.estimatedHourlyPrice == null ? '平台未返回费率' : `预计 ¥ ${elasticPreflight.estimatedHourlyPrice.toFixed(2)} / 小时` }}</b>
+            <small>查询时间 {{ new Date(elasticPreflight.checkedAt).toLocaleString('zh-CN') }}；实际费用以优云智算账单为准。</small>
+          </div>
+          <p v-if="elasticCreateNotice" class="connection-notice elastic-notice" :class="elasticCreateNoticeTone">{{ elasticCreateNotice }}</p>
+        </div>
+        <footer><span></span><span></span><button class="btn" type="button" :disabled="elasticCreateBusy" @click="closeElasticCreate">取消</button><button v-if="!elasticPreflight?.capacityAvailable" class="btn primary" type="button" :disabled="elasticCreateBusy || !elasticForm.name || !elasticForm.imageId" @click="preflightElasticCreate"><RefreshCw :size="16"/>{{ elasticCreateBusy ? '正在查询' : '查询库存与报价' }}</button><button v-else class="btn primary" type="button" :disabled="elasticCreateBusy" @click="confirmElasticCreate"><Plus :size="16"/>{{ elasticCreateBusy ? '正在创建' : '确认创建并开始计费' }}</button></footer>
       </section>
     </div>
 
@@ -560,5 +720,6 @@ export default { components: { FileTextIcon } };
 .settings-tabs button:disabled{opacity:.48;cursor:not-allowed}.connection-cards article[role="button"]{cursor:pointer;transition:.15s ease}.connection-cards article[role="button"]:hover,.connection-cards article[role="button"]:focus-visible{border-color:#8eb8f7;background:#f7faff;outline:0}.connection-backdrop{position:fixed;z-index:80;inset:30px 0 0 0;background:rgba(6,20,46,.32);display:grid;place-items:center;padding:24px}.connection-dialog{width:min(620px,calc(100vw - 80px));border:1px solid #cedbed;border-radius:13px;background:#fff;box-shadow:0 24px 70px rgba(16,45,88,.24);overflow:hidden}.connection-dialog>header{min-height:88px;padding:19px 22px;display:flex;align-items:flex-start;justify-content:space-between;border-bottom:1px solid var(--line);background:linear-gradient(135deg,#f7fbff,#fff)}.connection-dialog>header h2{font-size:22px}.connection-dialog>header p{margin-top:7px;color:#64799b;font-size:13px}.connection-dialog>header button{width:34px;height:34px;border:0;border-radius:7px;background:transparent;display:grid;place-items:center}.connection-dialog>header button:hover{background:#edf3fb}.connection-form{padding:20px 22px;display:flex;flex-direction:column;gap:16px}.connection-form label{display:grid;grid-template-columns:132px minmax(0,1fr);align-items:center;gap:8px 14px}.connection-form label>span{font-weight:700;color:#1b355f}.connection-form input,.connection-form select{height:43px;border:1px solid #cbd9ec;border-radius:8px;padding:0 12px;background:#fff;user-select:text}.connection-form input:focus,.connection-form select:focus{outline:2px solid #cfe2ff;border-color:var(--blue)}.connection-form small{grid-column:2;color:#6d809f;font-size:12px}.connection-notice{margin:2px 0 0 146px;padding:10px 12px;border-radius:7px;background:#f1f5fa;color:#52698e;font-size:13px}.connection-notice.success{background:#e8f8f1;color:#087d51}.connection-notice.error{background:#fff0ee;color:#b33b35}.connection-dialog>footer{min-height:72px;padding:13px 22px;border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:10px;background:#fbfdff}.connection-dialog button:disabled,.environment button:disabled{opacity:.55;cursor:not-allowed}.compute-summary{margin:0;padding:13px 15px;border-radius:8px;background:#eef6ff;color:#29486f}.compute-summary b{color:var(--blue);font-size:20px}.instance-picker{display:flex;flex-direction:column;gap:9px;max-height:280px;overflow:auto}.instance-picker>button{min-height:68px;padding:10px 14px;border:1px solid #d7e2ef;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:space-between;text-align:left;color:#17345f}.instance-picker>button.selected{border-color:var(--blue);background:#f1f7ff;box-shadow:0 0 0 1px var(--blue) inset}.instance-picker>button span{display:flex;flex-direction:column;gap:6px}.instance-picker>button small{color:#7183a0}.instance-picker>button strong{color:#315d9b;font-size:13px}
 .settings-tabs-spacer{flex:1}.policy-badge{padding:5px 9px;border-radius:14px;background:#e8f8f1;color:#087d51;font-size:12px;font-weight:700}.policy-badge.neutral{background:var(--surface-soft);color:var(--muted)}
 .policy-options{padding:0 14px;display:grid;gap:7px}.policy-options>button{min-height:55px;padding:7px 30px 7px 10px;border:1px solid #dbe4f0;border-radius:8px;background:#f9fbfe;text-align:left;position:relative;color:var(--text)}.policy-options>button.selected{border-color:var(--blue);background:#edf5ff;box-shadow:0 0 0 1px rgba(15,105,255,.08)}.policy-options>button>span{display:flex;align-items:center;justify-content:space-between;gap:8px}.policy-options b{font-size:13px}.policy-options small{color:var(--blue);font-size:10px;font-weight:700}.policy-options p{margin-top:3px;color:#657a9a;font-size:10px;line-height:1.3}.policy-options i{position:absolute;right:10px;top:19px;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:white;font-style:normal}.policy-guard{height:48px;margin:7px 14px 0;padding-top:7px;border-top:1px solid #e1e8f1;display:grid;grid-template-columns:27px minmax(0,1fr) 72px;align-items:center;gap:5px}.policy-guard>svg{color:#16355f}.policy-guard>span{min-width:0;display:flex;flex-direction:column}.policy-guard b{font-size:11px}.policy-guard small{color:#657a9a;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.policy-guard button{height:30px;border:1px solid #cfdbea;border-radius:6px;background:#fff;color:#31537f;font-size:11px}
-.compute-dialog{width:min(790px,calc(100vw - 80px))}.compute-dialog .connection-form{max-height:min(610px,calc(100vh - 250px));overflow:auto}.instance-center-head{display:flex;align-items:center;justify-content:space-between;color:#23446f;font-weight:700}.instance-center-head small{color:#7183a0;font-weight:400}.managed-picker{max-height:390px}.managed-picker>article{padding:13px 14px;border:1px solid #d7e2ef;border-radius:9px;background:#fff}.managed-picker>article.selected{border-color:var(--blue);background:#f4f8ff;box-shadow:0 0 0 1px var(--blue) inset}.managed-picker>article.uncertain{border-style:dashed;background:#fafbfc}.instance-row-main{display:grid;grid-template-columns:72px minmax(0,1fr) auto;align-items:center;gap:12px}.instance-row-main>div{min-width:0}.instance-row-main b,.instance-row-main small{display:block}.instance-row-main b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#17345f}.instance-row-main small{margin-top:5px;color:#7183a0;font-size:12px}.instance-row-main strong{color:#315d9b;font-size:13px}.instance-role{padding:5px 7px;border-radius:13px;background:#edf1f6;color:#5e708d;text-align:center;font-size:11px;font-weight:700}.instance-role.managed{background:#e9f8f1;color:#087d51}.instance-row-foot{margin-top:10px;padding-top:9px;border-top:1px solid #e6edf5;display:flex;align-items:center;gap:12px;color:#7183a0;font-size:11px}.instance-row-foot>div{margin-left:auto;display:flex;align-items:center;gap:8px}.selected-label{color:var(--blue);font-weight:700}.mini-btn{height:29px;padding:0 10px;border:1px solid #b9cce5;border-radius:6px;background:#fff;color:#285184;font-size:11px}.mini-btn.danger{border-color:#edb4ad;color:#b83830}.danger-text{color:#bd463d}.empty-instances{padding:24px 18px;border:1px dashed #cbd9eb;border-radius:9px;color:#6a7f9f;line-height:1.6;text-align:center}
+.compute-dialog{width:min(790px,calc(100vw - 80px))}.compute-dialog .connection-form{max-height:min(610px,calc(100vh - 250px));overflow:auto}.instance-center-head{display:flex;align-items:center;justify-content:space-between;color:#23446f;font-weight:700}.instance-center-head>div{display:flex;align-items:center;gap:9px}.instance-center-head small{color:#7183a0;font-weight:400}.instance-center-head .create{display:flex;align-items:center;gap:4px;border-color:#8db7f2;color:var(--blue)}.managed-picker{max-height:390px}.managed-picker>article{padding:13px 14px;border:1px solid #d7e2ef;border-radius:9px;background:#fff}.managed-picker>article.selected{border-color:var(--blue);background:#f4f8ff;box-shadow:0 0 0 1px var(--blue) inset}.managed-picker>article.uncertain{border-style:dashed;background:#fafbfc}.instance-row-main{display:grid;grid-template-columns:72px minmax(0,1fr) auto;align-items:center;gap:12px}.instance-row-main>div{min-width:0}.instance-row-main b,.instance-row-main small{display:block}.instance-row-main b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#17345f}.instance-row-main small{margin-top:5px;color:#7183a0;font-size:12px}.instance-row-main strong{color:#315d9b;font-size:13px}.instance-role{padding:5px 7px;border-radius:13px;background:#edf1f6;color:#5e708d;text-align:center;font-size:11px;font-weight:700}.instance-role.managed{background:#e9f8f1;color:#087d51}.instance-row-foot{margin-top:10px;padding-top:9px;border-top:1px solid #e6edf5;display:flex;align-items:center;gap:12px;color:#7183a0;font-size:11px}.instance-row-foot>div{margin-left:auto;display:flex;align-items:center;gap:8px}.selected-label{color:var(--blue);font-weight:700}.mini-btn{height:29px;padding:0 10px;border:1px solid #b9cce5;border-radius:6px;background:#fff;color:#285184;font-size:11px}.mini-btn.danger{border-color:#edb4ad;color:#b83830}.danger-text{color:#bd463d}.empty-instances{padding:24px 18px;border:1px dashed #cbd9eb;border-radius:9px;color:#6a7f9f;line-height:1.6;text-align:center}
+.elastic-create-dialog{width:min(720px,calc(100vw - 80px))}.elastic-create-form{gap:13px}.elastic-summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.elastic-summary-grid article{min-height:68px;padding:11px 13px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft)}.elastic-summary-grid span,.elastic-summary-grid b{display:block}.elastic-summary-grid span{color:var(--muted);font-size:11px}.elastic-summary-grid b{margin-top:7px;font-size:15px}.preflight-result{padding:13px 15px;border:1px solid #a8dec8;border-radius:8px;background:#effaf5;display:grid;grid-template-columns:1fr auto;gap:5px 12px;color:#087d51}.preflight-result.unavailable{border-color:#f2b5aa;background:#fff3f0;color:#b13c32}.preflight-result span{font-size:12px;font-weight:700}.preflight-result b{font-size:16px}.preflight-result small{grid-column:1/-1;color:var(--muted);font-size:11px}.elastic-notice{margin-left:0}.elastic-create-dialog footer .btn{display:flex;align-items:center;gap:6px}
 </style>
