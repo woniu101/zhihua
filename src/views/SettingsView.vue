@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
-import { CalendarClock, Calculator, Database, ExternalLink, FolderOpen, HardDrive, KeyRound, Laptop, Monitor, Moon, Palette, Power, RefreshCw, Server, ShieldCheck, Sun, Timer, Wallet, Wrench, X } from "lucide-vue-next";
+import { CalendarClock, Calculator, Database, ExternalLink, FolderOpen, HardDrive, KeyRound, Laptop, Monitor, Moon, Palette, Power, RefreshCw, Server, ShieldCheck, Sun, Wallet, Wrench, X } from "lucide-vue-next";
 import {
   normalizeConnectionFailure,
   serviceRepository,
@@ -13,6 +13,8 @@ import {
   type CompShareBalance,
   type CompShareConfiguration,
   type CompShareInstance,
+  type ComputeKeepAlivePolicy,
+  type ComputePolicySnapshot,
 } from "../services/compShareRepository";
 import {
   sshTunnelRepository,
@@ -45,6 +47,7 @@ const computeConfiguration = ref<CompShareConfiguration>();
 const computeBalance = ref<CompShareBalance>();
 const computeInstance = ref<CompShareInstance>();
 const computeInstances = ref<CompShareInstance[]>([]);
+const computePolicy = ref<ComputePolicySnapshot>({ policy: "economy", idleShutdownMinutes: 3, hardLimitMinutes: 60 });
 const computeNotice = ref("");
 const computeNoticeTone = ref<"success" | "error" | "neutral">("neutral");
 const llmConfiguration = ref<LlmConfiguration>();
@@ -54,6 +57,11 @@ const llmNoticeTone = ref<"success" | "error" | "neutral">("neutral");
 const activeSection = ref<"compute" | "appearance">("compute");
 const storageInfo = ref<StorageInfo>();
 const storageNotice = ref("");
+const computePolicyOptions: Array<{ value: ComputeKeepAlivePolicy; label: string; description: string; limit: string }> = [
+  { value: "economy", label: "省费用", description: "任务落盘后空闲 3 分钟关 GPU；关闭客户端且队列为空时立即关 GPU。", limit: "上限 1 小时" },
+  { value: "availability", label: "任务优先", description: "空闲 15 分钟再关 GPU，适合连续制作多个镜头，减少频繁抢卡。", limit: "上限 3 小时" },
+  { value: "continuous", label: "持续 GPU", description: "不因空闲或关闭客户端而关 GPU，适合库存紧张或连续工作。", limit: "保险上限 12 小时" },
+];
 
 const themeOptions: Array<{
   value: ThemePreference;
@@ -92,6 +100,10 @@ const stopSchedulerLabel = computed(() => {
     hour: "2-digit",
     minute: "2-digit",
   })} 自动关机`;
+});
+const policyGuardLabel = computed(() => {
+  if (computeInstance.value?.runningMode !== "gpu") return "启动 GPU 时生效";
+  return computeInstance.value.stopSchedulerTime ? "平台兜底已启用" : "保障待设置";
 });
 
 const connected = computed(
@@ -165,6 +177,7 @@ function setComputeNotice(message: string, tone: "success" | "error" | "neutral"
 
 async function refreshCompute() {
   try {
+    computePolicy.value = await compShareRepository.computePolicy();
     computeConfiguration.value = await compShareRepository.configuration();
     if (!computeConfiguration.value.credentialsStored) return;
     const [balance, instances] = await Promise.all([
@@ -182,6 +195,20 @@ async function refreshCompute() {
     }
   } catch (error) {
     setComputeNotice(normalizeCompShareError(error).message, "error");
+  }
+}
+
+async function changeComputePolicy(policy: ComputeKeepAlivePolicy) {
+  busy.value = true;
+  try {
+    computePolicy.value = await compShareRepository.setComputePolicy(policy);
+    await refreshCompute();
+    const selected = computePolicyOptions.find((item) => item.value === policy)!;
+    setComputeNotice(`已切换为“${selected.label}”，${selected.limit}的平台关机保障已生效。`, "success");
+  } catch (error) {
+    setComputeNotice(normalizeCompShareError(error).message, "error");
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -246,18 +273,12 @@ async function toggleStopDeadline() {
   if (!computeInstance.value || computeInstance.value.state !== "running") return;
   busy.value = true;
   try {
-    if (computeInstance.value.stopSchedulerTime) {
-      const result = await compShareRepository.clearStopDeadline();
-      computeInstance.value = result.instance;
-      setComputeNotice("已取消平台定时关机。", "success");
-    } else {
-      const result = await compShareRepository.setStopDeadline(
-        Math.floor(Date.now() / 1000) + 60 * 60,
-        computeConfiguration.value?.projectId,
-      );
-      computeInstance.value = result.instance;
-      setComputeNotice("已设置 60 分钟平台定时关机保障。", "success");
-    }
+    const result = await compShareRepository.setStopDeadline(
+      Math.floor(Date.now() / 1000) + computePolicy.value.hardLimitMinutes * 60,
+      computeConfiguration.value?.projectId,
+    );
+    computeInstance.value = result.instance;
+    setComputeNotice(`已刷新 ${computePolicy.value.hardLimitMinutes} 分钟平台定时关机保障。`, "success");
   } catch (error) {
     setComputeNotice(normalizeCompShareError(error).message, "error");
   } finally {
@@ -371,7 +392,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
       <section class="panel instance"><div class="panel-head"><h2>绑定实例</h2><span :class="computeInstance?.state === 'running' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: computeInstance?.state !== 'running' }"></span>{{ computeModeLabel }}</span></div><div class="instance-main"><div class="server-art">▤</div><div><h2>⌖ {{ computeInstance?.name ?? '尚未绑定实例' }}</h2><p>{{ computeInstance?.gpuType ? `RTX ${computeInstance.gpuType}` : '等待实例信息' }}</p><span class="muted"><span class="dot gray"></span>{{ computeInstance ? `${computeInstance.cpu ?? '--'} 核 · ${computeInstance.memoryMb ? Math.round(computeInstance.memoryMb / 1024) : '--'} GB` : '配置账户后选择实例' }}</span></div><span class="muted"><span class="dot gray"></span>{{ probe?.comfyuiReady ? '可生成' : '生成服务待启动' }}</span></div><div class="instance-metrics"><div><span>当前模式</span><b>{{ computeModeLabel }}</b></div><div><span>GPU 规格</span><b>{{ computeInstance?.gpuType ? `RTX ${computeInstance.gpuType}` : '--' }}</b></div><div><span>区域/可用区</span><b>{{ computeInstance?.zone ?? '--' }}</b></div></div><div class="instance-actions"><button class="btn primary" type="button" :disabled="busy || computeInstance?.state !== 'stopped'" @click="changeComputeMode('gpu')"><Power :size="18"/>启动 GPU</button><button class="btn" type="button" :disabled="busy || !computeInstance || (computeInstance.state !== 'stopped' && computeInstance.state !== 'running')" @click="computeInstance?.state === 'running' ? changeComputeMode('stop') : changeComputeMode('noGpu')"><Wrench :size="18"/>{{ computeInstance?.state === 'running' ? '关机' : '无卡启动' }}</button><button class="btn" type="button" @click="computeOpen=true"><ExternalLink :size="17"/>选择实例</button></div></section>
 
-      <section class="panel shutdown"><div class="panel-title"><h2>自动关机保障</h2><span class="policy-badge">已启用</span></div><div class="setting-row"><Timer :size="25"/><div><b>空闲 3 分钟后关机</b><span>任务完成并下载到本机后开始倒计时；新任务会取消倒计时。</span></div><strong>固定策略</strong></div><div class="setting-row"><ClockIcon/><div><b>本次 GPU 运行上限</b><span>达到 60 分钟后停止，避免异常任务持续计费。</span></div><strong>60 分钟</strong></div><div class="setting-row"><CalendarClock :size="24"/><div><b>平台定时关机</b><span>{{ stopSchedulerLabel }}</span></div><button type="button" :disabled="busy || computeInstance?.state !== 'running'" @click="toggleStopDeadline">{{ computeInstance?.stopSchedulerTime ? '取消' : '设置 60 分钟' }}</button></div></section>
+      <section class="panel shutdown"><div class="panel-title"><h2>GPU 保持策略</h2><span class="policy-badge" :class="{ neutral: computeInstance?.runningMode !== 'gpu' || !computeInstance?.stopSchedulerTime }">{{ policyGuardLabel }}</span></div><div class="policy-options"><button v-for="option in computePolicyOptions" :key="option.value" type="button" :class="{ selected: computePolicy.policy === option.value }" :disabled="busy" @click="changeComputePolicy(option.value)"><span><b>{{ option.label }}</b><small>{{ option.limit }}</small></span><p>{{ option.description }}</p><i>{{ computePolicy.policy === option.value ? '✓' : '' }}</i></button></div><div class="policy-guard"><CalendarClock :size="21"/><span><b>平台硬保护</b><small>{{ stopSchedulerLabel }}</small></span><button type="button" :disabled="busy || computeInstance?.state !== 'running' || computeInstance?.runningMode !== 'gpu'" @click="toggleStopDeadline">刷新保障</button></div></section>
 
       <section class="panel environment"><div class="panel-title"><h2>环境检查</h2><button class="btn link" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="15"/>连接并检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="24"/><b>远端磁盘</b><span>等待优云智算实例接口</span><div class="progress"><i style="width:0"></i></div><strong>未知</strong></div></section>
 
@@ -443,8 +464,8 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 </template>
 
 <script lang="ts">
-import { Clock3 as ClockIcon, FileText as FileTextIcon } from "lucide-vue-next";
-export default { components: { ClockIcon, FileTextIcon } };
+import { FileText as FileTextIcon } from "lucide-vue-next";
+export default { components: { FileTextIcon } };
 </script>
 
 <style scoped>
@@ -453,4 +474,5 @@ export default { components: { ClockIcon, FileTextIcon } };
 .appearance-grid{min-height:0;padding-top:14px;display:grid;grid-template-columns:minmax(640px,1.45fr) minmax(440px,1fr);grid-template-rows:minmax(0,1fr) 92px;gap:13px}.theme-panel,.local-storage-panel{overflow:hidden}.theme-panel>.panel-head,.local-storage-panel>.panel-head{min-height:74px}.theme-panel>.panel-head>div p,.local-storage-panel>.panel-head>div p{margin-top:5px;color:var(--muted);font-size:12px}.theme-current{display:flex;align-items:center;gap:7px;color:var(--blue);font-size:13px;font-weight:700}.theme-options{padding:18px;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.theme-options>button{min-height:96px;padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--surface);display:grid;grid-template-columns:47px 1fr 20px;align-items:center;gap:10px;text-align:left}.theme-options>button:hover{border-color:#94baf1}.theme-options>button.selected{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue) inset;background:var(--blue-soft)}.theme-icon{width:44px;height:44px;border-radius:10px;display:grid;place-items:center;color:var(--blue);background:var(--blue-soft)}.theme-options b,.theme-options small{display:block}.theme-options b{font-size:17px}.theme-options small{margin-top:6px;color:var(--muted);font-size:12px;line-height:1.4}.theme-options i{font-style:normal;color:var(--blue);font-weight:800}.theme-preview{height:calc(100% - 206px);min-height:210px;margin:0 18px 18px;border:1px solid var(--line);border-radius:12px;overflow:hidden;display:grid;grid-template-columns:112px 1fr;box-shadow:0 12px 30px rgba(25,62,111,.12)}.theme-preview.preview-light{background:#f4f8fe}.theme-preview.preview-dark{background:#101a2b;border-color:#30415a}.preview-nav{padding:18px 14px;display:flex;flex-direction:column;gap:12px;background:rgba(255,255,255,.9);border-right:1px solid #dce6f3}.preview-dark .preview-nav{background:#111d2f;border-color:#2b3c55}.preview-nav span{height:28px;border-radius:7px;background:var(--blue)}.preview-nav i{height:15px;border-radius:5px;background:#dfe8f5}.preview-dark .preview-nav i{background:#293951}.preview-main{padding:18px}.preview-main header{height:32px;width:45%;margin-bottom:15px;border-radius:6px;background:#d9e5f5}.preview-dark .preview-main header{background:#293b56}.preview-main section{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.preview-main article{height:115px;border:1px solid #d8e3f1;border-radius:9px;background:#fff}.preview-dark .preview-main article{border-color:#30415a;background:#18263a}.local-storage-panel{padding-bottom:18px}.local-storage-panel>.panel-head svg{color:var(--blue)}.storage-path-card{min-height:91px;margin:14px 18px 0;padding:13px;border:1px solid var(--line);border-radius:9px;display:grid;grid-template-columns:46px minmax(0,1fr);align-items:center;gap:12px;background:var(--surface-soft)}.storage-path-card>span{width:43px;height:43px;border-radius:9px;display:grid;place-items:center;color:var(--blue);background:var(--blue-soft)}.storage-path-card b,.storage-path-card code{display:block}.storage-path-card code{margin-top:7px;color:var(--muted);font:12px/1.4 Consolas,monospace;user-select:text;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.storage-meta{height:50px;margin:14px 18px 0;padding:0 14px;border:1px solid var(--line);border-radius:8px;display:flex;align-items:center;justify-content:space-between}.storage-meta span{color:var(--muted)}.storage-notice{margin:10px 18px;color:#c5483e;font-size:12px}.open-storage{width:calc(100% - 36px);height:48px;margin:14px 18px 0}.appearance-note{grid-column:1/3;display:flex;align-items:center;gap:15px;padding:0 22px}.appearance-note>svg{color:var(--blue)}.appearance-note p{margin-top:5px;color:var(--muted);font-size:13px}@media(max-width:1380px){.appearance-grid{grid-template-columns:1.35fr 1fr}.theme-options{padding:13px}.theme-options>button{padding:10px;grid-template-columns:40px 1fr 16px}.theme-icon{width:38px;height:38px}.theme-preview{height:calc(100% - 190px);margin:0 13px 13px}.storage-path-card{margin-left:13px;margin-right:13px}.open-storage{width:calc(100% - 26px);margin-left:13px;margin-right:13px}}
 .settings-tabs button:disabled{opacity:.48;cursor:not-allowed}.connection-cards article[role="button"]{cursor:pointer;transition:.15s ease}.connection-cards article[role="button"]:hover,.connection-cards article[role="button"]:focus-visible{border-color:#8eb8f7;background:#f7faff;outline:0}.connection-backdrop{position:fixed;z-index:80;inset:30px 0 0 0;background:rgba(6,20,46,.32);display:grid;place-items:center;padding:24px}.connection-dialog{width:min(620px,calc(100vw - 80px));border:1px solid #cedbed;border-radius:13px;background:#fff;box-shadow:0 24px 70px rgba(16,45,88,.24);overflow:hidden}.connection-dialog>header{min-height:88px;padding:19px 22px;display:flex;align-items:flex-start;justify-content:space-between;border-bottom:1px solid var(--line);background:linear-gradient(135deg,#f7fbff,#fff)}.connection-dialog>header h2{font-size:22px}.connection-dialog>header p{margin-top:7px;color:#64799b;font-size:13px}.connection-dialog>header button{width:34px;height:34px;border:0;border-radius:7px;background:transparent;display:grid;place-items:center}.connection-dialog>header button:hover{background:#edf3fb}.connection-form{padding:20px 22px;display:flex;flex-direction:column;gap:16px}.connection-form label{display:grid;grid-template-columns:132px minmax(0,1fr);align-items:center;gap:8px 14px}.connection-form label>span{font-weight:700;color:#1b355f}.connection-form input,.connection-form select{height:43px;border:1px solid #cbd9ec;border-radius:8px;padding:0 12px;background:#fff;user-select:text}.connection-form input:focus,.connection-form select:focus{outline:2px solid #cfe2ff;border-color:var(--blue)}.connection-form small{grid-column:2;color:#6d809f;font-size:12px}.connection-notice{margin:2px 0 0 146px;padding:10px 12px;border-radius:7px;background:#f1f5fa;color:#52698e;font-size:13px}.connection-notice.success{background:#e8f8f1;color:#087d51}.connection-notice.error{background:#fff0ee;color:#b33b35}.connection-dialog>footer{min-height:72px;padding:13px 22px;border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:10px;background:#fbfdff}.connection-dialog button:disabled,.environment button:disabled{opacity:.55;cursor:not-allowed}.compute-summary{margin:0;padding:13px 15px;border-radius:8px;background:#eef6ff;color:#29486f}.compute-summary b{color:var(--blue);font-size:20px}.instance-picker{display:flex;flex-direction:column;gap:9px;max-height:280px;overflow:auto}.instance-picker>button{min-height:68px;padding:10px 14px;border:1px solid #d7e2ef;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:space-between;text-align:left;color:#17345f}.instance-picker>button.selected{border-color:var(--blue);background:#f1f7ff;box-shadow:0 0 0 1px var(--blue) inset}.instance-picker>button span{display:flex;flex-direction:column;gap:6px}.instance-picker>button small{color:#7183a0}.instance-picker>button strong{color:#315d9b;font-size:13px}
 .settings-tabs-spacer{flex:1}.policy-badge{padding:5px 9px;border-radius:14px;background:#e8f8f1;color:#087d51;font-size:12px;font-weight:700}.policy-badge.neutral{background:var(--surface-soft);color:var(--muted)}
+.policy-options{padding:0 14px;display:grid;gap:7px}.policy-options>button{min-height:55px;padding:7px 30px 7px 10px;border:1px solid #dbe4f0;border-radius:8px;background:#f9fbfe;text-align:left;position:relative;color:var(--text)}.policy-options>button.selected{border-color:var(--blue);background:#edf5ff;box-shadow:0 0 0 1px rgba(15,105,255,.08)}.policy-options>button>span{display:flex;align-items:center;justify-content:space-between;gap:8px}.policy-options b{font-size:13px}.policy-options small{color:var(--blue);font-size:10px;font-weight:700}.policy-options p{margin-top:3px;color:#657a9a;font-size:10px;line-height:1.3}.policy-options i{position:absolute;right:10px;top:19px;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:white;font-style:normal}.policy-guard{height:48px;margin:7px 14px 0;padding-top:7px;border-top:1px solid #e1e8f1;display:grid;grid-template-columns:27px minmax(0,1fr) 72px;align-items:center;gap:5px}.policy-guard>svg{color:#16355f}.policy-guard>span{min-width:0;display:flex;flex-direction:column}.policy-guard b{font-size:11px}.policy-guard small{color:#657a9a;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.policy-guard button{height:30px;border:1px solid #cfdbea;border-radius:6px;background:#fff;color:#31537f;font-size:11px}
 </style>

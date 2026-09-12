@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import {
   FileText,
@@ -13,7 +13,7 @@ import {
   Upload,
   X,
 } from "lucide-vue-next";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import TaskCenter from "./components/TaskCenter.vue";
 
@@ -21,10 +21,37 @@ const route = useRoute();
 const appWindow = isTauri() ? getCurrentWindow() : null;
 const isSettings = computed(() => route.path === "/settings");
 const helpOpen = ref(false);
+const closing = ref(false);
+let unlistenClose: (() => void) | undefined;
 
 const minimizeWindow = () => appWindow?.minimize();
 const toggleMaximizeWindow = () => appWindow?.toggleMaximize();
 const closeWindow = () => appWindow?.close();
+
+onMounted(async () => {
+  if (!appWindow) return;
+  unlistenClose = await appWindow.onCloseRequested(async (event) => {
+    if (closing.value) return;
+    event.preventDefault();
+    closing.value = true;
+    try {
+      await Promise.race([
+        invoke("prepare_application_exit"),
+        new Promise((_, reject) => window.setTimeout(() => reject(new Error("退出保护检查超时")), 8_000)),
+      ]);
+    } catch (error) {
+      console.info("[知画] 退出保护由平台定时关机继续接管。", error);
+      const leaveAnyway = window.confirm("暂时无法确认 GPU 已关闭或平台定时关机已生效。继续退出可能产生额外费用。\n\n仍要退出知画吗？");
+      if (!leaveAnyway) {
+        closing.value = false;
+        return;
+      }
+    }
+    await appWindow.destroy();
+  });
+});
+
+onBeforeUnmount(() => unlistenClose?.());
 
 const nav = [
   { path: "/projects", label: "项目", icon: FolderKanban },

@@ -58,9 +58,10 @@ use source::{
 use ssh_tunnel::{SaveTunnelConfigurationInput, SshTunnelManager, TunnelError, TunnelStatus};
 use std::{
     fs,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::Duration,
 };
@@ -114,12 +115,57 @@ struct SelectCandidateVersionInput {
     version_id: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum ComputeKeepAlivePolicy {
+    Economy,
+    Availability,
+    Continuous,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComputePolicySnapshot {
+    policy: ComputeKeepAlivePolicy,
+    idle_shutdown_minutes: Option<u64>,
+    hard_limit_minutes: u64,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredComputePolicy {
+    policy: ComputeKeepAlivePolicy,
+}
+
+#[derive(Clone)]
 struct ComputeLifecycle {
     revision: Arc<AtomicU64>,
+    policy: Arc<RwLock<ComputeKeepAlivePolicy>>,
+    policy_path: Arc<PathBuf>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicationExitProtection {
+    active_remote_tasks: u64,
+    action: String,
+    detail: String,
 }
 
 impl ComputeLifecycle {
+    fn load(policy_path: PathBuf) -> Self {
+        let policy = fs::read(&policy_path)
+            .ok()
+            .and_then(|content| serde_json::from_slice::<StoredComputePolicy>(&content).ok())
+            .map(|stored| stored.policy)
+            .unwrap_or(ComputeKeepAlivePolicy::Economy);
+        Self {
+            revision: Arc::new(AtomicU64::new(0)),
+            policy: Arc::new(RwLock::new(policy)),
+            policy_path: Arc::new(policy_path),
+        }
+    }
+
     fn invalidate_idle_shutdown(&self) -> u64 {
         self.revision.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -127,6 +173,80 @@ impl ComputeLifecycle {
     fn is_current(&self, revision: u64) -> bool {
         self.revision.load(Ordering::SeqCst) == revision
     }
+
+    fn policy(&self) -> ComputeKeepAlivePolicy {
+        *self.policy.read().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn snapshot(&self) -> ComputePolicySnapshot {
+        let policy = self.policy();
+        ComputePolicySnapshot {
+            policy,
+            idle_shutdown_minutes: match policy {
+                ComputeKeepAlivePolicy::Economy => Some(3),
+                ComputeKeepAlivePolicy::Availability => Some(15),
+                ComputeKeepAlivePolicy::Continuous => None,
+            },
+            hard_limit_minutes: match policy {
+                ComputeKeepAlivePolicy::Economy => 60,
+                ComputeKeepAlivePolicy::Availability => 180,
+                ComputeKeepAlivePolicy::Continuous => 720,
+            },
+        }
+    }
+
+    fn set_policy(&self, policy: ComputeKeepAlivePolicy) -> Result<ComputePolicySnapshot, String> {
+        if let Some(parent) = self.policy_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("无法创建算力策略目录：{error}"))?;
+        }
+        let content = serde_json::to_vec_pretty(&StoredComputePolicy { policy })
+            .map_err(|error| format!("无法保存算力策略：{error}"))?;
+        fs::write(self.policy_path.as_ref(), content)
+            .map_err(|error| format!("无法写入算力策略：{error}"))?;
+        *self.policy.write().unwrap_or_else(|error| error.into_inner()) = policy;
+        self.invalidate_idle_shutdown();
+        Ok(self.snapshot())
+    }
+}
+
+#[tauri::command]
+fn get_compute_policy(lifecycle: State<'_, ComputeLifecycle>) -> ComputePolicySnapshot {
+    lifecycle.snapshot()
+}
+
+#[tauri::command]
+async fn set_compute_policy(
+    app: AppHandle,
+    lifecycle: State<'_, ComputeLifecycle>,
+    provider: State<'_, CompShareProvider>,
+    policy: ComputeKeepAlivePolicy,
+) -> Result<ComputePolicySnapshot, String> {
+    let previous = lifecycle.policy();
+    let snapshot = lifecycle.set_policy(policy)?;
+    match provider.bound_instance().await {
+        Ok(instance)
+            if instance.state == CompSharePowerState::Running
+                && instance.running_mode == CompShareRunningMode::Gpu =>
+        {
+            if let Err(error) = provider
+                .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+                    stop_time: chrono::Utc::now().timestamp()
+                        + (snapshot.hard_limit_minutes as i64) * 60,
+                    project_id: instance.project_id,
+                })
+                .await
+            {
+                let _ = lifecycle.set_policy(previous);
+                return Err(format!(
+                    "算力策略未切换：无法同步更新平台关机保障（{}）",
+                    error.message
+                ));
+            }
+        }
+        _ => {}
+    }
+    restart_idle_gpu_shutdown(&app, &lifecycle);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -191,9 +311,49 @@ async fn get_bound_compshare_instance(
 #[tauri::command]
 async fn start_compshare_instance(
     provider: State<'_, CompShareProvider>,
+    lifecycle: State<'_, ComputeLifecycle>,
     mode: CompShareStartMode,
-) -> Result<CompShareActionResult, CompShareError> {
-    provider.start_instance(mode).await
+) -> Result<CompShareActionResult, String> {
+    let initial = provider
+        .start_instance(mode)
+        .await
+        .map_err(|error| error.message)?;
+    if mode != CompShareStartMode::Gpu {
+        return Ok(initial);
+    }
+    let hard_limit_minutes = lifecycle.snapshot().hard_limit_minutes;
+    if let Err(error) = provider
+        .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+            stop_time: chrono::Utc::now().timestamp() + (hard_limit_minutes as i64) * 60,
+            project_id: initial.instance.project_id.clone(),
+        })
+        .await
+    {
+        let _ = wait_for_instance_state(
+            &provider,
+            CompSharePowerState::Running,
+            Some(CompShareRunningMode::Gpu),
+            Duration::from_secs(180),
+        )
+        .await;
+        let _ = provider.stop_instance().await;
+        return Err(format!(
+            "GPU 已启动，但无法设置 {hard_limit_minutes} 分钟平台关机保障，已请求关机：{}",
+            error.message
+        ));
+    }
+    let instance = wait_for_instance_state(
+        &provider,
+        CompSharePowerState::Running,
+        Some(CompShareRunningMode::Gpu),
+        Duration::from_secs(180),
+    )
+    .await?;
+    Ok(CompShareActionResult {
+        request_sent: initial.request_sent,
+        requested_mode: initial.requested_mode,
+        instance,
+    })
 }
 
 #[tauri::command]
@@ -201,6 +361,106 @@ async fn stop_compshare_instance(
     provider: State<'_, CompShareProvider>,
 ) -> Result<CompShareActionResult, CompShareError> {
     provider.stop_instance().await
+}
+
+#[tauri::command]
+async fn prepare_application_exit(
+    provider: State<'_, CompShareProvider>,
+    service: State<'_, ServiceClient>,
+    lifecycle: State<'_, ComputeLifecycle>,
+) -> Result<ApplicationExitProtection, String> {
+    lifecycle.invalidate_idle_shutdown();
+    let keep_alive_policy = lifecycle.policy();
+
+    let instance = match provider.bound_instance().await {
+        Ok(instance) => instance,
+        Err(error) => {
+            return Ok(ApplicationExitProtection {
+                active_remote_tasks: 0,
+                action: "no-bound-instance".to_owned(),
+                detail: format!("没有可处理的运行实例：{}", error.message),
+            });
+        }
+    };
+    if instance.state != CompSharePowerState::Running
+        || instance.running_mode != CompShareRunningMode::Gpu
+    {
+        return Ok(ApplicationExitProtection {
+            active_remote_tasks: 0,
+            action: "no-gpu-cost".to_owned(),
+            detail: "当前没有运行中的 GPU，无需额外处理。".to_owned(),
+        });
+    }
+
+    if keep_alive_policy == ComputeKeepAlivePolicy::Continuous {
+        if instance.stop_scheduler_time.is_none() {
+            let snapshot = lifecycle.snapshot();
+            provider
+                .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+                    stop_time: chrono::Utc::now().timestamp()
+                        + (snapshot.hard_limit_minutes as i64) * 60,
+                    project_id: instance.project_id.clone(),
+                })
+                .await
+                .map_err(|error| format!("持续 GPU 尚未获得平台关机保障：{}", error.message))?;
+        }
+        return Ok(ApplicationExitProtection {
+            active_remote_tasks: 0,
+            action: "continuous-gpu".to_owned(),
+            detail: "持续 GPU 模式已启用；客户端退出后保持 GPU，并由 12 小时平台硬上限兜底。"
+                .to_owned(),
+        });
+    }
+
+    // The service queue is authoritative. Local jobs may be stale after a tunnel
+    // interruption, so an unreachable service must keep the platform watchdog.
+    let probe = match service.probe().await {
+        Ok(probe) => probe,
+        Err(error) => {
+            return Ok(ApplicationExitProtection {
+                active_remote_tasks: 0,
+                action: "platform-watchdog".to_owned(),
+                detail: format!(
+                    "无法确认远端队列（{}）；保留优云智算平台定时关机，避免误停仍在执行的任务。",
+                    error.message
+                ),
+            });
+        }
+    };
+    let active_remote_tasks = probe.queue_active.saturating_add(probe.queue_queued);
+    if active_remote_tasks > 0 {
+        if instance.stop_scheduler_time.is_none() {
+            let snapshot = lifecycle.snapshot();
+            provider
+                .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+                    stop_time: chrono::Utc::now().timestamp()
+                        + (snapshot.hard_limit_minutes as i64) * 60,
+                    project_id: instance.project_id.clone(),
+                })
+                .await
+                .map_err(|error| format!("远端任务仍在运行，但无法补设平台关机保障：{}", error.message))?;
+        }
+        return Ok(ApplicationExitProtection {
+            active_remote_tasks,
+            action: "continue-until-watchdog".to_owned(),
+            detail: format!(
+                "远端仍有 {active_remote_tasks} 个任务，退出后继续执行，并由平台运行上限定时关机兜底。"
+            ),
+        });
+    }
+
+    provider
+        .stop_instance()
+        .await
+        .map_err(|error| format!("远端队列已空，但请求关闭 GPU 失败：{}", error.message))?;
+    // A new GPU start always overwrites the safeguard. Deleting it here avoids
+    // an old deadline unexpectedly affecting a later no-GPU maintenance boot.
+    let _ = provider.delete_stop_scheduler().await;
+    Ok(ApplicationExitProtection {
+        active_remote_tasks: 0,
+        action: "gpu-stop-requested".to_owned(),
+        detail: "远端队列为空，已在客户端退出前请求关闭 GPU。".to_owned(),
+    })
 }
 
 #[tauri::command]
@@ -320,6 +580,27 @@ async fn prepare_generation_service(
             .await
             .map_err(|error| error.message)?;
     }
+    let hard_limit_minutes = lifecycle.snapshot().hard_limit_minutes;
+    if let Err(error) = comp_share
+        .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
+            stop_time: chrono::Utc::now().timestamp() + (hard_limit_minutes as i64) * 60,
+            project_id: None,
+        })
+        .await
+    {
+        let _ = wait_for_instance_state(
+            &comp_share,
+            CompSharePowerState::Running,
+            Some(CompShareRunningMode::Gpu),
+            Duration::from_secs(180),
+        )
+        .await;
+        let _ = comp_share.stop_instance().await;
+        return Err(format!(
+            "GPU 已启动，但无法设置 {hard_limit_minutes} 分钟定时关机保障，已请求关机且任务未提交：{}",
+            error.message
+        ));
+    }
     wait_for_instance_state(
         &comp_share,
         CompSharePowerState::Running,
@@ -327,19 +608,6 @@ async fn prepare_generation_service(
         Duration::from_secs(180),
     )
     .await?;
-    if let Err(error) = comp_share
-        .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
-            stop_time: chrono::Utc::now().timestamp() + 60 * 60,
-            project_id: None,
-        })
-        .await
-    {
-        let _ = comp_share.stop_instance().await;
-        return Err(format!(
-            "GPU 已启动，但无法设置 60 分钟定时关机保障，已请求关机且任务未提交：{}",
-            error.message
-        ));
-    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {
@@ -711,6 +979,26 @@ async fn generate_and_persist_storyboard(
 #[cfg(test)]
 mod live_flow_tests {
     use super::*;
+
+    #[test]
+    fn compute_policy_persists_and_exposes_bounded_safety_windows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("compute-policy.json");
+        let lifecycle = ComputeLifecycle::load(path.clone());
+        assert_eq!(lifecycle.snapshot().policy, ComputeKeepAlivePolicy::Economy);
+        assert_eq!(lifecycle.snapshot().idle_shutdown_minutes, Some(3));
+        assert_eq!(lifecycle.snapshot().hard_limit_minutes, 60);
+
+        let continuous = lifecycle
+            .set_policy(ComputeKeepAlivePolicy::Continuous)
+            .expect("persist continuous policy");
+        assert_eq!(continuous.idle_shutdown_minutes, None);
+        assert_eq!(continuous.hard_limit_minutes, 720);
+
+        let reloaded = ComputeLifecycle::load(path).snapshot();
+        assert_eq!(reloaded.policy, ComputeKeepAlivePolicy::Continuous);
+        assert_eq!(reloaded.hard_limit_minutes, 720);
+    }
 
     #[tokio::test]
     #[ignore = "requires ZHIHUA_TEST_DEEPSEEK_API_KEY and performs two authorized live DeepSeek requests"]
@@ -1504,8 +1792,11 @@ async fn download_completed_enhancement(
 }
 
 fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revision: u64) {
+    let Some(idle_minutes) = lifecycle.snapshot().idle_shutdown_minutes else {
+        return;
+    };
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(180)).await;
+        tokio::time::sleep(Duration::from_secs(idle_minutes * 60)).await;
         if !lifecycle.is_current(revision) {
             return;
         }
@@ -1739,6 +2030,7 @@ pub fn run() {
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let comp_share = CompShareProvider::new(app_data_dir.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let compute_lifecycle = ComputeLifecycle::load(app_data_dir.join("compute-policy.json"));
             let ssh_tunnel = SshTunnelManager::new(app_data_dir)
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             app.manage(storage);
@@ -1751,7 +2043,7 @@ pub fn run() {
             app.manage(tts);
             app.manage(exporter);
             app.manage(llm);
-            app.manage(ComputeLifecycle::default());
+            app.manage(compute_lifecycle);
             app.manage(service);
             app.manage(comp_share);
             app.manage(ssh_tunnel);
@@ -1773,6 +2065,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_storage_info,
+            get_compute_policy,
+            set_compute_policy,
             get_storage_usage,
             open_projects_root,
             create_project,
@@ -1851,6 +2145,7 @@ pub fn run() {
             get_bound_compshare_instance,
             start_compshare_instance,
             stop_compshare_instance,
+            prepare_application_exit,
             update_compshare_stop_scheduler,
             delete_compshare_stop_scheduler,
             save_ssh_tunnel_configuration,

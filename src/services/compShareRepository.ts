@@ -13,6 +13,13 @@ export type CompShareRunningMode =
   | "transitioning"
   | "unknown";
 export type CompShareStartMode = "gpu" | "noGpu";
+export type ComputeKeepAlivePolicy = "economy" | "availability" | "continuous";
+
+export interface ComputePolicySnapshot {
+  policy: ComputeKeepAlivePolicy;
+  idleShutdownMinutes: number | null;
+  hardLimitMinutes: number;
+}
 
 export interface CompShareConfiguration {
   credentialsStored: boolean;
@@ -83,6 +90,16 @@ export function normalizeCompShareError(error: unknown): CompShareError {
 }
 
 export const compShareRepository = {
+  computePolicy: async () =>
+    required(
+      await invokeNative<ComputePolicySnapshot>("get_compute_policy"),
+      "算力策略仅可在桌面客户端中使用。",
+    ),
+  setComputePolicy: async (policy: ComputeKeepAlivePolicy) =>
+    required(
+      await invokeNative<ComputePolicySnapshot>("set_compute_policy", { policy }),
+      "算力策略仅可在桌面客户端中使用。",
+    ),
   configuration: async () =>
     required(
       await invokeNative<CompShareConfiguration>("get_compshare_configuration"),
