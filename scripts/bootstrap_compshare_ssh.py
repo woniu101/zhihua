@@ -21,6 +21,17 @@ import paramiko
 API_URL = "https://api.compshare.cn"
 
 
+class PinnedFingerprintPolicy(paramiko.MissingHostKeyPolicy):
+    def __init__(self, expected: str) -> None:
+        self.expected = expected
+
+    def missing_host_key(self, client, hostname, key) -> None:
+        digest = hashlib.sha256(key.asbytes()).digest()
+        actual = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+        if actual != self.expected:
+            raise paramiko.SSHException("SSH host key fingerprint mismatch")
+
+
 def load_credentials(path: Path) -> tuple[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -56,6 +67,10 @@ def main() -> None:
     parser.add_argument("credential_file", type=Path)
     parser.add_argument("instance_id")
     parser.add_argument("public_key_file", type=Path)
+    parser.add_argument(
+        "--host-fingerprint",
+        help="Expected SHA-256 host key fingerprint for a new endpoint",
+    )
     args = parser.parse_args()
     public_key, private_key = load_credentials(args.credential_file)
     response = invoke(
@@ -79,7 +94,12 @@ def main() -> None:
 
     client = paramiko.SSHClient()
     client.load_system_host_keys()
-    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    if args.host_fingerprint:
+        client.set_missing_host_key_policy(
+            PinnedFingerprintPolicy(args.host_fingerprint)
+        )
+    else:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
     client.connect(
         host,
         port=port,

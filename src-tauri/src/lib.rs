@@ -31,8 +31,8 @@ use comp_share::{
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
 use compute_control::{
-    ComputeControlStore, ComputeInstanceRole, ComputeOperation, ComputeOperationAction,
-    ComputeOperationStatus, ManagedComputeInstance, ReleaseEligibility,
+    ComputeControlError, ComputeControlStore, ComputeInstanceRole, ComputeOperation,
+    ComputeOperationAction, ComputeOperationStatus, ManagedComputeInstance, ReleaseEligibility,
 };
 use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
 use export::{
@@ -1617,15 +1617,22 @@ async fn submit_service_job(
     app: AppHandle,
     service: State<'_, ServiceClient>,
     queue: State<'_, JobQueueStorage>,
+    compute: State<'_, ComputeControlStore>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: SubmitServiceJobInput,
 ) -> Result<ServiceJob, ServiceConnectionError> {
     let request_id = input.client_request_id.clone();
     let result = async {
         queue.stage(&input).map_err(queue_service_error)?;
-        queue
-            .claim_for_worker(&request_id, "primary-worker", 300)
-            .map_err(queue_service_error)?;
+        let primary = compute.primary_instance().map_err(compute_service_error)?;
+        let worker_id = format!("instance:{}:gpu:0", primary.instance_id);
+        compute
+            .acquire_worker_lease(&worker_id, &primary.instance_id, &request_id, 3_600)
+            .map_err(compute_service_error)?;
+        if let Err(error) = queue.claim_for_worker(&request_id, &worker_id, 3_600) {
+            let _ = compute.release_worker_lease(&request_id);
+            return Err(queue_service_error(error));
+        }
         match service.submit_job(input).await {
             Ok(job) => {
                 queue.record_remote(&job).map_err(queue_service_error)?;
@@ -1633,6 +1640,7 @@ async fn submit_service_job(
             }
             Err(error) => {
                 let _ = queue.record_submit_failure(&request_id, error.code, &error.message);
+                let _ = compute.release_worker_lease(&request_id);
                 Err(error)
             }
         }
@@ -1649,13 +1657,32 @@ async fn get_service_job(
     app: AppHandle,
     service: State<'_, ServiceClient>,
     queue: State<'_, JobQueueStorage>,
+    compute: State<'_, ComputeControlStore>,
     lifecycle: State<'_, ComputeLifecycle>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
     let job = service.get_job(&job_id).await?;
-    queue.sync(&job).map_err(queue_service_error)?;
+    let local = queue.sync(&job).map_err(queue_service_error)?;
     if is_terminal_service_job(&job) {
+        compute
+            .release_worker_lease(&job.client_request_id)
+            .map_err(compute_service_error)?;
         restart_idle_gpu_shutdown(&app, &lifecycle);
+    } else if let Err(error) = compute.renew_worker_lease(&job.client_request_id, 3_600) {
+        if error.code != "WORKER_LEASE_NOT_FOUND" {
+            return Err(compute_service_error(error));
+        }
+        let worker_id = local
+            .worker_id
+            .as_deref()
+            .ok_or_else(|| ServiceConnectionError {
+                code: "compute_control_error",
+                message: "运行中的任务缺少 worker 分配记录".to_owned(),
+            })?;
+        let instance_id = worker_instance_id(worker_id)?;
+        compute
+            .acquire_worker_lease(worker_id, instance_id, &job.client_request_id, 3_600)
+            .map_err(compute_service_error)?;
     }
     Ok(job)
 }
@@ -1665,11 +1692,15 @@ async fn cancel_service_job(
     app: AppHandle,
     service: State<'_, ServiceClient>,
     queue: State<'_, JobQueueStorage>,
+    compute: State<'_, ComputeControlStore>,
     lifecycle: State<'_, ComputeLifecycle>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
     let job = service.cancel_job(&job_id).await?;
     queue.sync(&job).map_err(queue_service_error)?;
+    compute
+        .release_worker_lease(&job.client_request_id)
+        .map_err(compute_service_error)?;
     restart_idle_gpu_shutdown(&app, &lifecycle);
     Ok(job)
 }
@@ -1687,6 +1718,24 @@ fn queue_service_error(error: JobQueueError) -> ServiceConnectionError {
         code: "local_queue_error",
         message: error.message,
     }
+}
+
+fn compute_service_error(error: ComputeControlError) -> ServiceConnectionError {
+    ServiceConnectionError {
+        code: "compute_control_error",
+        message: format!("{}：{}", error.code, error.message),
+    }
+}
+
+fn worker_instance_id(worker_id: &str) -> Result<&str, ServiceConnectionError> {
+    worker_id
+        .strip_prefix("instance:")
+        .and_then(|value| value.strip_suffix(":gpu:0"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceConnectionError {
+            code: "compute_control_error",
+            message: "worker 分配记录无法映射到算力实例".to_owned(),
+        })
 }
 
 #[tauri::command]
