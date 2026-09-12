@@ -98,6 +98,38 @@ pub struct UpdateCompShareStopSchedulerInput {
     pub project_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompShareInstanceLocator {
+    pub instance_id: String,
+    pub region: String,
+    pub zone: String,
+    pub project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompShareCreateSpec {
+    pub region: String,
+    pub zone: String,
+    pub gpu_type: String,
+    pub gpu_count: u32,
+    pub cpu: u32,
+    pub memory_mb: u64,
+    pub image_id: String,
+    #[serde(default = "default_machine_type")]
+    pub machine_type: String,
+    #[serde(default = "default_cpu_platform")]
+    pub minimal_cpu_platform: String,
+    #[serde(default = "default_charge_type")]
+    pub charge_type: String,
+    #[serde(default = "default_boot_disk_type")]
+    pub boot_disk_type: String,
+    #[serde(default = "default_boot_disk_size")]
+    pub boot_disk_size_gb: u32,
+    pub project_id: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CompSharePowerState {
@@ -173,6 +205,10 @@ pub struct CompShareInstance {
     pub release_time: Option<i64>,
     pub stop_scheduler_time: Option<i64>,
     pub instance_price: Option<f64>,
+    pub disk_price: Option<f64>,
+    pub image_price: Option<f64>,
+    pub image_id: Option<String>,
+    pub charge_type: Option<String>,
     pub project_id: Option<String>,
 }
 
@@ -196,6 +232,51 @@ pub struct CompShareSchedulerResult {
 pub struct CompShareDeleteSchedulerResult {
     pub deleted: bool,
     pub instance: CompShareInstance,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompShareZone {
+    pub region: String,
+    pub zone: String,
+    pub description: Option<String>,
+    pub resource_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompShareCapacitySpec {
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub gpu_count: u32,
+    pub resource_enough: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompShareCreatePreflight {
+    pub spec: CompShareCreateSpec,
+    pub checked_at: String,
+    pub capacity_available: bool,
+    pub compatible_specs: Vec<CompShareCapacitySpec>,
+    pub price_details: serde_json::Value,
+    pub estimated_hourly_price: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCompShareInstanceResult {
+    pub instance_ids: Vec<String>,
+    pub warnings: Vec<serde_json::Value>,
+    pub request_uuid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminateCompShareInstanceResult {
+    pub instance_id: String,
+    pub in_recycle: Option<String>,
+    pub request_uuid: Option<String>,
 }
 
 struct CompShareApi {
@@ -457,6 +538,192 @@ impl CompShareProvider {
             }
         }
         Ok(instances)
+    }
+
+    pub async fn list_zones(&self) -> CompShareResult<Vec<CompShareZone>> {
+        let credentials = self.credentials()?;
+        let response: Value = self
+            .api
+            .invoke(
+                &credentials,
+                "DescribeCompShareSupportZone",
+                BTreeMap::new(),
+            )
+            .await?;
+        let zones = response
+            .get("ZoneInfo")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CompShareError::new(
+                    "INVALID_API_RESPONSE",
+                    "优云智算可用区接口没有返回 ZoneInfo",
+                )
+            })?;
+        let mut result = Vec::with_capacity(zones.len());
+        for zone in zones {
+            let region = string_field(zone, &["Region"])?;
+            let zone_id = string_field(zone, &["Zone"])?;
+            result.push(CompShareZone {
+                region,
+                zone: zone_id,
+                description: optional_string_field(zone, &["Describe", "Name"]),
+                resource_type: optional_string_field(zone, &["ResourceType", "Type"]),
+            });
+        }
+        Ok(result)
+    }
+
+    pub async fn preflight_create(
+        &self,
+        spec: CompShareCreateSpec,
+    ) -> CompShareResult<CompShareCreatePreflight> {
+        let spec = normalize_create_spec(spec)?;
+        let credentials = self.credentials()?;
+        let capacity: Value = self
+            .api
+            .invoke(
+                &credentials,
+                "CheckCompShareResourceCapacity",
+                create_capacity_parameters(&spec),
+            )
+            .await?;
+        let compatible_specs = capacity
+            .get("Specs")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(parse_capacity_spec)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let capacity_available = compatible_specs.iter().any(|candidate| {
+            candidate.gpu_count == spec.gpu_count
+                && candidate.cpu == spec.cpu
+                && u64::from(candidate.memory_gb).saturating_mul(1024) == spec.memory_mb
+                && candidate.resource_enough
+        });
+
+        let price: Value = self
+            .api
+            .invoke(
+                &credentials,
+                "GetCompShareInstancePrice",
+                create_price_parameters(&spec),
+            )
+            .await?;
+        let price_details = price
+            .get("PriceDetails")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let estimated_hourly_price = price_details
+            .as_array()
+            .and_then(|details| {
+                details
+                    .iter()
+                    .find(|detail| {
+                        optional_string_field(detail, &["ChargeType"])
+                            .is_some_and(|charge| charge.eq_ignore_ascii_case(&spec.charge_type))
+                    })
+                    .or_else(|| details.first())
+            })
+            .and_then(sum_price_detail);
+
+        Ok(CompShareCreatePreflight {
+            spec,
+            checked_at: chrono::Utc::now().to_rfc3339(),
+            capacity_available,
+            compatible_specs,
+            price_details,
+            estimated_hourly_price,
+        })
+    }
+
+    pub async fn create_instance(
+        &self,
+        spec: CompShareCreateSpec,
+        name: String,
+    ) -> CompShareResult<CreateCompShareInstanceResult> {
+        let spec = normalize_create_spec(spec)?;
+        let name = required_value(name, "实例名称")?;
+        if name.chars().count() > 63 {
+            return Err(CompShareError::new(
+                "INVALID_INPUT",
+                "实例名称不能超过 63 个字符",
+            ));
+        }
+        let credentials = self.credentials()?;
+        let parameters = create_instance_parameters(&spec, name);
+        let response: CreateInstanceResponseWire = self
+            .api
+            .invoke(&credentials, "CreateCompShareInstance", parameters)
+            .await?;
+        if response.instance_ids.len() != 1 {
+            return Err(CompShareError::new(
+                "INVALID_API_RESPONSE",
+                "优云智算创建接口没有返回唯一实例 ID",
+            ));
+        }
+        Ok(CreateCompShareInstanceResult {
+            instance_ids: response.instance_ids,
+            warnings: response.warnings,
+            request_uuid: response.request_uuid,
+        })
+    }
+
+    pub async fn describe_instance(
+        &self,
+        locator: CompShareInstanceLocator,
+    ) -> CompShareResult<CompShareInstance> {
+        let locator = normalize_locator(locator)?;
+        let credentials = self.credentials()?;
+        self.describe_exact(
+            &credentials,
+            &locator.instance_id,
+            &locator.region,
+            &locator.zone,
+        )
+        .await
+    }
+
+    pub async fn terminate_instance(
+        &self,
+        locator: CompShareInstanceLocator,
+        release_data_disk: bool,
+    ) -> CompShareResult<TerminateCompShareInstanceResult> {
+        let locator = normalize_locator(locator)?;
+        let credentials = self.credentials()?;
+        let current = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
+        if current.state != CompSharePowerState::Stopped {
+            return Err(CompShareError::new(
+                "INSTANCE_MUST_BE_STOPPED",
+                "只有平台确认已关机的实例才能释放",
+            ));
+        }
+        let mut parameters = locator_parameters(&locator);
+        parameters.insert("ReleaseUDisk".to_string(), release_data_disk.to_string());
+        let response: TerminateInstanceResponseWire = self
+            .api
+            .invoke(&credentials, "TerminateCompShareInstance", parameters)
+            .await?;
+        if response.instance_id != locator.instance_id {
+            return Err(CompShareError::new(
+                "INSTANCE_ID_MISMATCH",
+                "优云智算释放响应中的实例 ID 与请求不一致",
+            ));
+        }
+        Ok(TerminateCompShareInstanceResult {
+            instance_id: response.instance_id,
+            in_recycle: response.in_recycle,
+            request_uuid: response.request_uuid,
+        })
     }
 
     pub async fn bind_instance(
@@ -818,6 +1085,232 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn default_machine_type() -> String {
+    "G".to_owned()
+}
+
+fn default_cpu_platform() -> String {
+    "Auto".to_owned()
+}
+
+fn default_charge_type() -> String {
+    "Postpay".to_owned()
+}
+
+fn default_boot_disk_type() -> String {
+    "CLOUD_SSD".to_owned()
+}
+
+fn default_boot_disk_size() -> u32 {
+    40
+}
+
+fn normalize_locator(
+    locator: CompShareInstanceLocator,
+) -> CompShareResult<CompShareInstanceLocator> {
+    Ok(CompShareInstanceLocator {
+        instance_id: required_value(locator.instance_id, "实例 ID")?,
+        region: required_value(locator.region, "地域")?,
+        zone: required_value(locator.zone, "可用区")?,
+        project_id: normalize_optional(locator.project_id),
+    })
+}
+
+fn normalize_create_spec(spec: CompShareCreateSpec) -> CompShareResult<CompShareCreateSpec> {
+    let spec = CompShareCreateSpec {
+        region: required_value(spec.region, "地域")?,
+        zone: required_value(spec.zone, "可用区")?,
+        gpu_type: required_value(spec.gpu_type, "GPU 型号")?,
+        image_id: required_value(spec.image_id, "镜像 ID")?,
+        machine_type: required_value(spec.machine_type, "机型")?,
+        minimal_cpu_platform: required_value(spec.minimal_cpu_platform, "CPU 平台")?,
+        charge_type: required_value(spec.charge_type, "计费模式")?,
+        boot_disk_type: required_value(spec.boot_disk_type, "系统盘类型")?,
+        ..spec
+    };
+    if spec.gpu_count != 1 {
+        return Err(CompShareError::new(
+            "INVALID_CREATE_SPEC",
+            "MVP 每个 worker 只允许创建一张 GPU 的实例",
+        ));
+    }
+    if spec.cpu == 0 || spec.memory_mb == 0 || spec.memory_mb % 1024 != 0 {
+        return Err(CompShareError::new(
+            "INVALID_CREATE_SPEC",
+            "CPU 必须大于 0，内存必须是 1024MB 的整数倍",
+        ));
+    }
+    if spec.boot_disk_size_gb < 20 || spec.boot_disk_size_gb > 4096 {
+        return Err(CompShareError::new(
+            "INVALID_CREATE_SPEC",
+            "系统盘大小必须在 20～4096GB 之间",
+        ));
+    }
+    if spec.machine_type != "G" {
+        return Err(CompShareError::new(
+            "INVALID_CREATE_SPEC",
+            "当前只支持 G 机型",
+        ));
+    }
+    if !matches!(
+        spec.minimal_cpu_platform.as_str(),
+        "Auto" | "Intel/Auto" | "Amd/Auto"
+    ) {
+        return Err(CompShareError::new(
+            "INVALID_CREATE_SPEC",
+            "CPU 平台必须是 Auto、Intel/Auto 或 Amd/Auto",
+        ));
+    }
+    if spec.charge_type != "Postpay" {
+        return Err(CompShareError::new(
+            "INVALID_CREATE_SPEC",
+            "MVP 弹性实例只允许按量后付费 Postpay",
+        ));
+    }
+    Ok(spec)
+}
+
+fn locator_parameters(locator: &CompShareInstanceLocator) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("Region".to_owned(), locator.region.clone());
+    parameters.insert("Zone".to_owned(), locator.zone.clone());
+    parameters.insert("UHostId".to_owned(), locator.instance_id.clone());
+    if let Some(project_id) = locator.project_id.as_ref() {
+        parameters.insert("ProjectId".to_owned(), project_id.clone());
+    }
+    parameters
+}
+
+fn create_capacity_parameters(spec: &CompShareCreateSpec) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("Region".to_owned(), spec.region.clone());
+    parameters.insert("Zone".to_owned(), spec.zone.clone());
+    parameters.insert("GpuType".to_owned(), spec.gpu_type.clone());
+    parameters.insert("MachineType".to_owned(), spec.machine_type.clone());
+    parameters.insert(
+        "MinimalCpuPlatform".to_owned(),
+        spec.minimal_cpu_platform.clone(),
+    );
+    parameters.insert("CompShareImageId".to_owned(), spec.image_id.clone());
+    parameters.insert("ChargeType".to_owned(), spec.charge_type.clone());
+    insert_boot_disk_parameters(&mut parameters, spec);
+    parameters
+}
+
+fn create_price_parameters(spec: &CompShareCreateSpec) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("Region".to_owned(), spec.region.clone());
+    parameters.insert("Zone".to_owned(), spec.zone.clone());
+    parameters.insert("GpuType".to_owned(), spec.gpu_type.clone());
+    parameters.insert("Gpu".to_owned(), spec.gpu_count.to_string());
+    parameters.insert("Cpu".to_owned(), spec.cpu.to_string());
+    parameters.insert("Memory".to_owned(), spec.memory_mb.to_string());
+    parameters.insert("ChargeType".to_owned(), spec.charge_type.clone());
+    parameters.insert("CompShareImageId".to_owned(), spec.image_id.clone());
+    insert_boot_disk_parameters(&mut parameters, spec);
+    parameters
+}
+
+fn create_instance_parameters(
+    spec: &CompShareCreateSpec,
+    name: String,
+) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("Region".to_owned(), spec.region.clone());
+    parameters.insert("Zone".to_owned(), spec.zone.clone());
+    parameters.insert("MachineType".to_owned(), spec.machine_type.clone());
+    parameters.insert(
+        "MinimalCpuPlatform".to_owned(),
+        spec.minimal_cpu_platform.clone(),
+    );
+    parameters.insert("CompShareImageId".to_owned(), spec.image_id.clone());
+    parameters.insert("GPU".to_owned(), spec.gpu_count.to_string());
+    parameters.insert("GpuType".to_owned(), spec.gpu_type.clone());
+    parameters.insert("CPU".to_owned(), spec.cpu.to_string());
+    parameters.insert("Memory".to_owned(), spec.memory_mb.to_string());
+    parameters.insert("ChargeType".to_owned(), spec.charge_type.clone());
+    parameters.insert("MaxCount".to_owned(), "1".to_owned());
+    parameters.insert("Name".to_owned(), name);
+    if let Some(project_id) = spec.project_id.as_ref() {
+        parameters.insert("ProjectId".to_owned(), project_id.clone());
+    }
+    insert_boot_disk_parameters(&mut parameters, spec);
+    parameters
+}
+
+fn insert_boot_disk_parameters(
+    parameters: &mut BTreeMap<String, String>,
+    spec: &CompShareCreateSpec,
+) {
+    parameters.insert("Disks.0.IsBoot".to_owned(), "true".to_owned());
+    parameters.insert("Disks.0.Type".to_owned(), spec.boot_disk_type.clone());
+    parameters.insert(
+        "Disks.0.Size".to_owned(),
+        spec.boot_disk_size_gb.to_string(),
+    );
+}
+
+fn parse_capacity_spec(value: &Value) -> Option<CompShareCapacitySpec> {
+    Some(CompShareCapacitySpec {
+        cpu: u32::try_from(integer_field(value, &["Cpu", "CPU"])?).ok()?,
+        memory_gb: u32::try_from(integer_field(value, &["Mem", "Memory"])?).ok()?,
+        gpu_count: u32::try_from(integer_field(value, &["Gpu", "GPU"])?).ok()?,
+        resource_enough: value.get("ResourceEnough")?.as_bool()?,
+    })
+}
+
+fn sum_price_detail(value: &Value) -> Option<f64> {
+    if let Some(total) = number_field(value, "Price") {
+        return Some(total);
+    }
+    let mut total = 0.0;
+    let mut found = false;
+    for field in ["Instance", "Disks", "SystemDisks", "CompShareImage"] {
+        if let Some(amount) = number_field(value, field) {
+            total += amount;
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+fn number_field(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(|value| match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    })
+}
+
+fn integer_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| match value {
+            Value::Number(number) => number.as_i64(),
+            Value::String(text) => text.parse().ok(),
+            _ => None,
+        })
+    })
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> CompShareResult<String> {
+    optional_string_field(value, keys).ok_or_else(|| {
+        CompShareError::new(
+            "INVALID_API_RESPONSE",
+            format!("优云智算接口缺少字段 {}", keys.join("/")),
+        )
+    })
+}
+
+fn optional_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| match value {
+            Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+    })
+}
+
 fn action_parameters(bound: &BoundInstance) -> BTreeMap<String, String> {
     let mut parameters = BTreeMap::new();
     parameters.insert("Region".to_string(), bound.region.clone());
@@ -926,6 +1419,10 @@ impl CompShareInstance {
             release_time: wire.release_time,
             stop_scheduler_time: wire.stop_scheduler_time.or(wire.scheduler_stop_time),
             instance_price: wire.instance_price,
+            disk_price: wire.disk_price,
+            image_price: wire.image_price,
+            image_id: wire.image_id,
+            charge_type: wire.charge_type,
             project_id: wire.project_id,
         }
     }
@@ -996,11 +1493,11 @@ struct CompShareInstanceWire {
     project_id: Option<String>,
     #[serde(rename = "State")]
     state: Option<String>,
-    #[serde(rename = "CPU")]
+    #[serde(rename = "CPU", alias = "Cpu")]
     cpu: Option<u32>,
     #[serde(rename = "Memory")]
     memory: Option<u64>,
-    #[serde(rename = "GPU")]
+    #[serde(rename = "GPU", alias = "Gpu")]
     gpu: Option<u32>,
     #[serde(rename = "GpuType")]
     gpu_type: Option<String>,
@@ -1020,6 +1517,34 @@ struct CompShareInstanceWire {
     scheduler_stop_time: Option<i64>,
     #[serde(rename = "InstancePrice")]
     instance_price: Option<f64>,
+    #[serde(rename = "DiskPrice")]
+    disk_price: Option<f64>,
+    #[serde(rename = "CompShareImagePrice")]
+    image_price: Option<f64>,
+    #[serde(rename = "CompShareImageId")]
+    image_id: Option<String>,
+    #[serde(rename = "ChargeType")]
+    charge_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateInstanceResponseWire {
+    #[serde(rename = "UHostIds", default)]
+    instance_ids: Vec<String>,
+    #[serde(rename = "Warning", default)]
+    warnings: Vec<Value>,
+    #[serde(rename = "RequestUuid", alias = "RequestUUID")]
+    request_uuid: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TerminateInstanceResponseWire {
+    #[serde(rename = "UHostId")]
+    instance_id: String,
+    #[serde(rename = "InRecycle")]
+    in_recycle: Option<String>,
+    #[serde(rename = "RequestUuid", alias = "RequestUUID")]
+    request_uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1124,6 +1649,61 @@ mod tests {
     }
 
     #[test]
+    fn create_parameters_use_the_official_field_casing() {
+        let spec = CompShareCreateSpec {
+            region: "cn-wlcb".to_owned(),
+            zone: "cn-wlcb-01".to_owned(),
+            gpu_type: "5090".to_owned(),
+            gpu_count: 1,
+            cpu: 16,
+            memory_mb: 96 * 1024,
+            image_id: "image-1".to_owned(),
+            machine_type: default_machine_type(),
+            minimal_cpu_platform: default_cpu_platform(),
+            charge_type: default_charge_type(),
+            boot_disk_type: default_boot_disk_type(),
+            boot_disk_size_gb: default_boot_disk_size(),
+            project_id: Some("org-1".to_owned()),
+        };
+        let create = create_instance_parameters(&spec, "zhihua-worker".to_owned());
+        assert_eq!(create.get("GPU").map(String::as_str), Some("1"));
+        assert_eq!(create.get("CPU").map(String::as_str), Some("16"));
+        assert!(!create.contains_key("Gpu"));
+        assert!(!create.contains_key("Cpu"));
+        assert_eq!(
+            create.get("Disks.0.IsBoot").map(String::as_str),
+            Some("true")
+        );
+
+        let price = create_price_parameters(&spec);
+        assert_eq!(price.get("Gpu").map(String::as_str), Some("1"));
+        assert_eq!(price.get("Cpu").map(String::as_str), Some("16"));
+        assert!(!price.contains_key("GPU"));
+        assert!(!price.contains_key("CPU"));
+    }
+
+    #[test]
+    fn price_prefers_explicit_total_over_components() {
+        assert_eq!(
+            sum_price_detail(&serde_json::json!({
+                "Price": "3.20",
+                "Instance": 3.0,
+                "SystemDisks": 0.1,
+                "CompShareImage": 0.1
+            })),
+            Some(3.2)
+        );
+        assert_eq!(
+            sum_price_detail(&serde_json::json!({
+                "Instance": 3.0,
+                "SystemDisks": 0.1,
+                "CompShareImage": 0.1
+            })),
+            Some(3.2)
+        );
+    }
+
+    #[test]
     fn state_mapping_distinguishes_gpu_and_no_gpu() {
         let no_gpu = CompShareInstance::from_wire(
             CompShareInstanceWire {
@@ -1145,6 +1725,10 @@ mod tests {
                 stop_scheduler_time: None,
                 scheduler_stop_time: None,
                 instance_price: None,
+                disk_price: None,
+                image_price: None,
+                image_id: None,
+                charge_type: None,
             },
             None,
             None,

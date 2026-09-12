@@ -14,6 +14,13 @@ export type CompShareRunningMode =
   | "unknown";
 export type CompShareStartMode = "gpu" | "noGpu";
 export type ComputeKeepAlivePolicy = "economy" | "availability" | "continuous";
+export type ComputeInstanceRole = "primary" | "elastic" | "user_managed" | "test";
+export type ComputeInstanceOwnership = "zhihua_managed" | "user_managed";
+export type ComputeCleanupPolicy = "retain" | "release_when_idle";
+export type ComputeLifecycleState =
+  | "discovered" | "creating" | "starting" | "preparing" | "idle" | "busy"
+  | "draining" | "stopping" | "retained" | "terminating" | "terminated"
+  | "unknown" | "error";
 
 export interface ComputePolicySnapshot {
   policy: ComputeKeepAlivePolicy;
@@ -56,7 +63,42 @@ export interface CompShareInstance {
   releaseTime?: number;
   stopSchedulerTime?: number;
   instancePrice?: number;
+  diskPrice?: number;
+  imagePrice?: number;
+  imageId?: string;
+  chargeType?: string;
   projectId?: string;
+}
+
+export interface ManagedComputeInstance {
+  instanceId: string;
+  name?: string;
+  region: string;
+  zone: string;
+  projectId?: string;
+  role: ComputeInstanceRole;
+  ownership: ComputeInstanceOwnership;
+  cleanupPolicy: ComputeCleanupPolicy;
+  lifecycleState: ComputeLifecycleState;
+  platformState: string;
+  runningMode: "gpu" | "no_gpu" | "stopped" | "transitioning" | "unknown";
+  gpuType?: string;
+  gpuCount?: number;
+  imageId?: string;
+  releaseTime?: number;
+  stopTime?: number;
+  stopSchedulerTime?: number;
+  instancePrice?: number;
+  diskPrice?: number;
+  currentJobId?: string;
+  lastSyncedAt: string;
+  missingSince?: string;
+  updatedAt: string;
+}
+
+export interface ComputeReleaseEligibility {
+  allowed: boolean;
+  reasons: string[];
 }
 
 export interface CompShareError {
@@ -131,6 +173,36 @@ export const compShareRepository = {
         input: { region, zone },
       }),
       "优云智算接口仅可在桌面客户端中使用。",
+    ),
+  managedInstances: async () =>
+    required(
+      await invokeNative<ManagedComputeInstance[]>("list_managed_compute_instances"),
+      "实例中心仅可在桌面客户端中使用。",
+    ),
+  reconcileInstances: async () =>
+    required(
+      await invokeNative<ManagedComputeInstance[]>("reconcile_compute_instances"),
+      "实例中心仅可在桌面客户端中使用。",
+    ),
+  releaseEligibility: async (instanceId: string) =>
+    required(
+      await invokeNative<ComputeReleaseEligibility>("get_compute_release_eligibility", { instanceId }),
+      "实例中心仅可在桌面客户端中使用。",
+    ),
+  releaseManagedInstance: async (instanceId: string, releaseDataDisk = false) =>
+    required(
+      await invokeNative<{ status: "pending" | "succeeded" | "failed" | "unknown"; errorMessage?: string }>(
+        "release_managed_compshare_instance",
+        {
+          input: {
+            idempotencyKey: crypto.randomUUID(),
+            instanceId,
+            releaseDataDisk,
+            confirmed: true,
+          },
+        },
+      ),
+      "实例释放仅可在桌面客户端中使用。",
     ),
   bindInstance: async (instance: CompShareInstance) =>
     required(

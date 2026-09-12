@@ -13,8 +13,10 @@ import {
   type CompShareBalance,
   type CompShareConfiguration,
   type CompShareInstance,
+  type ComputeReleaseEligibility,
   type ComputeKeepAlivePolicy,
   type ComputePolicySnapshot,
+  type ManagedComputeInstance,
 } from "../services/compShareRepository";
 import {
   sshTunnelRepository,
@@ -47,6 +49,8 @@ const computeConfiguration = ref<CompShareConfiguration>();
 const computeBalance = ref<CompShareBalance>();
 const computeInstance = ref<CompShareInstance>();
 const computeInstances = ref<CompShareInstance[]>([]);
+const managedInstances = ref<ManagedComputeInstance[]>([]);
+const releaseEligibility = ref<Record<string, ComputeReleaseEligibility>>({});
 const computePolicy = ref<ComputePolicySnapshot>({ policy: "economy", idleShutdownMinutes: 3, hardLimitMinutes: 60 });
 const computeNotice = ref("");
 const computeNoticeTone = ref<"success" | "error" | "neutral">("neutral");
@@ -104,6 +108,16 @@ const stopSchedulerLabel = computed(() => {
 const policyGuardLabel = computed(() => {
   if (computeInstance.value?.runningMode !== "gpu") return "启动 GPU 时生效";
   return computeInstance.value.stopSchedulerTime ? "平台兜底已启用" : "保障待设置";
+});
+const selectedManagedInstance = computed(() => managedInstances.value.find(
+  (item) => item.instanceId === computeConfiguration.value?.boundInstanceId,
+));
+const releaseTimeLabel = computed(() => {
+  const timestamp = selectedManagedInstance.value?.releaseTime;
+  if (!timestamp) return "平台暂未返回回收时间";
+  return new Date(timestamp * 1000).toLocaleString("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  });
 });
 
 const connected = computed(
@@ -180,12 +194,19 @@ async function refreshCompute() {
     computePolicy.value = await compShareRepository.computePolicy();
     computeConfiguration.value = await compShareRepository.configuration();
     if (!computeConfiguration.value.credentialsStored) return;
-    const [balance, instances] = await Promise.all([
+    const [balance, instances, managed] = await Promise.all([
       compShareRepository.balance(),
       compShareRepository.listInstances(),
+      compShareRepository.reconcileInstances(),
     ]);
     computeBalance.value = balance;
     computeInstances.value = instances;
+    managedInstances.value = managed;
+    const entries = await Promise.all(managed.map(async (item) => [
+      item.instanceId,
+      await compShareRepository.releaseEligibility(item.instanceId),
+    ] as const));
+    releaseEligibility.value = Object.fromEntries(entries);
     const boundId = computeConfiguration.value.boundInstanceId;
     computeInstance.value = boundId
       ? instances.find((item) => item.instanceId === boundId)
@@ -229,7 +250,54 @@ async function saveComputeCredentials() {
     computeForm.publicKey = "";
     computeForm.privateKey = "";
     computeInstances.value = await compShareRepository.listInstances();
+    managedInstances.value = await compShareRepository.reconcileInstances();
     setComputeNotice("账户验证成功，密钥已保存到 Windows 凭据管理器。", "success");
+  } catch (error) {
+    setComputeNotice(normalizeCompShareError(error).message, "error");
+  } finally {
+    busy.value = false;
+  }
+}
+
+function roleLabel(role: ManagedComputeInstance["role"]) {
+  return role === "primary" ? "主实例" : role === "elastic" ? "弹性实例" : role === "test" ? "测试实例" : "用户实例";
+}
+
+function ownershipLabel(ownership: ManagedComputeInstance["ownership"]) {
+  return ownership === "zhihua_managed" ? "知画创建" : "用户创建";
+}
+
+function managedModeLabel(item: ManagedComputeInstance) {
+  if (item.runningMode === "gpu") return "GPU 运行";
+  if (item.runningMode === "no_gpu") return "无卡运行";
+  if (item.runningMode === "stopped") return "已关机";
+  if (item.lifecycleState === "unknown") return "待平台对账";
+  return item.platformState;
+}
+
+function formatReleaseTime(timestamp?: number) {
+  if (!timestamp) return "回收时间未返回";
+  return `预计回收 ${new Date(timestamp * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}`;
+}
+
+async function releaseManagedInstance(item: ManagedComputeInstance) {
+  const eligibility = releaseEligibility.value[item.instanceId];
+  if (!eligibility?.allowed) {
+    setComputeNotice(eligibility?.reasons.join("；") || "该实例当前不能释放。", "error");
+    return;
+  }
+  if (!window.confirm(`确认释放“${item.name ?? item.instanceId}”吗？实例将进入优云智算回收流程，数据处理以平台规则为准。`)) return;
+  busy.value = true;
+  try {
+    const operation = await compShareRepository.releaseManagedInstance(item.instanceId);
+    if (operation.status === "succeeded") {
+      setComputeNotice("实例已释放。", "success");
+    } else if (operation.status === "unknown") {
+      setComputeNotice("平台响应结果不确定，已停止重试并等待下一次对账。", "neutral");
+    } else {
+      setComputeNotice(operation.errorMessage ?? "实例释放失败。", "error");
+    }
+    await refreshCompute();
   } catch (error) {
     setComputeNotice(normalizeCompShareError(error).message, "error");
   } finally {
@@ -248,6 +316,16 @@ async function bindComputeInstance(instance: CompShareInstance) {
   } finally {
     busy.value = false;
   }
+}
+
+async function bindManagedInstance(item: ManagedComputeInstance) {
+  const platformInstance = computeInstances.value.find((candidate) => candidate.instanceId === item.instanceId);
+  if (!platformInstance) {
+    setComputeNotice("该实例尚未出现在本次平台查询中，完成对账前不能设为主实例。", "error");
+    return;
+  }
+  await bindComputeInstance(platformInstance);
+  await refreshCompute();
 }
 
 async function changeComputeMode(mode: "gpu" | "noGpu" | "stop") {
@@ -396,7 +474,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
       <section class="panel environment"><div class="panel-title"><h2>环境检查</h2><button class="btn link" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="15"/>连接并检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="24"/><b>远端磁盘</b><span>等待优云智算实例接口</span><div class="progress"><i style="width:0"></i></div><strong>未知</strong></div></section>
 
-      <section class="panel retention"><div class="panel-title"><h2>实例保留期　ⓘ</h2><span class="policy-badge neutral">未启用自动续期</span></div><div class="setting-row"><CalendarClock :size="24"/><div><b>平台回收时间</b><span>当前接口没有返回可验证的回收截止时间。</span></div><strong>等待平台数据</strong></div><div class="warning-box"><b>不会发送虚假的保活请求</b><span>实例保留以优云智算平台实际规则为准；接入可靠接口后再开放自动维护。</span></div></section>
+      <section class="panel retention"><div class="panel-title"><h2>实例保留期　ⓘ</h2><span class="policy-badge neutral">以平台时间为准</span></div><div class="setting-row"><CalendarClock :size="24"/><div><b>平台回收时间</b><span>关机实例可能进入平台回收倒计时；运行或启动实例时会重新查询。</span></div><strong>{{ releaseTimeLabel }}</strong></div><div class="warning-box"><b>实例不会被静默释放</b><span>主实例和用户创建的实例永久保留；仅知画创建且已关机、无任务的弹性实例可在确认后释放。</span></div></section>
 
       <section class="panel connection"><div class="panel-head"><h2>连接信息</h2><span :class="connected ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: !connected }"></span>{{ connectionLabel }}</span></div><div class="connection-cards"><article role="button" tabindex="0" @click="llmOpen=true" @keydown.enter="llmOpen=true"><KeyRound :size="31"/><div><b>大模型内容规划</b><span>{{ llmConfiguration?.credentialStored ? `${llmConfiguration.providerLabel} · ${llmConfiguration.model}` : '等待配置 API Key' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><KeyRound :size="31"/><div><b>自动安全连接</b><span>{{ tunnelStatus.configured ? 'SSH 私钥已保存到 Windows 凭据库' : '等待实例连接配置' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><Server :size="31"/><div><b>本机服务入口</b><span>{{ tunnelStatus.localUrl ?? connectionInfo?.baseUrl ?? '启动时自动分配' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><ShieldCheck :size="31"/><div><b>版本握手　<span :class="connected ? 'success-text' : 'waiting-text'">● {{ connectionLabel }}</span></b><span>{{ connected ? `API ${probe?.apiVersion} · 服务 ${probe?.serviceVersion}` : connectionError || '点击建立连接并检查兼容性' }}</span></div><strong>›</strong></article></div></section>
     </div>
@@ -425,8 +503,8 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
     </div>
 
     <div v-if="computeOpen" class="connection-backdrop" role="presentation" @click.self="computeOpen=false">
-      <section class="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="compute-title">
-        <header><div><h2 id="compute-title">优云智算账户与实例</h2><p>API 密钥只保存到 Windows 凭据管理器；客户端仅控制已选择的实例。</p></div><button type="button" aria-label="关闭" @click="computeOpen=false"><X :size="20"/></button></header>
+      <section class="connection-dialog compute-dialog" role="dialog" aria-modal="true" aria-labelledby="compute-title">
+        <header><div><h2 id="compute-title">优云智算实例中心</h2><p>平台实例会自动对账；用户实例只控制运行状态，知画弹性实例才允许安全释放。</p></div><button type="button" aria-label="关闭" @click="computeOpen=false"><X :size="20"/></button></header>
         <div class="connection-form">
           <template v-if="!computeConfigured">
             <label><span>API 公钥</span><input v-model="computeForm.publicKey" autocomplete="off" placeholder="输入 PublicKey"/></label>
@@ -434,10 +512,17 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
           </template>
           <template v-else>
             <p class="compute-summary">账户已连接　·　可用余额 <b>{{ computeBalance?.amountAvailable ? `¥ ${computeBalance.amountAvailable}` : '--' }}</b></p>
-            <div class="instance-picker">
-              <button v-for="item in computeInstances" :key="item.instanceId" type="button" :class="{ selected: item.instanceId === computeConfiguration?.boundInstanceId }" :disabled="busy" @click="bindComputeInstance(item)">
-                <span><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : '无 GPU 信息' }}</small></span><strong>{{ item.runningMode === 'noGpu' ? '无卡运行' : item.runningMode === 'gpu' ? 'GPU 运行' : item.rawState }}</strong>
-              </button>
+            <div class="instance-center-head"><span>共 {{ managedInstances.length }} 个实例</span><small>单击“设为主实例”后用于日常生成</small></div>
+            <div class="instance-picker managed-picker">
+              <article v-for="item in managedInstances" :key="item.instanceId" :class="{ selected: item.instanceId === computeConfiguration?.boundInstanceId, uncertain: item.lifecycleState === 'unknown' }">
+                <div class="instance-row-main">
+                  <span class="instance-role" :class="item.ownership === 'zhihua_managed' ? 'managed' : ''">{{ roleLabel(item.role) }}</span>
+                  <div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : 'GPU 规格待查询' }} · {{ ownershipLabel(item.ownership) }}</small></div>
+                  <strong>{{ managedModeLabel(item) }}</strong>
+                </div>
+                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
+              </article>
+              <p v-if="!managedInstances.length" class="empty-instances">平台没有返回可用实例。创建弹性实例前会先检查地域库存和实时报价，并再次让你确认。</p>
             </div>
           </template>
           <p v-if="computeNotice" class="connection-notice" :class="computeNoticeTone">{{ computeNotice }}</p>
@@ -475,4 +560,5 @@ export default { components: { FileTextIcon } };
 .settings-tabs button:disabled{opacity:.48;cursor:not-allowed}.connection-cards article[role="button"]{cursor:pointer;transition:.15s ease}.connection-cards article[role="button"]:hover,.connection-cards article[role="button"]:focus-visible{border-color:#8eb8f7;background:#f7faff;outline:0}.connection-backdrop{position:fixed;z-index:80;inset:30px 0 0 0;background:rgba(6,20,46,.32);display:grid;place-items:center;padding:24px}.connection-dialog{width:min(620px,calc(100vw - 80px));border:1px solid #cedbed;border-radius:13px;background:#fff;box-shadow:0 24px 70px rgba(16,45,88,.24);overflow:hidden}.connection-dialog>header{min-height:88px;padding:19px 22px;display:flex;align-items:flex-start;justify-content:space-between;border-bottom:1px solid var(--line);background:linear-gradient(135deg,#f7fbff,#fff)}.connection-dialog>header h2{font-size:22px}.connection-dialog>header p{margin-top:7px;color:#64799b;font-size:13px}.connection-dialog>header button{width:34px;height:34px;border:0;border-radius:7px;background:transparent;display:grid;place-items:center}.connection-dialog>header button:hover{background:#edf3fb}.connection-form{padding:20px 22px;display:flex;flex-direction:column;gap:16px}.connection-form label{display:grid;grid-template-columns:132px minmax(0,1fr);align-items:center;gap:8px 14px}.connection-form label>span{font-weight:700;color:#1b355f}.connection-form input,.connection-form select{height:43px;border:1px solid #cbd9ec;border-radius:8px;padding:0 12px;background:#fff;user-select:text}.connection-form input:focus,.connection-form select:focus{outline:2px solid #cfe2ff;border-color:var(--blue)}.connection-form small{grid-column:2;color:#6d809f;font-size:12px}.connection-notice{margin:2px 0 0 146px;padding:10px 12px;border-radius:7px;background:#f1f5fa;color:#52698e;font-size:13px}.connection-notice.success{background:#e8f8f1;color:#087d51}.connection-notice.error{background:#fff0ee;color:#b33b35}.connection-dialog>footer{min-height:72px;padding:13px 22px;border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:10px;background:#fbfdff}.connection-dialog button:disabled,.environment button:disabled{opacity:.55;cursor:not-allowed}.compute-summary{margin:0;padding:13px 15px;border-radius:8px;background:#eef6ff;color:#29486f}.compute-summary b{color:var(--blue);font-size:20px}.instance-picker{display:flex;flex-direction:column;gap:9px;max-height:280px;overflow:auto}.instance-picker>button{min-height:68px;padding:10px 14px;border:1px solid #d7e2ef;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:space-between;text-align:left;color:#17345f}.instance-picker>button.selected{border-color:var(--blue);background:#f1f7ff;box-shadow:0 0 0 1px var(--blue) inset}.instance-picker>button span{display:flex;flex-direction:column;gap:6px}.instance-picker>button small{color:#7183a0}.instance-picker>button strong{color:#315d9b;font-size:13px}
 .settings-tabs-spacer{flex:1}.policy-badge{padding:5px 9px;border-radius:14px;background:#e8f8f1;color:#087d51;font-size:12px;font-weight:700}.policy-badge.neutral{background:var(--surface-soft);color:var(--muted)}
 .policy-options{padding:0 14px;display:grid;gap:7px}.policy-options>button{min-height:55px;padding:7px 30px 7px 10px;border:1px solid #dbe4f0;border-radius:8px;background:#f9fbfe;text-align:left;position:relative;color:var(--text)}.policy-options>button.selected{border-color:var(--blue);background:#edf5ff;box-shadow:0 0 0 1px rgba(15,105,255,.08)}.policy-options>button>span{display:flex;align-items:center;justify-content:space-between;gap:8px}.policy-options b{font-size:13px}.policy-options small{color:var(--blue);font-size:10px;font-weight:700}.policy-options p{margin-top:3px;color:#657a9a;font-size:10px;line-height:1.3}.policy-options i{position:absolute;right:10px;top:19px;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:white;font-style:normal}.policy-guard{height:48px;margin:7px 14px 0;padding-top:7px;border-top:1px solid #e1e8f1;display:grid;grid-template-columns:27px minmax(0,1fr) 72px;align-items:center;gap:5px}.policy-guard>svg{color:#16355f}.policy-guard>span{min-width:0;display:flex;flex-direction:column}.policy-guard b{font-size:11px}.policy-guard small{color:#657a9a;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.policy-guard button{height:30px;border:1px solid #cfdbea;border-radius:6px;background:#fff;color:#31537f;font-size:11px}
+.compute-dialog{width:min(790px,calc(100vw - 80px))}.compute-dialog .connection-form{max-height:min(610px,calc(100vh - 250px));overflow:auto}.instance-center-head{display:flex;align-items:center;justify-content:space-between;color:#23446f;font-weight:700}.instance-center-head small{color:#7183a0;font-weight:400}.managed-picker{max-height:390px}.managed-picker>article{padding:13px 14px;border:1px solid #d7e2ef;border-radius:9px;background:#fff}.managed-picker>article.selected{border-color:var(--blue);background:#f4f8ff;box-shadow:0 0 0 1px var(--blue) inset}.managed-picker>article.uncertain{border-style:dashed;background:#fafbfc}.instance-row-main{display:grid;grid-template-columns:72px minmax(0,1fr) auto;align-items:center;gap:12px}.instance-row-main>div{min-width:0}.instance-row-main b,.instance-row-main small{display:block}.instance-row-main b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#17345f}.instance-row-main small{margin-top:5px;color:#7183a0;font-size:12px}.instance-row-main strong{color:#315d9b;font-size:13px}.instance-role{padding:5px 7px;border-radius:13px;background:#edf1f6;color:#5e708d;text-align:center;font-size:11px;font-weight:700}.instance-role.managed{background:#e9f8f1;color:#087d51}.instance-row-foot{margin-top:10px;padding-top:9px;border-top:1px solid #e6edf5;display:flex;align-items:center;gap:12px;color:#7183a0;font-size:11px}.instance-row-foot>div{margin-left:auto;display:flex;align-items:center;gap:8px}.selected-label{color:var(--blue);font-weight:700}.mini-btn{height:29px;padding:0 10px;border:1px solid #b9cce5;border-radius:6px;background:#fff;color:#285184;font-size:11px}.mini-btn.danger{border-color:#edb4ad;color:#b83830}.danger-text{color:#bd463d}.empty-instances{padding:24px 18px;border:1px dashed #cbd9eb;border-radius:9px;color:#6a7f9f;line-height:1.6;text-align:center}
 </style>

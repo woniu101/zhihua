@@ -1,6 +1,7 @@
 mod asset;
 mod audio_inspector;
 mod comp_share;
+mod compute_control;
 mod compute_pool;
 mod export;
 mod frame_composition;
@@ -24,9 +25,14 @@ use asset::{
 use audio_inspector::{CandidateAudioInspection, InspectCandidateAudioInput};
 use comp_share::{
     BindCompShareInstanceInput, CompShareActionResult, CompShareBalance, CompShareConfiguration,
-    CompShareConnectionTest, CompShareError, CompShareInstance, CompSharePowerState,
-    CompShareProvider, CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode,
+    CompShareConnectionTest, CompShareCreatePreflight, CompShareCreateSpec, CompShareError,
+    CompShareInstance, CompShareInstanceLocator, CompSharePowerState, CompShareProvider,
+    CompShareRunningMode, CompShareSchedulerResult, CompShareStartMode, CompShareZone,
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
+};
+use compute_control::{
+    ComputeControlStore, ComputeInstanceRole, ComputeOperation, ComputeOperationAction,
+    ComputeOperationStatus, ManagedComputeInstance, ReleaseEligibility,
 };
 use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
 use export::{
@@ -115,6 +121,26 @@ struct SelectCandidateVersionInput {
     version_id: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateManagedComputeInstanceInput {
+    idempotency_key: String,
+    name: String,
+    spec: CompShareCreateSpec,
+    role: ComputeInstanceRole,
+    confirmed: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseManagedComputeInstanceInput {
+    idempotency_key: String,
+    instance_id: String,
+    #[serde(default)]
+    release_data_disk: bool,
+    confirmed: bool,
+}
+
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum ComputeKeepAlivePolicy {
@@ -175,7 +201,10 @@ impl ComputeLifecycle {
     }
 
     fn policy(&self) -> ComputeKeepAlivePolicy {
-        *self.policy.read().unwrap_or_else(|error| error.into_inner())
+        *self
+            .policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn snapshot(&self) -> ComputePolicySnapshot {
@@ -203,7 +232,10 @@ impl ComputeLifecycle {
             .map_err(|error| format!("无法保存算力策略：{error}"))?;
         fs::write(self.policy_path.as_ref(), content)
             .map_err(|error| format!("无法写入算力策略：{error}"))?;
-        *self.policy.write().unwrap_or_else(|error| error.into_inner()) = policy;
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = policy;
         self.invalidate_idle_shutdown();
         Ok(self.snapshot())
     }
@@ -294,11 +326,322 @@ async fn list_compshare_instances(
 }
 
 #[tauri::command]
+async fn list_compshare_zones(
+    provider: State<'_, CompShareProvider>,
+) -> Result<Vec<CompShareZone>, CompShareError> {
+    provider.list_zones().await
+}
+
+#[tauri::command]
+async fn preflight_compshare_create(
+    provider: State<'_, CompShareProvider>,
+    spec: CompShareCreateSpec,
+) -> Result<CompShareCreatePreflight, CompShareError> {
+    provider.preflight_create(spec).await
+}
+
+#[tauri::command]
+fn list_managed_compute_instances(
+    store: State<'_, ComputeControlStore>,
+) -> Result<Vec<ManagedComputeInstance>, String> {
+    store.list_instances().map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn reconcile_compute_instances(
+    provider: State<'_, CompShareProvider>,
+    store: State<'_, ComputeControlStore>,
+) -> Result<Vec<ManagedComputeInstance>, String> {
+    let platform_instances = provider
+        .list_instances(ListCompShareInstancesInput {
+            region: None,
+            zone: None,
+        })
+        .await
+        .map_err(|error| error.message)?;
+    let configuration = provider.configuration().map_err(|error| error.message)?;
+    store
+        .reconcile(
+            &platform_instances,
+            configuration.bound_instance_id.as_deref(),
+        )
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+fn get_compute_release_eligibility(
+    store: State<'_, ComputeControlStore>,
+    instance_id: String,
+) -> Result<ReleaseEligibility, String> {
+    store
+        .release_eligibility(&instance_id)
+        .map_err(|error| error.message)
+}
+
+fn uncertain_compshare_result(error: &CompShareError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "REQUEST_TIMEOUT"
+            | "CONNECTION_FAILED"
+            | "NETWORK_ERROR"
+            | "HTTP_STATUS_ERROR"
+            | "INVALID_API_RESPONSE"
+            | "RESPONSE_TOO_LARGE"
+    )
+}
+
+#[tauri::command]
+async fn create_managed_compshare_instance(
+    provider: State<'_, CompShareProvider>,
+    store: State<'_, ComputeControlStore>,
+    input: CreateManagedComputeInstanceInput,
+) -> Result<ComputeOperation, String> {
+    if !input.confirmed {
+        return Err("创建实例前必须向用户展示地域、规格、镜像和价格并获得确认".to_owned());
+    }
+    if !matches!(
+        input.role,
+        ComputeInstanceRole::Elastic | ComputeInstanceRole::Test
+    ) {
+        return Err("客户端只能自动创建弹性实例或测试实例".to_owned());
+    }
+    let payload = serde_json::json!({
+        "name": input.name,
+        "role": input.role,
+        "spec": input.spec,
+    });
+    let (operation, claimed) = store
+        .claim_operation(
+            &input.idempotency_key,
+            None,
+            ComputeOperationAction::Create,
+            &payload,
+        )
+        .map_err(|error| error.message)?;
+    if !claimed {
+        if operation.action != ComputeOperationAction::Create || operation.payload != payload {
+            return Err("该幂等键已用于另一项算力操作".to_owned());
+        }
+        return Ok(operation);
+    }
+
+    let preflight = match provider.preflight_create(input.spec.clone()).await {
+        Ok(result) if result.capacity_available => result,
+        Ok(_) => {
+            let operation = store
+                .finish_operation(
+                    &input.idempotency_key,
+                    ComputeOperationStatus::Failed,
+                    None,
+                    None,
+                    Some("所选地域当前没有匹配的空闲实例"),
+                )
+                .map_err(|error| error.message)?;
+            return Ok(operation);
+        }
+        Err(error) => {
+            let status = if uncertain_compshare_result(&error) {
+                ComputeOperationStatus::Unknown
+            } else {
+                ComputeOperationStatus::Failed
+            };
+            let operation = store
+                .finish_operation(
+                    &input.idempotency_key,
+                    status,
+                    None,
+                    error.request_uuid.as_deref(),
+                    Some(&error.message),
+                )
+                .map_err(|store_error| store_error.message)?;
+            return Ok(operation);
+        }
+    };
+    debug_assert!(preflight.capacity_available);
+
+    let created = match provider
+        .create_instance(input.spec.clone(), input.name.clone())
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let status = if uncertain_compshare_result(&error) {
+                ComputeOperationStatus::Unknown
+            } else {
+                ComputeOperationStatus::Failed
+            };
+            return store
+                .finish_operation(
+                    &input.idempotency_key,
+                    status,
+                    None,
+                    error.request_uuid.as_deref(),
+                    Some(&error.message),
+                )
+                .map_err(|store_error| store_error.message);
+        }
+    };
+    let instance_id = created.instance_ids[0].clone();
+    let placeholder = CompShareInstance {
+        instance_id: instance_id.clone(),
+        name: Some(input.name),
+        region: input.spec.region.clone(),
+        zone: input.spec.zone.clone(),
+        state: CompSharePowerState::Starting,
+        raw_state: "Creating".to_owned(),
+        running_mode: CompShareRunningMode::Transitioning,
+        cpu: Some(input.spec.cpu),
+        memory_mb: Some(input.spec.memory_mb),
+        gpu_count: Some(input.spec.gpu_count),
+        gpu_type: Some(input.spec.gpu_type.clone()),
+        support_without_gpu_start: false,
+        ssh_login_command: None,
+        start_time: None,
+        stop_time: None,
+        release_time: None,
+        stop_scheduler_time: None,
+        instance_price: preflight.estimated_hourly_price,
+        disk_price: None,
+        image_price: None,
+        image_id: Some(input.spec.image_id.clone()),
+        charge_type: Some(input.spec.charge_type.clone()),
+        project_id: input.spec.project_id.clone(),
+    };
+    store
+        .register_zhihua_instance(&placeholder, input.role)
+        .map_err(|error| error.message)?;
+
+    if let Ok(instance) = provider
+        .describe_instance(CompShareInstanceLocator {
+            instance_id: instance_id.clone(),
+            region: input.spec.region,
+            zone: input.spec.zone,
+            project_id: input.spec.project_id,
+        })
+        .await
+    {
+        store
+            .register_zhihua_instance(&instance, input.role)
+            .map_err(|error| error.message)?;
+    }
+    store
+        .finish_operation(
+            &input.idempotency_key,
+            ComputeOperationStatus::Succeeded,
+            Some(&instance_id),
+            created.request_uuid.as_deref(),
+            None,
+        )
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn release_managed_compshare_instance(
+    provider: State<'_, CompShareProvider>,
+    store: State<'_, ComputeControlStore>,
+    input: ReleaseManagedComputeInstanceInput,
+) -> Result<ComputeOperation, String> {
+    if !input.confirmed {
+        return Err("释放实例需要用户明确确认".to_owned());
+    }
+    let payload = serde_json::json!({
+        "instanceId": input.instance_id,
+        "releaseDataDisk": input.release_data_disk,
+    });
+    let (operation, claimed) = store
+        .claim_operation(
+            &input.idempotency_key,
+            Some(&input.instance_id),
+            ComputeOperationAction::Terminate,
+            &payload,
+        )
+        .map_err(|error| error.message)?;
+    if !claimed {
+        if operation.action != ComputeOperationAction::Terminate || operation.payload != payload {
+            return Err("该幂等键已用于另一项算力操作".to_owned());
+        }
+        return Ok(operation);
+    }
+
+    let eligibility = store
+        .release_eligibility_excluding(&input.instance_id, Some(&input.idempotency_key))
+        .map_err(|error| error.message)?;
+    if !eligibility.allowed {
+        return store
+            .finish_operation(
+                &input.idempotency_key,
+                ComputeOperationStatus::Failed,
+                Some(&input.instance_id),
+                None,
+                Some(&eligibility.reasons.join("；")),
+            )
+            .map_err(|error| error.message);
+    }
+    let instance = store
+        .get_instance(&input.instance_id)
+        .map_err(|error| error.message)?;
+    store
+        .mark_terminating(&input.instance_id)
+        .map_err(|error| error.message)?;
+    let result = provider
+        .terminate_instance(
+            CompShareInstanceLocator {
+                instance_id: instance.instance_id.clone(),
+                region: instance.region,
+                zone: instance.zone,
+                project_id: instance.project_id,
+            },
+            input.release_data_disk,
+        )
+        .await;
+    match result {
+        Ok(result) => {
+            store
+                .mark_terminated(&input.instance_id)
+                .map_err(|error| error.message)?;
+            store
+                .finish_operation(
+                    &input.idempotency_key,
+                    ComputeOperationStatus::Succeeded,
+                    Some(&input.instance_id),
+                    result.request_uuid.as_deref(),
+                    None,
+                )
+                .map_err(|error| error.message)
+        }
+        Err(error) => {
+            let status = if uncertain_compshare_result(&error) {
+                ComputeOperationStatus::Unknown
+            } else {
+                ComputeOperationStatus::Failed
+            };
+            store
+                .finish_operation(
+                    &input.idempotency_key,
+                    status,
+                    Some(&input.instance_id),
+                    error.request_uuid.as_deref(),
+                    Some(&error.message),
+                )
+                .map_err(|store_error| store_error.message)
+        }
+    }
+}
+
+#[tauri::command]
 async fn bind_compshare_instance(
     provider: State<'_, CompShareProvider>,
+    store: State<'_, ComputeControlStore>,
     input: BindCompShareInstanceInput,
-) -> Result<CompShareInstance, CompShareError> {
-    provider.bind_instance(input).await
+) -> Result<CompShareInstance, String> {
+    let instance = provider
+        .bind_instance(input)
+        .await
+        .map_err(|error| error.message)?;
+    store
+        .adopt_primary(&instance)
+        .map_err(|error| error.message)?;
+    Ok(instance)
 }
 
 #[tauri::command]
@@ -438,7 +781,12 @@ async fn prepare_application_exit(
                     project_id: instance.project_id.clone(),
                 })
                 .await
-                .map_err(|error| format!("远端任务仍在运行，但无法补设平台关机保障：{}", error.message))?;
+                .map_err(|error| {
+                    format!(
+                        "远端任务仍在运行，但无法补设平台关机保障：{}",
+                        error.message
+                    )
+                })?;
         }
         return Ok(ApplicationExitProtection {
             active_remote_tasks,
@@ -2024,13 +2372,17 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|error| format!("无法确定应用数据目录：{error}"))?;
-            let llm = LlmProvider::initialize(app_data_dir.clone(), storage.info().database_path)
+            let database_path = storage.info().database_path;
+            let llm = LlmProvider::initialize(app_data_dir.clone(), database_path.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             let service = ServiceClient::new(app_data_dir.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let comp_share = CompShareProvider::new(app_data_dir.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
-            let compute_lifecycle = ComputeLifecycle::load(app_data_dir.join("compute-policy.json"));
+            let compute_control = ComputeControlStore::initialize(database_path)
+                .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
+            let compute_lifecycle =
+                ComputeLifecycle::load(app_data_dir.join("compute-policy.json"));
             let ssh_tunnel = SshTunnelManager::new(app_data_dir)
                 .map_err(|error| -> Box<dyn std::error::Error> { error.message.into() })?;
             app.manage(storage);
@@ -2044,11 +2396,28 @@ pub fn run() {
             app.manage(exporter);
             app.manage(llm);
             app.manage(compute_lifecycle);
+            app.manage(compute_control);
             app.manage(service);
             app.manage(comp_share);
             app.manage(ssh_tunnel);
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let comp_share = app_handle.state::<CompShareProvider>();
+                let compute_control = app_handle.state::<ComputeControlStore>();
+                if let Ok(configuration) = comp_share.configuration() {
+                    if configuration.credentials_stored {
+                        if let Ok(instances) = comp_share
+                            .list_instances(ListCompShareInstancesInput {
+                                region: None,
+                                zone: None,
+                            })
+                            .await
+                        {
+                            let _ = compute_control
+                                .reconcile(&instances, configuration.bound_instance_id.as_deref());
+                        }
+                    }
+                }
                 let manager = app_handle.state::<SshTunnelManager>();
                 let configured = manager
                     .status()
@@ -2056,7 +2425,6 @@ pub fn run() {
                     .unwrap_or(false);
                 if configured {
                     let service = app_handle.state::<ServiceClient>();
-                    let comp_share = app_handle.state::<CompShareProvider>();
                     let _ =
                         connect_service_through_tunnel_impl(&manager, &service, &comp_share).await;
                 }
@@ -2141,6 +2509,13 @@ pub fn run() {
             test_compshare_connection,
             get_compshare_balance,
             list_compshare_instances,
+            list_compshare_zones,
+            preflight_compshare_create,
+            list_managed_compute_instances,
+            reconcile_compute_instances,
+            get_compute_release_eligibility,
+            create_managed_compshare_instance,
+            release_managed_compshare_instance,
             bind_compshare_instance,
             get_bound_compshare_instance,
             start_compshare_instance,
