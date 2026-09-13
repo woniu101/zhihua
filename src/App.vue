@@ -2,24 +2,23 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import {
-  FileText,
-  Film,
   FolderKanban,
   HelpCircle,
-  Images,
   Minus,
   Settings,
   Square,
-  Upload,
   X,
 } from "lucide-vue-next";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import TaskCenter from "./components/TaskCenter.vue";
+import ProjectWorkspaceBar from "./components/ProjectWorkspaceBar.vue";
 
 const route = useRoute();
 const appWindow = isTauri() ? getCurrentWindow() : null;
 const isSettings = computed(() => route.path === "/settings");
+const projectRoutes = ["/sources", "/storyboard", "/assets", "/export"];
+const isProjectWorkspace = computed(() => projectRoutes.includes(route.path));
 const helpOpen = ref(false);
 const closing = ref(false);
 let unlistenClose: (() => void) | undefined;
@@ -55,10 +54,6 @@ onBeforeUnmount(() => unlistenClose?.());
 
 const nav = [
   { path: "/projects", label: "项目", icon: FolderKanban },
-  { path: "/sources", label: "资料", icon: FileText },
-  { path: "/storyboard", label: "分镜", icon: Film },
-  { path: "/assets", label: "素材", icon: Images },
-  { path: "/export", label: "导出", icon: Upload },
 ];
 </script>
 
@@ -95,21 +90,22 @@ const nav = [
       </div>
     </aside>
 
-    <main class="main-area">
-      <RouterView />
+    <main class="main-area" :class="{ 'with-project-bar': isProjectWorkspace }">
+      <ProjectWorkspaceBar v-if="isProjectWorkspace" />
+      <div class="route-view"><RouterView /></div>
     </main>
 
     <div v-if="helpOpen" class="help-backdrop" role="presentation" @click.self="helpOpen = false">
       <section class="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
         <header>
-          <div><span class="brand-mark">知</span><div><h2 id="help-title">开始使用知画</h2><p>按顺序完成资料、分镜、生成和导出。</p></div></div>
+          <div><span class="brand-mark">知</span><div><h2 id="help-title">开始使用知画</h2><p>选择完整视频或快速素材，知画会提示下一步。</p></div></div>
           <button type="button" aria-label="关闭帮助" @click="helpOpen = false"><X :size="20" /></button>
         </header>
         <ol>
-          <li><b>创建项目</b><span>填写名称，选择目标受众与成片时长。</span></li>
-          <li><b>导入并审核资料</b><span>核对知识点、事实和来源后再生成分镜。</span></li>
+          <li><b>选择开始方式</b><span>制作完整视频，或直接生成一个图片、视频素材。</span></li>
+          <li><b>确认内容与分镜</b><span>核对知识点、事实和来源后再消耗 GPU 算力。</span></li>
           <li><b>生成候选视频</b><span>优云智算仅在需要生成时切换到 GPU，空闲后自动关机。</span></li>
-          <li><b>选择并导出成片</b><span>候选可直接设为正式版本并导出 MP4，1080p AI 增强按需制作。</span></li>
+          <li><b>采用结果并交付</b><span>可以导出单段素材，也可以继续完成旁白、字幕和 MP4 成片。</span></li>
         </ol>
         <footer><button type="button" class="btn primary" @click="helpOpen = false">知道了</button></footer>
       </section>

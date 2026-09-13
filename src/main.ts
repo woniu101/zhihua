@@ -8,6 +8,7 @@ import SettingsView from "./views/SettingsView.vue";
 import SourcesView from "./views/SourcesView.vue";
 import StoryboardView from "./views/StoryboardView.vue";
 import { initializeAppearance } from "./services/appearance";
+import { activeProjectId } from "./services/storyboardRepository";
 import "./styles.css";
 
 initializeAppearance();
@@ -17,12 +18,17 @@ const router = createRouter({
   routes: [
     { path: "/", redirect: "/projects" },
     { path: "/projects", component: ProjectsView },
-    { path: "/sources", component: SourcesView },
-    { path: "/storyboard", component: StoryboardView },
-    { path: "/assets", component: AssetsView },
-    { path: "/export", component: ExportView },
+    { path: "/sources", component: SourcesView, meta: { requiresProject: true } },
+    { path: "/storyboard", component: StoryboardView, meta: { requiresProject: true } },
+    { path: "/assets", component: AssetsView, meta: { requiresProject: true } },
+    { path: "/export", component: ExportView, meta: { requiresProject: true } },
     { path: "/settings", component: SettingsView },
   ],
+});
+
+router.beforeEach((to) => {
+  if (to.meta.requiresProject && !activeProjectId()) return "/projects";
+  return true;
 });
 
 createApp(App).use(router).mount("#app");

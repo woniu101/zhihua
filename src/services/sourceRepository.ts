@@ -3,32 +3,13 @@ import type { SceneDraft } from "../domain/storyboard";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invokeNative, invokeOptional, isNativeRuntime, readLocal, writeLocal } from "./nativeBridge";
 
-const SOURCE_KEY = "zhihua.sources.v1";
-const POINT_KEY = "zhihua.knowledgePoints.v1";
+function sourceStorageKey(projectId: string): string {
+  return `zhihua.sources.${projectId}.v2`;
+}
 
-const timestamp = new Date().toISOString();
-const demoSources: SourceDocument[] = [
-  { id: "source-pdf", name: "为什么会打雷？.pdf", kind: "PDF", size: 3_200_000, pageCount: 12, enabled: true, status: "ready", progress: 100, statusMessage: "解析完成", createdAt: timestamp, extractedText: "2. 为什么会打雷？\n\n打雷是云层中发生剧烈放电时产生的声音。积雨云中存在大量的正、负电荷，当电荷积累到一定程度，空气的绝缘性被击穿，形成强大的电流通道，也就是闪电。\n\n闪电发生时，电流会使周围空气在极短时间内迅速加热，温度可达 3 万摄氏度以上。受热的空气迅速膨胀，形成强烈的冲击波，这就是我们听到的雷声。\n\n由于光的传播速度比声音快得多，所以我们总是先看到闪电，再听到雷声。" },
-  { id: "source-pptx", name: "天气与气候.pptx", kind: "PPTX", size: 18_600_000, pageCount: 26, enabled: true, status: "parsing", progress: 60, statusMessage: "解析中 60%", createdAt: timestamp, extractedText: "正在等待桌面解析器返回提取内容。" },
-  { id: "source-docx", name: "雷电科学原理.docx", kind: "DOCX", size: 1_100_000, pageCount: 8, enabled: true, status: "error", progress: 0, statusMessage: "解析失败 · 可重试", createdAt: timestamp, extractedText: "该演示文件解析失败。真实 DOCX 解析需由桌面端解析 command 提供。" },
-  { id: "source-txt", name: "常见气象问题.txt", kind: "TXT", size: 256_000, enabled: true, status: "ready", progress: 100, statusMessage: "解析完成", createdAt: timestamp, extractedText: "雷电天气常见问题：为什么先看到闪电，后听到雷声？" },
-  { id: "source-pdf-2", name: "闪电的类型与防护.pdf", kind: "PDF", size: 4_800_000, pageCount: 15, enabled: true, status: "ready", progress: 100, statusMessage: "解析完成", createdAt: timestamp, extractedText: "雷雨天气应远离高处、孤立大树和金属设施，并尽快进入安全建筑。" },
-];
-
-const demoPoints: KnowledgePoint[] = [
-  ["云层中正负电荷的形成与积累", "积雨云中存在大量正负电荷，积累到一定程度就可能发生放电。", "第 2 页", false],
-  ["空气被击穿形成闪电", "强电场击穿空气，形成短时间的强大电流通道。", "第 3 页", false],
-  ["闪电使空气迅速加热并产生冲击波", "温度数据需要与其他来源交叉核对。", "第 3 页", true],
-  ["先看到闪电后听到雷声的原因", "光速远高于声速，因此视觉信号先到达。", "第 3 页", false],
-  ["根据时间差估算距离", "通过闪电与雷声间隔可粗略估计距离。", "第 4 页", false],
-].map(([title, detail, location, needsConfirmation], index) => ({
-  id: `point-${index + 1}`,
-  title: title as string,
-  detail: detail as string,
-  needsConfirmation: needsConfirmation as boolean,
-  confirmed: !(needsConfirmation as boolean),
-  sourceRefs: [{ sourceId: "source-pdf", sourceName: "为什么会打雷？.pdf", location: location as string }],
-}));
+function pointStorageKey(projectId: string): string {
+  return `zhihua.knowledgePoints.${projectId}.v2`;
+}
 
 function kindFromFile(file: File): SourceKind | undefined {
   const extension = file.name.split(".").pop()?.toLocaleLowerCase();
@@ -90,7 +71,8 @@ export const sourceRepository = {
       const sources = await invokeNative<NativeSource[]>("list_sources", { projectId });
       return Promise.all((sources ?? []).map(fromNative));
     }
-    return readLocal(SOURCE_KEY, demoSources);
+    const projectId = activeProjectId();
+    return projectId ? readLocal(sourceStorageKey(projectId), []) : [];
   },
   async listKnowledgePoints(): Promise<KnowledgePoint[]> {
     if (isNativeRuntime()) {
@@ -98,7 +80,8 @@ export const sourceRepository = {
       if (!projectId) return [];
       return (await invokeNative<KnowledgePoint[]>("knowledge_point_list", { projectId })) ?? [];
     }
-    return readLocal(POINT_KEY, demoPoints);
+    const projectId = activeProjectId();
+    return projectId ? readLocal(pointStorageKey(projectId), []) : [];
   },
   async pickNative(): Promise<SourceDocument[] | undefined> {
     if (!isNativeRuntime()) return undefined;
@@ -161,7 +144,10 @@ export const sourceRepository = {
     }
     return source;
   },
-  save(sources: SourceDocument[]): void { writeLocal(SOURCE_KEY, sources); },
+  save(sources: SourceDocument[]): void {
+    const projectId = activeProjectId();
+    if (projectId) writeLocal(sourceStorageKey(projectId), sources);
+  },
   async savePoints(points: KnowledgePoint[]): Promise<void> {
     if (isNativeRuntime()) {
       const projectId = activeProjectId();
@@ -169,7 +155,8 @@ export const sourceRepository = {
       await invokeNative<KnowledgePoint[]>("knowledge_points_replace", { projectId, points });
       return;
     }
-    writeLocal(POINT_KEY, points);
+    const projectId = activeProjectId();
+    if (projectId) writeLocal(pointStorageKey(projectId), points);
   },
   async remove(id: string): Promise<void> { await invokeOptional("delete_source", { id }); },
   async setEnabled(id: string, enabled: boolean): Promise<void> { await invokeOptional("set_source_enabled", { input: { id, enabled } }); },

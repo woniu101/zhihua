@@ -9,36 +9,10 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { SceneDraft } from "../domain/storyboard";
 import { invokeNative, isNativeRuntime, readLocal, writeLocal } from "./nativeBridge";
 
-const STORAGE_KEY = "zhihua.projects.v1";
-
-const now = new Date().toISOString();
-const demoProjects: ZhihuaProject[] = [
-  ["为什么会打雷？", "通过生动的动画讲解雷电形成的原理。", 5, 42, "待导出", "lightning"],
-  ["校园消防安全", "学习火灾的预防、逃生与自救知识。", 8, 75, "已完成", "school"],
-  ["认识太阳系", "带领学生认识八大行星，探索宇宙的奥秘。", 12, 128, "生成中", "space"],
-  ["预防流感", "了解流感的传播途径，学会科学防护。", 6, 63, "草稿", "health"],
-  ["海洋生物的奇妙世界", "探索海洋生态系统，认识常见的海洋生物。", 10, 110, "编排中", "ocean"],
-  ["植物是如何生长的", "从种子到大树，了解植物的生长过程。", 7, 88, "草稿", "plant"],
-  ["气候变化与地球未来", "认识气候变化的影响，共同守护地球。", 9, 96, "已完成", "ice"],
-  ["中国传统文化之美", "走进传统文化，感受中华文明的魅力。", 11, 132, "生成中", "culture"],
-].map(([title, description, shotCount, durationSeconds, state, cover], index) => ({
-  id: `demo-${index + 1}`,
-  title: title as string,
-  description: description as string,
-  audience: index === 0 ? "小学高年级" : "",
-  targetDurationSeconds: durationSeconds as number,
-  shotCount: shotCount as number,
-  durationSeconds: durationSeconds as number,
-  state: state as ZhihuaProject["state"],
-  styleProfile: defaultProjectStyleProfile(),
-  cover: cover as string,
-  createdAt: now,
-  updatedAt: new Date(Date.now() - index * 3_600_000).toISOString(),
-  lastOpenedAt: index === 0 ? now : undefined,
-}));
+const STORAGE_KEY = "zhihua.projects.v2";
 
 function localList(): ZhihuaProject[] {
-  return readLocal(STORAGE_KEY, demoProjects);
+  return readLocal<ZhihuaProject[]>(STORAGE_KEY, []);
 }
 
 function persist(projects: ZhihuaProject[]): ZhihuaProject[] {
@@ -144,7 +118,7 @@ export const projectRepository = {
       durationSeconds: 0,
       state: "草稿",
       styleProfile: defaultProjectStyleProfile(),
-      cover: "lightning",
+      cover: "empty",
       createdAt: timestamp,
       updatedAt: timestamp,
       lastOpenedAt: timestamp,
@@ -171,11 +145,19 @@ export const projectRepository = {
   },
 
   async remove(id: string): Promise<void> {
+    const clearActive = () => {
+      if (readLocal<string | undefined>("zhihua.activeProjectId", undefined) === id) {
+        localStorage.removeItem("zhihua.activeProjectId");
+        localStorage.removeItem(`zhihua.lastProjectRoute.${id}`);
+      }
+    };
     if (isNativeRuntime()) {
       await invokeNative<void>("delete_project", { id });
+      clearActive();
       return;
     }
     persist(localList().filter((item) => item.id !== id));
+    clearActive();
   },
 
   async markOpened(id: string): Promise<void> {

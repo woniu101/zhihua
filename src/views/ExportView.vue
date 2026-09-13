@@ -291,7 +291,7 @@ onMounted(async () => {
 <template>
   <section class="page export-page">
     <header class="export-head">
-      <div class="page-title-line"><h1>检查并导出</h1><span class="ready" :class="statusTone"><span class="status-symbol"><Check v-if="integrityPassed && capability.available" :size="14"/><AlertTriangle v-else :size="15"/></span><b>{{ exportStatus==='checking' ? '正在检查' : exportStatus==='blocked' ? '暂不可导出' : exportStatus==='exporting' ? '正在导出' : exportStatus==='failed' ? '导出失败' : exportStatus==='succeeded' ? '导出完成' : '准备就绪' }}</b><small>{{ exportMessage }}</small></span></div>
+      <div class="page-title-line"><h1>成片</h1><span class="ready" :class="statusTone"><span class="status-symbol"><Check v-if="integrityPassed && capability.available" :size="14"/><AlertTriangle v-else :size="15"/></span><b>{{ exportStatus==='checking' ? '正在检查' : exportStatus==='blocked' ? '暂不可导出' : exportStatus==='exporting' ? '正在导出' : exportStatus==='failed' ? '导出失败' : exportStatus==='succeeded' ? '导出完成' : '准备就绪' }}</b><small>{{ exportMessage }}</small></span></div>
       <button class="btn" @click="runChecks"><RotateCw :size="17"/>重新检查</button>
     </header>
 

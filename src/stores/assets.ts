@@ -33,68 +33,9 @@ const nowText = () => new Intl.DateTimeFormat("zh-CN", {
 
 const uid = (prefix: string) => `${prefix}-${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`;
 
-function version(label: string, fileName: string, dimensions: string | undefined, duration: string | undefined, note: string): AssetVersion {
-  return {
-    id: uid("version"),
-    label,
-    fileName,
-    format: fileName.split(".").pop()?.toUpperCase() ?? "未知",
-    dimensions,
-    duration,
-    createdAt: "2026-09-08 14:28",
-    note,
-  };
-}
-
-function seedAsset(
-  id: string,
-  name: string,
-  category: AssetCategory,
-  fallbackImage: string,
-  fileName: string,
-  links: string[],
-  versionCount = 1,
-): AssetItem {
-  const mediaType: AssetMediaType = category === "音频" ? "audio" : "image";
-  const versions = Array.from({ length: versionCount }, (_, index) => {
-    const number = versionCount - index;
-    return version(
-      `V${number}`,
-      fileName,
-      mediaType === "image" ? "1920 × 1080" : undefined,
-      mediaType === "audio" ? "02:42" : undefined,
-      number === 1 ? "初始版本" : "优化了构图、亮度和画面细节",
-    );
-  });
-  return {
-    id,
-    name,
-    category,
-    mediaType,
-    source: "演示素材",
-    description: name === "闪电构图"
-      ? "乌云密布的夜空中闪电劈下，突出雷电的强烈感，用于科普分镜的关键画面。"
-      : `${name}，用于当前项目的参考素材。`,
-    fallbackImage,
-    currentVersionId: versions[0].id,
-    versions,
-    linkedShotIds: links,
-  };
-}
-
 const state = reactive<AssetStoreState>({
-  items: [
-    seedAsset("clouds", "雷云场景", "场景", "clouds", "thunder-clouds.png", ["01", "02", "03"]),
-    seedAsset("bolt", "闪电构图", "场景", "bolt", "lightning.png", ["01", "02", "03", "04", "05"], 2),
-    seedAsset("runner", "安全避险人物", "角色", "runner", "runner.png", ["02", "04", "05"]),
-    seedAsset("mountain", "山地背景", "场景", "mountain", "mountain.png", ["01", "03"]),
-    seedAsset("palette", "科普配色", "风格", "palette", "palette.png", ["01"]),
-    seedAsset("audio", "轻柔科普音乐", "音频", "audio", "science-music.mp3", ["01", "03", "05"]),
-    seedAsset("safety", "避险道具组合", "道具", "safety", "safety-kit.png", ["05"]),
-    seedAsset("village", "夜晚小镇", "场景", "village", "night-town.png", ["02", "04"]),
-    seedAsset("street", "雨夜街道", "场景", "street", "rain-street.png", ["04"]),
-  ],
-  selectedId: "bolt",
+  items: [],
+  selectedId: null,
   activeCategory: "全部",
   query: "",
   detailTab: "versions",
@@ -102,6 +43,7 @@ const state = reactive<AssetStoreState>({
 });
 let loadedProjectId: string | undefined;
 let loadingPromise: Promise<void> | undefined;
+const browserAssetsByProject = new Map<string, AssetItem[]>();
 
 const selectedAsset = computed(() => state.items.find((item) => item.id === state.selectedId) ?? null);
 const filteredAssets = computed(() => {
@@ -177,7 +119,6 @@ function fileAsBase64(file: File): Promise<string> {
 }
 
 async function loadActiveProject(force = false): Promise<void> {
-  if (!isNativeRuntime()) return;
   const projectId = activeProjectId();
   if (!projectId) {
     state.items = [];
@@ -189,7 +130,10 @@ async function loadActiveProject(force = false): Promise<void> {
   if (loadingPromise) return loadingPromise;
   loadingPromise = (async () => {
     try {
-      state.items = await assetRepository.list(projectId);
+      state.items = isNativeRuntime()
+        ? await assetRepository.list(projectId)
+        : (browserAssetsByProject.get(projectId) ?? []);
+      if (!isNativeRuntime()) browserAssetsByProject.set(projectId, state.items);
       loadedProjectId = projectId;
       state.selectedId = state.items[0]?.id ?? null;
       state.notice = state.items.length ? "" : "当前项目还没有素材";
@@ -271,7 +215,10 @@ async function importFiles(files: File[], source: ImportSource): Promise<number>
     };
     return asset;
   }));
+  const projectId = activeProjectId();
+  if (projectId && projectId !== loadedProjectId) await loadActiveProject();
   state.items.unshift(...imported);
+  if (projectId) browserAssetsByProject.set(projectId, state.items);
   if (imported[0]) {
     state.selectedId = imported[0].id;
     state.activeCategory = "全部";
@@ -420,7 +367,7 @@ async function removeSelected(): Promise<boolean> {
 }
 
 export function useAssetStore() {
-  if (isNativeRuntime() && activeProjectId() !== loadedProjectId) void loadActiveProject();
+  if (activeProjectId() !== loadedProjectId) void loadActiveProject();
   return {
     state,
     selectedAsset,
