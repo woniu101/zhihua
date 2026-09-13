@@ -1044,6 +1044,25 @@ async fn provision_compute_worker_connection(
     lifecycle: State<'_, ComputeLifecycle>,
     instance_id: String,
 ) -> Result<ServiceProbe, String> {
+    provision_compute_worker_connection_impl(
+        &manager,
+        &service,
+        &comp_share,
+        &compute,
+        &lifecycle,
+        &instance_id,
+    )
+    .await
+}
+
+async fn provision_compute_worker_connection_impl(
+    manager: &SshTunnelManager,
+    service: &ServiceClient,
+    comp_share: &CompShareProvider,
+    compute: &ComputeControlStore,
+    lifecycle: &ComputeLifecycle,
+    instance_id: &str,
+) -> Result<ServiceProbe, String> {
     lifecycle.invalidate_idle_shutdown();
     let managed = compute
         .get_instance(&instance_id)
@@ -1248,16 +1267,15 @@ async fn prepare_compute_worker_impl(
         .status_for(instance_id)
         .map_err(|error| error.message)?;
     if !tunnel.configured {
-        let _ = compute.record_worker_readiness(
+        provision_compute_worker_connection_impl(
+            manager,
+            service,
+            comp_share,
+            compute,
+            lifecycle,
             instance_id,
-            ComputeServiceState::Unreachable,
-            None,
-            None,
-            None,
-            None,
-            Some("实例尚未配置独立 SSH 连接"),
-        );
-        return Err("该实例尚未配置独立 SSH 连接，未启动 GPU 以避免产生空耗费用".to_owned());
+        )
+        .await?;
     }
 
     let locator = compute_instance_locator(&managed);
