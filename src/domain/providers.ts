@@ -84,6 +84,7 @@ export interface VideoGenerationRequest {
   seed: number;
   assetIds: string[];
   h3AudioPolicy: H3AudioPolicy;
+  workerPoolPrepared?: boolean;
 }
 
 export interface ImageGenerationRequest {

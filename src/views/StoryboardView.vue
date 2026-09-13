@@ -10,6 +10,7 @@ import { assetRepository } from "../services/assetRepository";
 import { generationRepository, type CandidateVersion, type EnhancedVersion } from "../services/generationRepository";
 import { llmRepository, normalizeLlmError, type SceneRevisionProposal } from "../services/llmRepository";
 import { ComfyUiH3Provider, normalizeConnectionFailure, serviceRepository } from "../services/serviceRepository";
+import { compShareRepository } from "../services/compShareRepository";
 import { ttsRepository, type NarrationArtifact, type SystemVoice } from "../services/ttsRepository";
 import { requestNativePreview } from "../services/exportService";
 import { useStoryboardStore } from "../stores/storyboard";
@@ -33,6 +34,7 @@ const activeInspector = ref<"content" | "visual" | "generation">("visual");
 const submitting = ref(false);
 const batchSubmitting = ref(false);
 const batchNotice = ref("");
+const batchWorkerLimit = ref<1 | 2 | 4 | 8>(1);
 const previewBusy = ref(false);
 const fullPreviewUrl = ref("");
 const fullPreviewOpen = ref(false);
@@ -660,6 +662,57 @@ async function openPreviewLocation() {
   }
 }
 
+async function prepareBatchWorkerPool(taskCount: number) {
+  batchNotice.value = "正在准备主实例的生成环境…";
+  const primaryProbe = await serviceRepository.prepareGeneration();
+  if (!primaryProbe?.comfyuiReady) {
+    throw new Error(primaryProbe?.detail ?? "主实例生成环境尚未就绪。");
+  }
+
+  let preparedWorkers = 1;
+  let preparationFailures = 0;
+  const workerLimit = Math.min(batchWorkerLimit.value, taskCount);
+  if (workerLimit > 1) {
+    const [configuration, managed] = await Promise.all([
+      compShareRepository.configuration(),
+      compShareRepository.managedInstances(),
+    ]);
+    const elasticCandidates = managed
+      .filter((item) =>
+        item.instanceId !== configuration.boundInstanceId
+        && (item.role === "elastic" || item.role === "test")
+        && !["unknown", "terminating", "terminated", "error"].includes(item.lifecycleState)
+      )
+      .slice(0, workerLimit - 1);
+    if (elasticCandidates.length) {
+      batchNotice.value = `主实例已就绪，正在并行准备 ${elasticCandidates.length} 个弹性 worker…`;
+      const results = await Promise.allSettled(
+        elasticCandidates.map((item) => serviceRepository.prepareWorker(item.instanceId)),
+      );
+      preparedWorkers += results.filter(
+        (result) => result.status === "fulfilled" && Boolean(result.value?.comfyuiReady),
+      ).length;
+      preparationFailures = results.length - (preparedWorkers - 1);
+    }
+  }
+
+  const plan = await serviceRepository.planComputePool({
+    taskCount,
+    policy: {
+      mode: batchWorkerLimit.value === 1 ? "single" : "elastic",
+      maxWorkers: batchWorkerLimit.value,
+      maxInstances: batchWorkerLimit.value,
+    },
+    readyWorkers: preparedWorkers,
+    activeInstances: preparedWorkers,
+    accountInstanceQuotaRemaining: 0,
+    capacityAvailableInstances: 0,
+    affordableNewInstances: 0,
+    workersPerNewInstance: 1,
+  });
+  return { plan, preparationFailures };
+}
+
 async function generateIncompleteScenes() {
   if (batchSubmitting.value || submitting.value || enhancing.value) return;
   const candidates = scenes.value.filter((scene) =>
@@ -674,7 +727,17 @@ async function generateIncompleteScenes() {
   }
 
   batchSubmitting.value = true;
-  batchNotice.value = `正在将 ${valid.length} 个分镜加入生成队列…`;
+  let pool: Awaited<ReturnType<typeof prepareBatchWorkerPool>>;
+  try {
+    pool = await prepareBatchWorkerPool(valid.length);
+    batchNotice.value = pool.plan.plannedWorkers > 1
+      ? `${pool.plan.plannedWorkers} 路 worker 已就绪，正在分配 ${valid.length} 个分镜…`
+      : `单路 worker 已就绪，正在将 ${valid.length} 个分镜加入队列…`;
+  } catch (error) {
+    batchSubmitting.value = false;
+    batchNotice.value = normalizeConnectionFailure(error).message;
+    return;
+  }
   let submittedCount = 0;
   const failures: string[] = [];
   for (const scene of valid) {
@@ -702,6 +765,7 @@ async function generateIncompleteScenes() {
         seed: crypto.getRandomValues(new Uint32Array(1))[0],
         assetIds: scene.assetIds,
         h3AudioPolicy: settings.value.h3AudioPolicy,
+        workerPoolPrepared: true,
       });
       await save(scene.id, {
         lastJobId: submitted.id,
@@ -718,9 +782,15 @@ async function generateIncompleteScenes() {
     }
   }
   batchSubmitting.value = false;
+  const poolDetail = pool.plan.plannedWorkers > 1
+    ? `${pool.plan.plannedWorkers} 路并行，${pool.plan.queuedTasks} 个进入后续轮次`
+    : "单路串行";
+  const preparationDetail = pool.preparationFailures
+    ? `；${pool.preparationFailures} 个弹性实例未就绪，已自动降级`
+    : "";
   batchNotice.value = failures.length
-    ? `已排入 ${submittedCount} 个，${failures.length} 个未提交：${failures[0]}`
-    : `${submittedCount} 个分镜已排入队列，可在右上角“任务”中查看。`;
+    ? `已排入 ${submittedCount} 个，${failures.length} 个未提交：${failures[0]}（${poolDetail}${preparationDetail}）`
+    : `${submittedCount} 个分镜已排入队列（${poolDetail}${preparationDetail}）。`;
 }
 
 async function openFullPreview() {
@@ -876,7 +946,7 @@ const confirmRemove = () => {
   <section class="page storyboard-page">
     <header class="story-head">
       <div><p class="breadcrumb">{{ workspace.projectTitle.value }}　/　分镜</p><div class="page-title-line"><h1>分镜编排</h1><ComputeStatus context="提交生成时自动切换 GPU"/></div></div>
-      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene || selectedScene.locked" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="18"/>{{ previewBusy ? '正在合成' : '预览全片' }}</button></div>
+      <div class="head-actions"><div class="format-pill"><span>项目画幅</span><select :value="settings.aspectRatio" aria-label="项目画幅" @change="setProjectAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="1:1">1:1</option></select><i></i><span>候选画面</span><b>{{ activeFrameProfile.visibleWidth }}×{{ activeFrameProfile.visibleHeight }}</b></div><label class="pool-pill" :class="{ active: batchWorkerLimit > 1 }" title="多路会同时启动已有的知画弹性实例并产生 GPU 费用，不会自动购买新实例"><span>批量算力</span><select v-model.number="batchWorkerLimit" :disabled="batchSubmitting" aria-label="批量生成算力"><option :value="1">单路</option><option :value="2">多路 ×2</option><option :value="4">多路 ×4</option><option :value="8">多路 ×8</option></select></label><button class="btn primary" :disabled="submitting || batchSubmitting || enhancing || isTaskActive || !selectedScene || selectedScene.locked" @click="generateSelected"><LoaderCircle v-if="submitting" class="spin" :size="19"/><Sparkles v-else :size="19"/>{{ submitting ? '正在提交' : '生成选中分镜' }}</button><button class="btn" :disabled="batchSubmitting || submitting || enhancing || !scenes.length" :title="batchNotice || '将尚无候选版本的分镜依次排入队列'" @click="generateIncompleteScenes"><LoaderCircle v-if="batchSubmitting" class="spin" :size="18"/><Film v-else :size="18"/>{{ batchSubmitting ? '正在排队' : '生成未完成分镜' }}</button><button class="btn" :disabled="previewBusy || !scenes.length" @click="openFullPreview"><LoaderCircle v-if="previewBusy" class="spin" :size="18"/><Play v-else :size="18"/>{{ previewBusy ? '正在合成' : '预览全片' }}</button></div>
     </header>
 
     <div class="story-workspace">
@@ -1038,4 +1108,6 @@ const confirmRemove = () => {
 .prompt-controls{display:flex;align-items:center;gap:7px}.ai-revise{height:30px;padding:0 9px;border:1px solid #bfd6f6;border-radius:6px;background:#f3f8ff;color:var(--blue);display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700}.ai-revise:disabled{opacity:.5;cursor:not-allowed}.revision-backdrop{position:fixed;z-index:110;inset:30px 0 0;background:rgba(5,20,45,.48);display:grid;place-items:center;padding:24px}.revision-dialog{width:min(860px,calc(100vw - 80px));max-height:calc(100vh - 90px);overflow:auto;border:1px solid #cbd9eb;border-radius:13px;background:var(--surface);box-shadow:0 26px 80px rgba(8,32,70,.28)}.revision-dialog>header{min-height:82px;padding:17px 21px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;justify-content:space-between}.revision-dialog>header p{margin-top:6px;color:var(--muted);font-size:12px}.revision-dialog>header button{width:34px;height:34px;border:0;border-radius:7px;background:transparent;color:var(--text);display:grid;place-items:center}.revision-body{padding:18px 21px;display:flex;flex-direction:column;gap:14px}.revision-body>label{display:flex;flex-direction:column;gap:7px;font-weight:700}.revision-body>label textarea{height:100px}.revision-compare{display:grid;grid-template-columns:1fr 1fr;gap:12px}.revision-compare article{min-height:188px;padding:14px;border:1px solid var(--line);border-radius:9px;background:var(--surface-soft)}.revision-compare article.proposed{border-color:#9ec3f6;background:#f1f7ff}.revision-compare h3{margin:8px 0;font-size:16px}.revision-compare p{min-height:72px;color:#405a80;font-size:13px;line-height:1.55;white-space:pre-wrap}.revision-compare small{display:block;margin-top:9px;color:var(--muted);line-height:1.5}.revision-summary{padding:10px 12px;border-radius:8px;background:#eaf7f1;color:#196e51;display:flex;flex-direction:column;gap:5px}.revision-summary span{font-size:11px}.revision-error{padding:9px 11px;border-radius:7px;background:#fff0ee;color:#b23c36;font-size:12px}.revision-dialog>footer{min-height:68px;padding:11px 21px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:9px}
 .duration-picker{position:relative;margin:0 0 15px;padding-right:78px}.duration-picker>input[type="range"]{width:100%;height:26px;accent-color:var(--blue)}.duration-scale{display:flex;justify-content:space-between;color:var(--muted);font-size:10px}.duration-picker>label{position:absolute;right:0;top:0;width:66px;height:42px;border:1px solid var(--line);border-radius:8px;background:var(--surface-soft);display:flex;align-items:center;justify-content:center;gap:3px}.duration-picker>label input{width:34px;border:0;background:transparent;color:var(--text);font-size:16px;font-weight:800;text-align:right;outline:none}.duration-picker>label span{color:var(--muted);font-size:11px}
 .shot-panel>.panel-head h2{display:flex;align-items:baseline;gap:4px;white-space:nowrap;flex:0 0 auto}.shot-panel>.panel-head h2 span{font-variant-numeric:tabular-nums}
+.pool-pill{height:49px;padding:0 10px;border:1px solid var(--line);border-radius:9px;background:var(--surface);display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;white-space:nowrap}.pool-pill select{height:30px;border:1px solid #cbd9eb;border-radius:6px;background:var(--surface-soft);padding:0 7px;color:var(--text);font-size:12px;font-weight:700}.pool-pill.active{border-color:#9fc3f4;background:#f2f7ff;color:var(--blue)}
+@media(max-width:1380px){.pool-pill>span{display:none}.pool-pill{padding:0 7px}}
 </style>

@@ -234,8 +234,11 @@ export const serviceRepository = {
     if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
     return mapJob(job);
   },
-  planComputePool: (input: ComputePoolPlanInput) =>
-    invokeNative<ComputePoolPlan>("plan_generation_compute_pool", { input }),
+  planComputePool: async (input: ComputePoolPlanInput) => {
+    const plan = await invokeNative<ComputePoolPlan>("plan_generation_compute_pool", { input });
+    if (!plan) throw new Error("计算池计划仅可在桌面客户端中生成。");
+    return plan;
+  },
   reserveWorker: (clientRequestId: string) =>
     invokeNative<ComputeWorkerLease>("reserve_service_worker", { clientRequestId }),
   releaseWorker: (clientRequestId: string) =>
@@ -399,9 +402,11 @@ export class ComfyUiH3Provider implements VideoProvider {
     const uploaded: ServiceInputUpload[] = [];
     let lease: ComputeWorkerLease | undefined;
     try {
-      const probe = await serviceRepository.prepareGeneration();
-      if (!probe?.comfyuiReady) {
-        throw new Error(probe?.detail ?? "生成环境尚未就绪，请稍后重试。");
+      if (!request.workerPoolPrepared) {
+        const probe = await serviceRepository.prepareGeneration();
+        if (!probe?.comfyuiReady) {
+          throw new Error(probe?.detail ?? "生成环境尚未就绪，请稍后重试。");
+        }
       }
       const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
       if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
