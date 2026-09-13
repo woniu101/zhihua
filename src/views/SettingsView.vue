@@ -808,7 +808,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
     <div v-if="elasticCreateOpen" class="connection-backdrop" role="presentation" @click.self="closeElasticCreate">
       <section class="connection-dialog elastic-create-dialog" role="dialog" aria-modal="true" aria-labelledby="elastic-create-title">
-        <header><div><h2 id="elastic-create-title">创建弹性实例</h2><p>复用当前主实例的地域、镜像和单卡规格。预检只查询库存与单台报价，最终确认后才提交按量实例。</p></div><button type="button" aria-label="关闭" :disabled="elasticCreateBusy" @click="closeElasticCreate"><X :size="20"/></button></header>
+        <header><div><h2 id="elastic-create-title">创建弹性实例</h2><p>复用当前主实例的地域、镜像和单卡规格。确认后创建按量实例；全部结果完成本地校验后自动关机并释放实例，数据盘默认保留。</p></div><button type="button" aria-label="关闭" :disabled="elasticCreateBusy" @click="closeElasticCreate"><X :size="20"/></button></header>
         <div class="connection-form elastic-create-form">
           <label><span>实例名称</span><input v-model.trim="elasticForm.name" maxlength="63" autocomplete="off"/></label>
           <label><span>创建数量</span><input v-model.number="elasticForm.count" type="number" min="1" max="50" step="1"/><small>每台实例分别使用幂等操作；实时库存和账号配额不足时允许部分成功，知画不会自动补购。</small></label>

@@ -31,9 +31,9 @@ use comp_share::{
     ListCompShareInstancesInput, SaveCompShareCredentialsInput, UpdateCompShareStopSchedulerInput,
 };
 use compute_control::{
-    ComputeControlError, ComputeControlStore, ComputeInstanceRole, ComputeOperation,
-    ComputeOperationAction, ComputeOperationStatus, ComputeServiceState, ComputeWorkerLease,
-    ComputeWorkerReadiness, ManagedComputeInstance, ReleaseEligibility,
+    ComputeCleanupPolicy, ComputeControlError, ComputeControlStore, ComputeInstanceRole,
+    ComputeOperation, ComputeOperationAction, ComputeOperationStatus, ComputeServiceState,
+    ComputeWorkerLease, ComputeWorkerReadiness, ManagedComputeInstance, ReleaseEligibility,
 };
 use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
 use export::{
@@ -390,11 +390,34 @@ async fn reconcile_compute_instances(
 #[tauri::command]
 fn get_compute_release_eligibility(
     store: State<'_, ComputeControlStore>,
+    queue: State<'_, JobQueueStorage>,
     instance_id: String,
 ) -> Result<ReleaseEligibility, String> {
-    store
-        .release_eligibility(&instance_id)
-        .map_err(|error| error.message)
+    compute_release_eligibility(&store, &queue, &instance_id, None)
+}
+
+fn compute_release_eligibility(
+    store: &ComputeControlStore,
+    queue: &JobQueueStorage,
+    instance_id: &str,
+    excluded_idempotency_key: Option<&str>,
+) -> Result<ReleaseEligibility, String> {
+    let mut eligibility = match excluded_idempotency_key {
+        Some(key) => store.release_eligibility_excluding(instance_id, Some(key)),
+        None => store.release_eligibility(instance_id),
+    }
+    .map_err(|error| error.message)?;
+    let worker_id = format!("instance:{instance_id}:gpu:0");
+    if queue
+        .has_unsettled_remote_jobs_for_worker(&worker_id)
+        .map_err(|error| error.message)?
+    {
+        eligibility
+            .reasons
+            .push("实例仍有尚未取回并校验的远端结果".to_owned());
+        eligibility.allowed = false;
+    }
+    Ok(eligibility)
 }
 
 fn uncertain_compshare_result(error: &CompShareError) -> bool {
@@ -558,11 +581,21 @@ async fn create_managed_compshare_instance(
 async fn release_managed_compshare_instance(
     provider: State<'_, CompShareProvider>,
     store: State<'_, ComputeControlStore>,
+    queue: State<'_, JobQueueStorage>,
     input: ReleaseManagedComputeInstanceInput,
 ) -> Result<ComputeOperation, String> {
     if !input.confirmed {
         return Err("释放实例需要用户明确确认".to_owned());
     }
+    release_managed_compshare_instance_impl(&provider, &store, &queue, input).await
+}
+
+async fn release_managed_compshare_instance_impl(
+    provider: &CompShareProvider,
+    store: &ComputeControlStore,
+    queue: &JobQueueStorage,
+    input: ReleaseManagedComputeInstanceInput,
+) -> Result<ComputeOperation, String> {
     let payload = serde_json::json!({
         "instanceId": input.instance_id,
         "releaseDataDisk": input.release_data_disk,
@@ -582,9 +615,12 @@ async fn release_managed_compshare_instance(
         return Ok(operation);
     }
 
-    let eligibility = store
-        .release_eligibility_excluding(&input.instance_id, Some(&input.idempotency_key))
-        .map_err(|error| error.message)?;
+    let eligibility = compute_release_eligibility(
+        store,
+        queue,
+        &input.instance_id,
+        Some(&input.idempotency_key),
+    )?;
     if !eligibility.allowed {
         return store
             .finish_operation(
@@ -645,6 +681,39 @@ async fn release_managed_compshare_instance(
                 .map_err(|store_error| store_error.message)
         }
     }
+}
+
+async fn release_idle_elastic_instance(
+    provider: &CompShareProvider,
+    store: &ComputeControlStore,
+    queue: &JobQueueStorage,
+    instance: &ManagedComputeInstance,
+) -> Result<Option<ComputeOperation>, String> {
+    if instance.role != ComputeInstanceRole::Elastic
+        || instance.cleanup_policy != ComputeCleanupPolicy::ReleaseWhenIdle
+        || !instance.platform_state.eq_ignore_ascii_case("stopped")
+        || instance.running_mode != "stopped"
+    {
+        return Ok(None);
+    }
+    let eligibility = compute_release_eligibility(store, queue, &instance.instance_id, None)?;
+    if !eligibility.allowed {
+        return Ok(None);
+    }
+    let stop_marker = instance.stop_time.unwrap_or(0);
+    let operation = release_managed_compshare_instance_impl(
+        provider,
+        store,
+        queue,
+        ReleaseManagedComputeInstanceInput {
+            idempotency_key: format!("auto-release:{}:{stop_marker}", instance.instance_id),
+            instance_id: instance.instance_id.clone(),
+            release_data_disk: false,
+            confirmed: true,
+        },
+    )
+    .await?;
+    Ok(Some(operation))
 }
 
 #[tauri::command]
@@ -2466,8 +2535,6 @@ fn select_candidate_version(
 #[tauri::command]
 async fn download_completed_job(
     app: AppHandle,
-    manager: State<'_, SshTunnelManager>,
-    provider: State<'_, CompShareProvider>,
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
@@ -2606,10 +2673,7 @@ async fn download_completed_job(
                 .map_err(|error| error.message)?,
         );
     }
-    finish_result_transfer(
-        &app, &manager, &provider, &compute, &queue, &lifecycle, &job,
-    )
-    .await?;
+    finish_result_transfer(&app, &compute, &queue, &lifecycle, &job)?;
     Ok(candidates)
 }
 
@@ -2640,8 +2704,6 @@ async fn preview_project_video(
 #[tauri::command]
 async fn download_completed_image_job(
     app: AppHandle,
-    manager: State<'_, SshTunnelManager>,
-    provider: State<'_, CompShareProvider>,
     projects: State<'_, ProjectStorage>,
     assets: State<'_, AssetStorage>,
     queue: State<'_, JobQueueStorage>,
@@ -2718,18 +2780,13 @@ async fn download_completed_image_job(
         let _ = fs::remove_file(&downloaded.destination_path);
         imported.push(result?);
     }
-    finish_result_transfer(
-        &app, &manager, &provider, &compute, &queue, &lifecycle, &job,
-    )
-    .await?;
+    finish_result_transfer(&app, &compute, &queue, &lifecycle, &job)?;
     Ok(imported)
 }
 
 #[tauri::command]
 async fn download_completed_enhancement(
     app: AppHandle,
-    manager: State<'_, SshTunnelManager>,
-    provider: State<'_, CompShareProvider>,
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
@@ -2834,17 +2891,12 @@ async fn download_completed_enhancement(
                 .map_err(|error| error.message)?,
         );
     }
-    finish_result_transfer(
-        &app, &manager, &provider, &compute, &queue, &lifecycle, &job,
-    )
-    .await?;
+    finish_result_transfer(&app, &compute, &queue, &lifecycle, &job)?;
     Ok(enhanced_versions)
 }
 
-async fn finish_result_transfer(
+fn finish_result_transfer(
     app: &AppHandle,
-    manager: &SshTunnelManager,
-    provider: &CompShareProvider,
     compute: &ComputeControlStore,
     queue: &JobQueueStorage,
     lifecycle: &ComputeLifecycle,
@@ -2864,12 +2916,48 @@ async fn finish_result_transfer(
         return Ok(());
     };
     if managed.running_mode == "no_gpu" {
-        let _ = manager.stop_for(&managed.instance_id).await;
-        let _ = provider
-            .stop_instance_for(compute_instance_locator(&managed))
-            .await;
+        schedule_result_instance_cleanup(app, managed.instance_id);
     }
     Ok(())
+}
+
+fn schedule_result_instance_cleanup(app: &AppHandle, instance_id: String) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let manager = app.state::<SshTunnelManager>();
+        let provider = app.state::<CompShareProvider>();
+        let compute = app.state::<ComputeControlStore>();
+        let queue = app.state::<JobQueueStorage>();
+        let Ok(managed) = compute.get_instance(&instance_id) else {
+            return;
+        };
+        if managed.running_mode != "no_gpu" {
+            return;
+        }
+        let _ = manager.stop_for(&instance_id).await;
+        let locator = compute_instance_locator(&managed);
+        if provider.stop_instance_for(locator.clone()).await.is_err() {
+            return;
+        }
+        let Ok(stopped) = wait_for_instance_state_for(
+            &provider,
+            &locator,
+            CompSharePowerState::Stopped,
+            None,
+            Duration::from_secs(120),
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(refreshed) = compute.refresh_platform_instance(&stopped) else {
+            return;
+        };
+        let _ = provider.delete_stop_scheduler_for(locator).await;
+        if refreshed.role == ComputeInstanceRole::Elastic {
+            let _ = release_idle_elastic_instance(&provider, &compute, &queue, &refreshed).await;
+        }
+    });
 }
 
 fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revision: u64) {
@@ -2913,26 +3001,35 @@ fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revis
             {
                 continue;
             }
-            if provider.stop_instance_for(locator.clone()).await.is_ok()
-                && wait_for_instance_state_for(
-                    &provider,
-                    &locator,
-                    CompSharePowerState::Stopped,
-                    None,
-                    Duration::from_secs(120),
-                )
-                .await
-                .is_ok()
-                && lifecycle.is_current(revision)
-            {
-                let _ = provider.delete_stop_scheduler_for(locator.clone()).await;
-                if managed.role == ComputeInstanceRole::Primary
-                    && instance.support_without_gpu_start
-                {
-                    let _ = provider
-                        .start_instance_for(locator, CompShareStartMode::NoGpu)
-                        .await;
-                }
+            if provider.stop_instance_for(locator.clone()).await.is_err() {
+                continue;
+            }
+            let Ok(stopped) = wait_for_instance_state_for(
+                &provider,
+                &locator,
+                CompSharePowerState::Stopped,
+                None,
+                Duration::from_secs(120),
+            )
+            .await
+            else {
+                continue;
+            };
+            if !lifecycle.is_current(revision) {
+                continue;
+            }
+            let Ok(refreshed) = compute.refresh_platform_instance(&stopped) else {
+                continue;
+            };
+            let _ = provider.delete_stop_scheduler_for(locator.clone()).await;
+            if refreshed.role == ComputeInstanceRole::Primary && stopped.support_without_gpu_start {
+                let _ = provider
+                    .start_instance_for(locator, CompShareStartMode::NoGpu)
+                    .await;
+            } else if refreshed.role == ComputeInstanceRole::Elastic {
+                let queue = app.state::<JobQueueStorage>();
+                let _ =
+                    release_idle_elastic_instance(&provider, &compute, &queue, &refreshed).await;
             }
         }
     });
@@ -3170,8 +3267,20 @@ pub fn run() {
                             })
                             .await
                         {
-                            let _ = compute_control
-                                .reconcile(&instances, configuration.bound_instance_id.as_deref());
+                            if let Ok(managed_instances) = compute_control
+                                .reconcile(&instances, configuration.bound_instance_id.as_deref())
+                            {
+                                let queue = app_handle.state::<JobQueueStorage>();
+                                for managed in managed_instances {
+                                    let _ = release_idle_elastic_instance(
+                                        &comp_share,
+                                        &compute_control,
+                                        &queue,
+                                        &managed,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
                 }

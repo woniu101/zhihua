@@ -357,6 +357,20 @@ impl JobQueueStorage {
         rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
     }
 
+    pub fn has_unsettled_remote_jobs_for_worker(&self, worker_id: &str) -> QueueResult<bool> {
+        let count: i64 = self
+            .connection()?
+            .query_row(
+                "SELECT COUNT(*) FROM generation_jobs
+                 WHERE worker_id=?1 AND remote_job_id IS NOT NULL
+                   AND status NOT IN ('completed_local','failed','cancelled','interrupted')",
+                [worker_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        Ok(count > 0)
+    }
+
     pub fn request_parameters(&self, remote_job_id: &str) -> QueueResult<Value> {
         let request_json = self
             .connection()?
@@ -532,6 +546,9 @@ mod tests {
         let mut completed = job.clone();
         completed.status = "completed".into();
         let synced = queue.sync(&completed).expect("sync completed job");
+        assert!(queue
+            .has_unsettled_remote_jobs_for_worker("instance:worker-one:gpu:0")
+            .expect("unsettled result"));
         assert_eq!(
             synced.worker_id.as_deref(),
             Some("instance:worker-one:gpu:0")
@@ -545,6 +562,9 @@ mod tests {
             Some("instance:worker-one:gpu:0")
         );
         queue.mark_local_complete("remote-1").expect("complete");
+        assert!(!queue
+            .has_unsettled_remote_jobs_for_worker("instance:worker-one:gpu:0")
+            .expect("settled result"));
         let local = queue.find_by_request("request-1").expect("find");
         assert_eq!(local.status, "completed_local");
         assert_eq!(
