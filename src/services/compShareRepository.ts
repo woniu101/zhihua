@@ -146,6 +146,25 @@ export interface ComputeReleaseEligibility {
   reasons: string[];
 }
 
+export type ComputeServiceState =
+  | "unknown"
+  | "connecting"
+  | "waiting_for_gpu"
+  | "ready"
+  | "incompatible"
+  | "unreachable";
+
+export interface ComputeWorkerReadiness {
+  instanceId: string;
+  state: ComputeServiceState;
+  serviceVersion?: string;
+  apiVersion?: string;
+  workflowManifestVersion?: string;
+  modelManifestVersion?: string;
+  detail?: string;
+  checkedAt: string;
+}
+
 export interface CompShareError {
   code: string;
   message: string;
@@ -239,6 +258,11 @@ export const compShareRepository = {
     required(
       await invokeNative<ManagedComputeInstance[]>("list_managed_compute_instances"),
       "实例中心仅可在桌面客户端中使用。",
+    ),
+  workerReadiness: async () =>
+    required(
+      await invokeNative<ComputeWorkerReadiness[]>("list_compute_worker_readiness"),
+      "worker 状态仅可在桌面客户端中使用。",
     ),
   reconcileInstances: async () =>
     required(

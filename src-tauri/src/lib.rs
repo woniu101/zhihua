@@ -32,7 +32,8 @@ use comp_share::{
 };
 use compute_control::{
     ComputeControlError, ComputeControlStore, ComputeInstanceRole, ComputeOperation,
-    ComputeOperationAction, ComputeOperationStatus, ManagedComputeInstance, ReleaseEligibility,
+    ComputeOperationAction, ComputeOperationStatus, ComputeServiceState, ComputeWorkerReadiness,
+    ManagedComputeInstance, ReleaseEligibility,
 };
 use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
 use export::{
@@ -345,6 +346,13 @@ fn list_managed_compute_instances(
     store: State<'_, ComputeControlStore>,
 ) -> Result<Vec<ManagedComputeInstance>, String> {
     store.list_instances().map_err(|error| error.message)
+}
+
+#[tauri::command]
+fn list_compute_worker_readiness(
+    store: State<'_, ComputeControlStore>,
+) -> Result<Vec<ComputeWorkerReadiness>, String> {
+    store.list_worker_readiness().map_err(|error| error.message)
 }
 
 #[tauri::command]
@@ -859,33 +867,85 @@ async fn connect_service_through_tunnel_impl(
     manager: &SshTunnelManager,
     service: &ServiceClient,
     comp_share: &CompShareProvider,
+    compute: &ComputeControlStore,
 ) -> Result<ServiceProbe, String> {
-    let tunnel = manager.start().await.map_err(|error| error.message)?;
-    let local_url = tunnel
-        .local_url
-        .ok_or_else(|| "SSH 隧道没有返回本机服务地址".to_owned())?;
-    let connection_info = service.info().map_err(|error| error.message)?;
-    if connection_info.configured && connection_info.credential_stored {
-        service.retarget(local_url).map_err(|error| error.message)?;
-    } else {
-        let instance_id = comp_share
-            .configuration()
-            .map_err(|error| error.message)?
-            .bound_instance_id
-            .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
-        let token = manager
-            .read_service_token()
-            .await
-            .map_err(|error| error.message)?;
-        service
-            .save(SaveServiceConnectionInput {
-                instance_id,
-                base_url: local_url,
-                token,
-            })
-            .map_err(|error| error.message)?;
+    let instance_id = comp_share
+        .configuration()
+        .map_err(|error| error.message)?
+        .bound_instance_id
+        .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
+    let _ = compute.record_worker_readiness(
+        &instance_id,
+        ComputeServiceState::Connecting,
+        None,
+        None,
+        None,
+        None,
+        Some("正在建立 SSH 隧道并检查知画服务"),
+    );
+    let result = async {
+        let tunnel = manager.start().await.map_err(|error| error.message)?;
+        let local_url = tunnel
+            .local_url
+            .ok_or_else(|| "SSH 隧道没有返回本机服务地址".to_owned())?;
+        let connection_info = service.info().map_err(|error| error.message)?;
+        if connection_info.configured
+            && connection_info.credential_stored
+            && connection_info.instance_id.as_deref() == Some(instance_id.as_str())
+        {
+            service.retarget(local_url).map_err(|error| error.message)?;
+        } else {
+            let token = manager
+                .read_service_token()
+                .await
+                .map_err(|error| error.message)?;
+            service
+                .save(SaveServiceConnectionInput {
+                    instance_id: instance_id.clone(),
+                    base_url: local_url,
+                    token,
+                })
+                .map_err(|error| error.message)?;
+        }
+        service.probe().await.map_err(|error| error.message)
     }
-    service.probe().await.map_err(|error| error.message)
+    .await;
+
+    match result {
+        Ok(probe) => {
+            let state = if !probe.compatible {
+                ComputeServiceState::Incompatible
+            } else if probe.comfyui_ready {
+                ComputeServiceState::Ready
+            } else {
+                ComputeServiceState::WaitingForGpu
+            };
+            compute
+                .record_worker_readiness(
+                    &instance_id,
+                    state,
+                    Some(&probe.service_version),
+                    probe.api_version.as_deref(),
+                    Some(&probe.workflow_manifest_version),
+                    Some(&probe.model_manifest_version),
+                    Some(&probe.detail),
+                )
+                .map_err(|error| error.message)?;
+            Ok(probe)
+        }
+        Err(message) => {
+            let _ = compute.record_worker_readiness(
+                &instance_id,
+                ComputeServiceState::Unreachable,
+                None,
+                None,
+                None,
+                None,
+                Some(&message),
+            );
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
@@ -893,8 +953,9 @@ async fn connect_service_through_tunnel(
     manager: State<'_, SshTunnelManager>,
     service: State<'_, ServiceClient>,
     comp_share: State<'_, CompShareProvider>,
+    compute: State<'_, ComputeControlStore>,
 ) -> Result<ServiceProbe, String> {
-    connect_service_through_tunnel_impl(&manager, &service, &comp_share).await
+    connect_service_through_tunnel_impl(&manager, &service, &comp_share, &compute).await
 }
 
 #[tauri::command]
@@ -902,6 +963,7 @@ async fn prepare_generation_service(
     manager: State<'_, SshTunnelManager>,
     service: State<'_, ServiceClient>,
     comp_share: State<'_, CompShareProvider>,
+    compute: State<'_, ComputeControlStore>,
     lifecycle: State<'_, ComputeLifecycle>,
 ) -> Result<ServiceProbe, String> {
     lifecycle.invalidate_idle_shutdown();
@@ -960,7 +1022,9 @@ async fn prepare_generation_service(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {
         let readiness =
-            match connect_service_through_tunnel_impl(&manager, &service, &comp_share).await {
+            match connect_service_through_tunnel_impl(&manager, &service, &comp_share, &compute)
+                .await
+            {
                 Ok(probe) if probe.comfyui_ready => return Ok(probe),
                 Ok(probe) => probe.detail,
                 Err(error) => error,
@@ -2474,8 +2538,14 @@ pub fn run() {
                     .unwrap_or(false);
                 if configured {
                     let service = app_handle.state::<ServiceClient>();
-                    let _ =
-                        connect_service_through_tunnel_impl(&manager, &service, &comp_share).await;
+                    let compute = app_handle.state::<ComputeControlStore>();
+                    let _ = connect_service_through_tunnel_impl(
+                        &manager,
+                        &service,
+                        &comp_share,
+                        &compute,
+                    )
+                    .await;
                 }
             });
             Ok(())
@@ -2561,6 +2631,7 @@ pub fn run() {
             list_compshare_zones,
             preflight_compshare_create,
             list_managed_compute_instances,
+            list_compute_worker_readiness,
             reconcile_compute_instances,
             get_compute_release_eligibility,
             create_managed_compshare_instance,

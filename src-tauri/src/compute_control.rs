@@ -297,6 +297,62 @@ pub struct ComputeWorkerLease {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeServiceState {
+    Unknown,
+    Connecting,
+    WaitingForGpu,
+    Ready,
+    Incompatible,
+    Unreachable,
+}
+
+impl ComputeServiceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Connecting => "connecting",
+            Self::WaitingForGpu => "waiting_for_gpu",
+            Self::Ready => "ready",
+            Self::Incompatible => "incompatible",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+impl FromStr for ComputeServiceState {
+    type Err = ComputeControlError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "unknown" => Ok(Self::Unknown),
+            "connecting" => Ok(Self::Connecting),
+            "waiting_for_gpu" => Ok(Self::WaitingForGpu),
+            "ready" => Ok(Self::Ready),
+            "incompatible" => Ok(Self::Incompatible),
+            "unreachable" => Ok(Self::Unreachable),
+            _ => Err(ComputeControlError::new(
+                "INVALID_COMPUTE_SERVICE_STATE",
+                format!("未知的 worker 服务状态：{value}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputeWorkerReadiness {
+    pub instance_id: String,
+    pub state: ComputeServiceState,
+    pub service_version: Option<String>,
+    pub api_version: Option<String>,
+    pub workflow_manifest_version: Option<String>,
+    pub model_manifest_version: Option<String>,
+    pub detail: Option<String>,
+    pub checked_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ComputeControlStore {
     database_path: PathBuf,
@@ -368,6 +424,19 @@ impl ComputeControlStore {
                 ON worker_leases(instance_id, lease_expires_at);
             CREATE INDEX IF NOT EXISTS idx_worker_leases_worker
                 ON worker_leases(worker_id, lease_expires_at);
+
+            CREATE TABLE IF NOT EXISTS compute_worker_readiness (
+                instance_id                TEXT PRIMARY KEY NOT NULL,
+                state                      TEXT NOT NULL,
+                service_version            TEXT,
+                api_version                TEXT,
+                workflow_manifest_version  TEXT,
+                model_manifest_version     TEXT,
+                detail                     TEXT,
+                checked_at                 TEXT NOT NULL,
+                FOREIGN KEY(instance_id) REFERENCES compute_instances(instance_id)
+                    ON DELETE CASCADE
+            );
             ",
         )?;
         migrate_worker_leases(&connection)?;
@@ -701,6 +770,90 @@ impl ComputeControlStore {
         let released = release_expired_worker_leases_in_transaction(&transaction)?;
         transaction.commit()?;
         Ok(released)
+    }
+
+    pub fn record_worker_readiness(
+        &self,
+        instance_id: &str,
+        state: ComputeServiceState,
+        service_version: Option<&str>,
+        api_version: Option<&str>,
+        workflow_manifest_version: Option<&str>,
+        model_manifest_version: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<ComputeWorkerReadiness, ComputeControlError> {
+        let instance_id = instance_id.trim();
+        if instance_id.is_empty() {
+            return Err(ComputeControlError::new(
+                "INVALID_COMPUTE_INSTANCE_ID",
+                "worker 就绪状态缺少实例 ID",
+            ));
+        }
+        let checked_at = now_iso();
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "INSERT INTO compute_worker_readiness (
+                 instance_id, state, service_version, api_version,
+                 workflow_manifest_version, model_manifest_version, detail, checked_at
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE EXISTS(SELECT 1 FROM compute_instances WHERE instance_id=?1)
+             ON CONFLICT(instance_id) DO UPDATE SET
+                 state=excluded.state, service_version=excluded.service_version,
+                 api_version=excluded.api_version,
+                 workflow_manifest_version=excluded.workflow_manifest_version,
+                 model_manifest_version=excluded.model_manifest_version,
+                 detail=excluded.detail, checked_at=excluded.checked_at",
+            params![
+                instance_id,
+                state.as_str(),
+                service_version,
+                api_version,
+                workflow_manifest_version,
+                model_manifest_version,
+                detail,
+                checked_at,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ComputeControlError::new(
+                "COMPUTE_INSTANCE_NOT_FOUND",
+                "worker 就绪状态对应的实例尚未纳入管理",
+            ));
+        }
+        self.worker_readiness(instance_id)
+    }
+
+    pub fn list_worker_readiness(
+        &self,
+    ) -> Result<Vec<ComputeWorkerReadiness>, ComputeControlError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT instance_id, state, service_version, api_version,
+                    workflow_manifest_version, model_manifest_version, detail, checked_at
+             FROM compute_worker_readiness ORDER BY checked_at DESC",
+        )?;
+        let rows = statement.query_map([], worker_readiness_from_row)?;
+        rows.map(|row| row.map_err(ComputeControlError::from))
+            .collect()
+    }
+
+    pub fn worker_readiness(
+        &self,
+        instance_id: &str,
+    ) -> Result<ComputeWorkerReadiness, ComputeControlError> {
+        self.connection()?
+            .query_row(
+                "SELECT instance_id, state, service_version, api_version,
+                        workflow_manifest_version, model_manifest_version, detail, checked_at
+                 FROM compute_worker_readiness WHERE instance_id=?1",
+                [instance_id.trim()],
+                worker_readiness_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                ComputeControlError::new("WORKER_READINESS_NOT_FOUND", "该实例尚未完成知画服务检查")
+            })
     }
 
     fn worker_lease(&self, job_id: &str) -> Result<ComputeWorkerLease, ComputeControlError> {
@@ -1205,6 +1358,20 @@ fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputeOperat
     })
 }
 
+fn worker_readiness_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputeWorkerReadiness> {
+    let state: String = row.get(1)?;
+    Ok(ComputeWorkerReadiness {
+        instance_id: row.get(0)?,
+        state: parse_enum(1, state)?,
+        service_version: row.get(2)?,
+        api_version: row.get(3)?,
+        workflow_manifest_version: row.get(4)?,
+        model_manifest_version: row.get(5)?,
+        detail: row.get(6)?,
+        checked_at: row.get(7)?,
+    })
+}
+
 fn parse_enum<T>(index: usize, value: String) -> rusqlite::Result<T>
 where
     T: FromStr,
@@ -1514,5 +1681,67 @@ mod tests {
         migrated
             .acquire_worker_lease("worker-one", "one", "job-2", 300)
             .unwrap();
+    }
+
+    #[test]
+    fn records_readiness_independently_for_each_compute_instance() {
+        let store = store();
+        store
+            .reconcile(
+                &[
+                    instance("worker-one", CompSharePowerState::Running),
+                    instance("worker-two", CompSharePowerState::Running),
+                ],
+                None,
+            )
+            .unwrap();
+
+        let ready = store
+            .record_worker_readiness(
+                "worker-one",
+                ComputeServiceState::Ready,
+                Some("0.4.0"),
+                Some("v1"),
+                Some("workflows-r2"),
+                Some("models-r1"),
+                Some("11 workflows ready"),
+            )
+            .unwrap();
+        store
+            .record_worker_readiness(
+                "worker-two",
+                ComputeServiceState::WaitingForGpu,
+                Some("0.4.0"),
+                Some("v1"),
+                Some("workflows-r2"),
+                Some("models-r1"),
+                Some("ComfyUI waiting for GPU"),
+            )
+            .unwrap();
+
+        assert_eq!(ready.state, ComputeServiceState::Ready);
+        assert_eq!(ready.api_version.as_deref(), Some("v1"));
+        let states = store.list_worker_readiness().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            store.worker_readiness("worker-two").unwrap().state,
+            ComputeServiceState::WaitingForGpu
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_an_instance_outside_the_control_plane() {
+        let error = store()
+            .record_worker_readiness(
+                "missing",
+                ComputeServiceState::Unreachable,
+                None,
+                None,
+                None,
+                None,
+                Some("connection refused"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "COMPUTE_INSTANCE_NOT_FOUND");
     }
 }
