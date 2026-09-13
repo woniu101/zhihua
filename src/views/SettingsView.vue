@@ -424,8 +424,11 @@ function roleLabel(role: ManagedComputeInstance["role"]) {
   return role === "primary" ? "主实例" : role === "elastic" ? "弹性实例" : role === "test" ? "测试实例" : "用户实例";
 }
 
-function ownershipLabel(ownership: ManagedComputeInstance["ownership"]) {
-  return ownership === "zhihua_managed" ? "知画创建" : "用户创建";
+function managementLabel(item: ManagedComputeInstance) {
+  if (item.ownership === "zhihua_managed") return "知画创建并管理";
+  if (item.role === "elastic" || item.role === "test") return "用户创建 · 已授权自动启停";
+  if (item.role === "primary") return "用户创建 · 当前主实例";
+  return "用户创建 · 仅手动控制";
 }
 
 function workerReadinessLabel(instanceId: string) {
@@ -502,6 +505,31 @@ async function bindManagedInstance(item: ManagedComputeInstance) {
   }
   await bindComputeInstance(platformInstance);
   await refreshCompute();
+}
+
+async function setUserWorkerEnabled(item: ManagedComputeInstance, enabled: boolean) {
+  busy.value = true;
+  setComputeNotice(
+    enabled
+      ? `正在把“${item.name ?? item.instanceId}”加入批量算力池……`
+      : `正在把“${item.name ?? item.instanceId}”移出批量算力池……`,
+    "neutral",
+  );
+  try {
+    await compShareRepository.setUserWorkerEnabled(item.instanceId, enabled);
+    await refreshCompute();
+    setComputeNotice(
+      enabled
+        ? "已授权知画按任务自动启停该实例；实例仍归用户所有，知画不会释放它。首次使用前还需完成独立 SSH 连接。"
+        : "已移出批量算力池；知画不会再自动启停该实例。",
+      "success",
+    );
+  } catch (error) {
+    setComputeNotice(normalizeCompShareError(error).message, "error");
+    await refreshCompute();
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function checkManagedWorker(item: ManagedComputeInstance) {
@@ -726,7 +754,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
     <div v-if="computeOpen" class="connection-backdrop" role="presentation" @click.self="computeOpen=false">
       <section class="connection-dialog compute-dialog" role="dialog" aria-modal="true" aria-labelledby="compute-title">
-        <header><div><h2 id="compute-title">优云智算实例中心</h2><p>平台实例会自动对账；用户实例只控制运行状态，知画弹性实例才允许安全释放。</p></div><button type="button" aria-label="关闭" @click="computeOpen=false"><X :size="20"/></button></header>
+        <header><div><h2 id="compute-title">优云智算实例中心</h2><p>已有实例可授权知画自动启停并参与批量生成；用户创建的实例始终保留，不会被知画释放。</p></div><button type="button" aria-label="关闭" @click="computeOpen=false"><X :size="20"/></button></header>
         <div class="connection-form">
           <template v-if="!computeConfigured">
             <label><span>API 公钥</span><input v-model="computeForm.publicKey" autocomplete="off" placeholder="输入 PublicKey"/></label>
@@ -739,10 +767,10 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
               <article v-for="item in managedInstances" :key="item.instanceId" :class="{ selected: item.instanceId === computeConfiguration?.boundInstanceId, uncertain: item.lifecycleState === 'unknown' }">
                 <div class="instance-row-main">
                   <span class="instance-role" :class="item.ownership === 'zhihua_managed' ? 'managed' : ''">{{ roleLabel(item.role) }}</span>
-                  <div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : 'GPU 规格待查询' }} · {{ ownershipLabel(item.ownership) }}　<em class="worker-readiness" :class="workerReadinessTone(item.instanceId)">● {{ workerReadinessLabel(item.instanceId) }}</em></small></div>
+                  <div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : 'GPU 规格待查询' }} · {{ managementLabel(item) }}　<em class="worker-readiness" :class="workerReadinessTone(item.instanceId)">● {{ workerReadinessLabel(item.instanceId) }}</em></small></div>
                   <strong>{{ managedModeLabel(item) }}</strong>
                 </div>
-                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.role !== 'user_managed' && item.runningMode !== 'gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="prepareManagedWorker(item)">准备 GPU</button><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
+                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.ownership === 'user_managed' && item.role === 'user_managed'" class="mini-btn create" type="button" :disabled="busy || Boolean(item.missingSince) || ['unknown', 'terminating', 'terminated', 'error'].includes(item.lifecycleState)" @click="setUserWorkerEnabled(item, true)">加入批量算力</button><button v-if="item.ownership === 'user_managed' && (item.role === 'elastic' || item.role === 'test')" class="mini-btn" type="button" :disabled="busy || item.runningMode !== 'stopped' || Boolean(item.currentJobId)" title="关机且没有任务时才能移出" @click="setUserWorkerEnabled(item, false)">移出批量算力</button><button v-if="item.role !== 'user_managed' && item.runningMode !== 'gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="prepareManagedWorker(item)">准备 GPU</button><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
               </article>
               <p v-if="!managedInstances.length" class="empty-instances">平台没有返回可用实例。创建弹性实例前会先检查地域库存和实时报价，并再次让你确认。</p>
             </div>

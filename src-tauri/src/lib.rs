@@ -349,6 +349,17 @@ fn list_managed_compute_instances(
 }
 
 #[tauri::command]
+fn set_user_compute_worker_enabled(
+    store: State<'_, ComputeControlStore>,
+    instance_id: String,
+    enabled: bool,
+) -> Result<ManagedComputeInstance, String> {
+    store
+        .set_user_instance_worker_enabled(&instance_id, enabled)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
 fn list_compute_worker_readiness(
     store: State<'_, ComputeControlStore>,
 ) -> Result<Vec<ComputeWorkerReadiness>, String> {
@@ -3010,6 +3021,7 @@ pub fn run() {
             list_compshare_zones,
             preflight_compshare_create,
             list_managed_compute_instances,
+            set_user_compute_worker_enabled,
             list_compute_worker_readiness,
             reconcile_compute_instances,
             get_compute_release_eligibility,

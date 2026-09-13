@@ -102,6 +102,253 @@ async fn configure_desktop_for_running_instance() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authorized running instance and adds its SSH profile to the real desktop worker pool"]
+async fn configure_desktop_worker_connection() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+    let private_key = std::fs::read_to_string(required("ZHIHUA_TEST_SSH_PRIVATE_KEY_PATH"))
+        .expect("read local SSH private key");
+    let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
+    tunnel
+        .save_configuration(SaveTunnelConfigurationInput {
+            instance_id: instance_id.clone(),
+            host: required("ZHIHUA_TEST_SSH_HOST"),
+            port: required("ZHIHUA_TEST_SSH_PORT")
+                .parse::<u16>()
+                .expect("valid SSH port"),
+            username: "root".to_owned(),
+            host_key_fingerprint: required("ZHIHUA_TEST_SSH_HOST_FINGERPRINT"),
+            private_key,
+        })
+        .expect("save worker SSH tunnel configuration");
+    let tunnel_status = tunnel
+        .start_for(&instance_id)
+        .await
+        .expect("start worker SSH tunnel");
+    let local_url = tunnel_status.local_url.expect("local tunnel URL");
+    let token = tunnel
+        .read_service_token_for(&instance_id)
+        .await
+        .expect("read remote service token");
+    let service = ServiceClient::new(app_data_dir.clone()).expect("initialize service client");
+    service
+        .save_for(SaveServiceConnectionInput {
+            instance_id: instance_id.clone(),
+            base_url: local_url,
+            token,
+        })
+        .expect("save worker service connection");
+    let probe = service
+        .probe_for(&instance_id)
+        .await
+        .expect("probe worker service through tunnel");
+    assert!(probe.compatible);
+    assert!(probe.workflows.len() >= 11);
+
+    let compute = crate::compute_control::ComputeControlStore::initialize(
+        app_data_dir.join("zhihua.sqlite3"),
+    )
+    .expect("initialize compute control store");
+    let worker = compute
+        .set_user_instance_worker_enabled(&instance_id, true)
+        .expect("authorize existing instance for automatic worker control");
+    assert_eq!(
+        worker.role,
+        crate::compute_control::ComputeInstanceRole::Elastic
+    );
+    assert_eq!(
+        worker.ownership,
+        crate::compute_control::ComputeInstanceOwnership::UserManaged
+    );
+    assert!(
+        !compute
+            .release_eligibility(&instance_id)
+            .expect("read release eligibility")
+            .allowed
+    );
+    tunnel
+        .stop_for(&instance_id)
+        .await
+        .expect("stop validation tunnel");
+}
+
+#[tokio::test]
+#[ignore = "starts two configured desktop workers in paid GPU mode, validates pool fallback or distribution, and stops both"]
+async fn prepare_desktop_worker_pool_and_cleanup() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let instance_ids = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_IDS")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(instance_ids.len(), 2, "provide exactly two instance IDs");
+
+    let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
+    let service = ServiceClient::new(app_data_dir.clone()).expect("initialize service client");
+    let provider = CompShareProvider::new(app_data_dir.clone()).expect("initialize CompShare");
+    let compute = crate::compute_control::ComputeControlStore::initialize(
+        app_data_dir.join("zhihua.sqlite3"),
+    )
+    .expect("initialize compute control store");
+    let policy_dir = tempfile::tempdir().expect("temporary policy directory");
+    let lifecycle = crate::ComputeLifecycle::load(policy_dir.path().join("compute-policy.json"));
+
+    let first = crate::prepare_compute_worker_impl(
+        &tunnel,
+        &service,
+        &provider,
+        &compute,
+        &lifecycle,
+        &instance_ids[0],
+    );
+    let second = crate::prepare_compute_worker_impl(
+        &tunnel,
+        &service,
+        &provider,
+        &compute,
+        &lifecycle,
+        &instance_ids[1],
+    );
+    let (first_result, second_result) = tokio::join!(first, second);
+
+    let mut validation_error = None;
+    match (&first_result, &second_result) {
+        (Ok(first_probe), Ok(second_probe)) => {
+            if !first_probe.comfyui_ready || !second_probe.comfyui_ready {
+                validation_error =
+                    Some("both workers connected but ComfyUI was not ready".to_owned());
+            } else {
+                let first_lease = compute.acquire_ready_worker_lease("live-pool-job-1", 120);
+                let second_lease = compute.acquire_ready_worker_lease("live-pool-job-2", 120);
+                match (first_lease, second_lease) {
+                    (Ok(first_lease), Ok(second_lease)) => {
+                        if first_lease.instance_id == second_lease.instance_id {
+                            validation_error = Some(
+                                "two jobs were assigned to the same worker despite two ready workers"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        validation_error = Some(format!("worker lease failed: {}", error.message));
+                    }
+                }
+                let _ = compute.release_worker_lease("live-pool-job-1");
+                let _ = compute.release_worker_lease("live-pool-job-2");
+            }
+        }
+        (Ok(probe), Err(error)) | (Err(error), Ok(probe)) if probe.comfyui_ready => {
+            let first_lease = compute.acquire_ready_worker_lease("live-pool-job-1", 120);
+            let second_lease = compute.acquire_ready_worker_lease("live-pool-job-2", 120);
+            match (first_lease, second_lease) {
+                (Ok(first_lease), Ok(second_lease))
+                    if first_lease.instance_id == second_lease.instance_id =>
+                {
+                    eprintln!(
+                        "worker pool safely degraded to one route because the second worker was unavailable: {error}"
+                    );
+                }
+                (Ok(_), Ok(_)) => {
+                    validation_error = Some(
+                        "degraded pool unexpectedly routed jobs to different workers".to_owned(),
+                    );
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    validation_error =
+                        Some(format!("fallback worker lease failed: {}", error.message));
+                }
+            }
+            let _ = compute.release_worker_lease("live-pool-job-1");
+            let _ = compute.release_worker_lease("live-pool-job-2");
+        }
+        _ => {
+            validation_error = Some(format!(
+                "no usable worker after preparation: first={:?}; second={:?}",
+                first_result.as_ref().err(),
+                second_result.as_ref().err()
+            ));
+        }
+    }
+
+    let mut cleanup_errors = Vec::new();
+    for instance_id in &instance_ids {
+        let _ = tunnel.stop_for(instance_id).await;
+        let managed = match compute.get_instance(instance_id) {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_errors.push(format!("{instance_id}: {}", error.message));
+                continue;
+            }
+        };
+        let locator = crate::compute_instance_locator(&managed);
+        let platform = provider.describe_instance(locator.clone()).await;
+        if let Ok(platform) = platform {
+            if platform.state == CompSharePowerState::Running
+                || platform.state == CompSharePowerState::Starting
+            {
+                if let Err(error) = provider.stop_instance_for(locator.clone()).await {
+                    cleanup_errors.push(format!("{instance_id}: {}", error.message));
+                    continue;
+                }
+                match crate::wait_for_instance_state_for(
+                    &provider,
+                    &locator,
+                    CompSharePowerState::Stopped,
+                    None,
+                    std::time::Duration::from_secs(180),
+                )
+                .await
+                {
+                    Ok(stopped) => {
+                        let _ = compute.refresh_platform_instance(&stopped);
+                    }
+                    Err(error) => {
+                        cleanup_errors.push(format!("{instance_id}: {error}"));
+                        continue;
+                    }
+                }
+            }
+            if let Err(error) = provider.delete_stop_scheduler_for(locator.clone()).await {
+                cleanup_errors.push(format!("{instance_id}: {}", error.message));
+            } else if let Ok(refreshed) = provider.describe_instance(locator).await {
+                let _ = compute.refresh_platform_instance(&refreshed);
+            }
+        }
+    }
+    assert!(
+        cleanup_errors.is_empty(),
+        "worker cleanup failed: {cleanup_errors:?}"
+    );
+    assert!(validation_error.is_none(), "{}", validation_error.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires saved CompShare credentials and reconciles the real desktop instance inventory"]
+async fn reconcile_desktop_compute_inventory() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let provider = CompShareProvider::new(app_data_dir.clone()).expect("initialize CompShare");
+    let instances = provider
+        .list_instances(crate::comp_share::ListCompShareInstancesInput {
+            region: None,
+            zone: None,
+        })
+        .await
+        .expect("list platform instances");
+    let configuration = provider
+        .configuration()
+        .expect("read CompShare configuration");
+    let compute = crate::compute_control::ComputeControlStore::initialize(
+        app_data_dir.join("zhihua.sqlite3"),
+    )
+    .expect("initialize compute control store");
+    let reconciled = compute
+        .reconcile(&instances, configuration.bound_instance_id.as_deref())
+        .expect("reconcile desktop inventory");
+    assert_eq!(reconciled.len(), instances.len());
+}
+
+#[tokio::test]
 #[ignore = "requires the configured paid GPU instance and runs Qwen Image plus H3 I2V"]
 async fn generate_image_then_video_through_desktop_service_client() {
     let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));

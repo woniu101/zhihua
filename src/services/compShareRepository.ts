@@ -259,6 +259,14 @@ export const compShareRepository = {
       await invokeNative<ManagedComputeInstance[]>("list_managed_compute_instances"),
       "实例中心仅可在桌面客户端中使用。",
     ),
+  setUserWorkerEnabled: async (instanceId: string, enabled: boolean) =>
+    required(
+      await invokeNative<ManagedComputeInstance>("set_user_compute_worker_enabled", {
+        instanceId,
+        enabled,
+      }),
+      "实例自动启停授权仅可在桌面客户端中使用。",
+    ),
   workerReadiness: async () =>
     required(
       await invokeNative<ComputeWorkerReadiness[]>("list_compute_worker_readiness"),

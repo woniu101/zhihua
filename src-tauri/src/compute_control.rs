@@ -515,6 +515,111 @@ impl ComputeControlStore {
         self.get_instance(&instance.instance_id)
     }
 
+    pub fn set_user_instance_worker_enabled(
+        &self,
+        instance_id: &str,
+        enabled: bool,
+    ) -> Result<ManagedComputeInstance, ComputeControlError> {
+        let instance_id = instance_id.trim();
+        if instance_id.is_empty() {
+            return Err(ComputeControlError::new(
+                "INVALID_COMPUTE_INSTANCE_ID",
+                "算力实例 ID 不能为空",
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        release_expired_worker_leases_in_transaction(&transaction)?;
+        let current = transaction
+            .query_row(
+                "SELECT role, ownership, platform_state, running_mode, current_job_id,
+                        lifecycle_state, missing_since
+                 FROM compute_instances WHERE instance_id=?1",
+                [instance_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                ComputeControlError::new("COMPUTE_INSTANCE_NOT_FOUND", "算力实例尚未纳入管理")
+            })?;
+        if current.1 != "user_managed" {
+            return Err(ComputeControlError::new(
+                "COMPUTE_INSTANCE_OWNERSHIP_MISMATCH",
+                "知画创建的实例已经由弹性池管理，无需重复授权",
+            ));
+        }
+        if current.0 == "primary" {
+            return Err(ComputeControlError::new(
+                "PRIMARY_COMPUTE_INSTANCE_IMMUTABLE",
+                "主实例始终参与生成，不能在这里改变自动启停授权",
+            ));
+        }
+        if enabled {
+            if !matches!(
+                current.2.to_ascii_lowercase().as_str(),
+                "running" | "stopped"
+            ) || matches!(
+                current.5.as_str(),
+                "unknown" | "terminating" | "terminated" | "error"
+            ) || current.6.is_some()
+            {
+                return Err(ComputeControlError::new(
+                    "COMPUTE_INSTANCE_NOT_RECONCILED",
+                    "实例状态尚未与平台确认，当前不能加入批量算力池",
+                ));
+            }
+            transaction.execute(
+                "UPDATE compute_instances SET role='elastic', cleanup_policy='retain',
+                        lifecycle_state=CASE
+                            WHEN lower(platform_state)='running' THEN 'idle'
+                            WHEN lower(platform_state)='stopped' THEN 'retained'
+                            ELSE lifecycle_state END,
+                        updated_at=?2
+                 WHERE instance_id=?1",
+                params![instance_id, now_iso()],
+            )?;
+        } else {
+            let active_leases: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM worker_leases
+                 WHERE instance_id=?1 AND lease_expires_at>?2",
+                params![instance_id, now_iso()],
+                |row| row.get(0),
+            )?;
+            if !current.2.eq_ignore_ascii_case("stopped")
+                || current.3 != "stopped"
+                || current.4.is_some()
+                || active_leases > 0
+            {
+                return Err(ComputeControlError::new(
+                    "COMPUTE_WORKER_STILL_ACTIVE",
+                    "请先等待任务结束并关闭该实例，再移出批量算力池",
+                ));
+            }
+            transaction.execute(
+                "UPDATE compute_instances SET role='user_managed', cleanup_policy='retain',
+                        lifecycle_state='retained', current_job_id=NULL, updated_at=?2
+                 WHERE instance_id=?1",
+                params![instance_id, now_iso()],
+            )?;
+            transaction.execute(
+                "DELETE FROM compute_worker_readiness WHERE instance_id=?1",
+                [instance_id],
+            )?;
+        }
+        transaction.commit()?;
+        self.get_instance(instance_id)
+    }
+
     pub fn register_zhihua_instance(
         &self,
         instance: &CompShareInstance,
@@ -1596,6 +1701,42 @@ mod tests {
             store.get_instance("two").unwrap().role,
             ComputeInstanceRole::Primary
         );
+    }
+
+    #[test]
+    fn user_instance_can_join_worker_pool_without_becoming_releasable() {
+        let store = store();
+        let stopped = instance("user-worker", CompSharePowerState::Stopped);
+        store.reconcile(&[stopped], None).unwrap();
+
+        let adopted = store
+            .set_user_instance_worker_enabled("user-worker", true)
+            .unwrap();
+        assert_eq!(adopted.role, ComputeInstanceRole::Elastic);
+        assert_eq!(adopted.ownership, ComputeInstanceOwnership::UserManaged);
+        assert_eq!(adopted.cleanup_policy, ComputeCleanupPolicy::Retain);
+        assert!(!store.release_eligibility("user-worker").unwrap().allowed);
+
+        let removed = store
+            .set_user_instance_worker_enabled("user-worker", false)
+            .unwrap();
+        assert_eq!(removed.role, ComputeInstanceRole::UserManaged);
+        assert_eq!(removed.ownership, ComputeInstanceOwnership::UserManaged);
+    }
+
+    #[test]
+    fn active_user_worker_cannot_leave_pool() {
+        let store = store();
+        let running = instance("user-worker", CompSharePowerState::Running);
+        store.reconcile(&[running], None).unwrap();
+        store
+            .set_user_instance_worker_enabled("user-worker", true)
+            .unwrap();
+
+        let error = store
+            .set_user_instance_worker_enabled("user-worker", false)
+            .unwrap_err();
+        assert_eq!(error.code, "COMPUTE_WORKER_STILL_ACTIVE");
     }
 
     #[test]
