@@ -27,28 +27,35 @@ let unlistenClose: (() => void) | undefined;
 
 const minimizeWindow = () => appWindow?.minimize();
 const toggleMaximizeWindow = () => appWindow?.toggleMaximize();
-const closeWindow = () => appWindow?.close();
+const beginWindowDrag = (event: MouseEvent) => {
+  if (!appWindow || event.button !== 0) return;
+  void appWindow.startDragging();
+};
+
+async function closeWindow() {
+  if (!appWindow || closing.value) return;
+  closing.value = true;
+  try {
+    await Promise.race([
+      invoke("prepare_application_exit"),
+      new Promise((_, reject) => window.setTimeout(() => reject(new Error("退出保护检查超时")), 8_000)),
+    ]);
+  } catch (error) {
+    console.info("[知画] 退出保护由平台定时关机继续接管。", error);
+    const leaveAnyway = window.confirm("暂时无法确认 GPU 已关闭或平台定时关机已生效。继续退出可能产生额外费用。\n\n仍要退出知画吗？");
+    if (!leaveAnyway) {
+      closing.value = false;
+      return;
+    }
+  }
+  await appWindow.destroy();
+}
 
 onMounted(async () => {
   if (!appWindow) return;
-  unlistenClose = await appWindow.onCloseRequested(async (event) => {
-    if (closing.value) return;
+  unlistenClose = await appWindow.onCloseRequested((event) => {
     event.preventDefault();
-    closing.value = true;
-    try {
-      await Promise.race([
-        invoke("prepare_application_exit"),
-        new Promise((_, reject) => window.setTimeout(() => reject(new Error("退出保护检查超时")), 30_000)),
-      ]);
-    } catch (error) {
-      console.info("[知画] 退出保护由平台定时关机继续接管。", error);
-      const leaveAnyway = window.confirm("暂时无法确认 GPU 已关闭或平台定时关机已生效。继续退出可能产生额外费用。\n\n仍要退出知画吗？");
-      if (!leaveAnyway) {
-        closing.value = false;
-        return;
-      }
-    }
-    await appWindow.destroy();
+    void closeWindow();
   });
 });
 
@@ -63,7 +70,7 @@ const nav = [
   <div class="app-frame">
     <header class="appbar">
       <RouterLink class="app-brand" to="/projects" aria-label="知画首页">
-        <BrandLogo :size="36" />
+        <BrandLogo :size="42" />
         <span><strong>知画</strong><small>AI 视频工作台</small></span>
       </RouterLink>
       <nav class="global-nav" aria-label="全局导航">
@@ -73,14 +80,14 @@ const nav = [
         </RouterLink>
         <TaskCenter />
       </nav>
-      <div class="appbar-drag" data-tauri-drag-region></div>
+      <div class="appbar-drag" data-tauri-drag-region @mousedown="beginWindowDrag" @dblclick="toggleMaximizeWindow"></div>
       <RouterLink class="topbar-compute" to="/settings" title="打开算力设置"><ComputeStatus compact /></RouterLink>
       <button type="button" class="appbar-icon" aria-label="帮助" title="帮助" @click="helpOpen = true"><HelpCircle :size="18" /></button>
       <RouterLink class="appbar-icon" to="/settings" :class="{ active: isSettings }" aria-label="设置与算力" title="设置与算力"><Settings :size="18" /></RouterLink>
       <div class="window-actions">
         <button aria-label="最小化" @click="minimizeWindow"><Minus :size="16" /></button>
         <button aria-label="最大化" @click="toggleMaximizeWindow"><Square :size="13" /></button>
-        <button aria-label="关闭" class="close" @click="closeWindow"><X :size="17" /></button>
+        <button aria-label="关闭" class="close" :disabled="closing" :title="closing ? '正在安全退出' : '关闭'" @click="closeWindow"><X :size="17" /></button>
       </div>
     </header>
 

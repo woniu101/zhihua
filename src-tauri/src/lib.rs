@@ -1559,8 +1559,11 @@ async fn wait_for_instance_state_for(
 }
 
 #[tauri::command]
-fn get_storage_info(storage: State<'_, ProjectStorage>) -> StorageInfo {
-    storage.info()
+fn get_storage_info(
+    app: AppHandle,
+    storage: State<'_, ProjectStorage>,
+) -> Result<StorageInfo, String> {
+    storage_info_with_preferences(&app, &storage)
 }
 
 #[tauri::command]
@@ -1576,6 +1579,41 @@ fn open_projects_root(storage: State<'_, ProjectStorage>) -> Result<(), String> 
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法打开项目目录：{error}"))
+}
+
+#[tauri::command]
+fn set_projects_root(
+    app: AppHandle,
+    storage: State<'_, ProjectStorage>,
+    path: String,
+) -> Result<StorageInfo, String> {
+    let requested = PathBuf::from(path.trim());
+    if !requested.is_absolute() {
+        return Err("请选择一个有效的绝对目录。".to_owned());
+    }
+    if requested.parent().is_none() {
+        return Err("不能直接把磁盘根目录设为项目目录，请先创建一个知画专用文件夹。".to_owned());
+    }
+    fs::create_dir_all(&requested).map_err(|error| format!("无法创建项目目录：{error}"))?;
+    let requested = requested
+        .canonicalize()
+        .map_err(|error| format!("无法读取项目目录：{error}"))?;
+    save_storage_preferences(
+        &app,
+        &StoragePreferences {
+            projects_root: Some(requested),
+        },
+    )?;
+    storage_info_with_preferences(&app, &storage)
+}
+
+#[tauri::command]
+fn reset_projects_root(
+    app: AppHandle,
+    storage: State<'_, ProjectStorage>,
+) -> Result<StorageInfo, String> {
+    save_storage_preferences(&app, &StoragePreferences::default())?;
+    storage_info_with_preferences(&app, &storage)
 }
 
 #[tauri::command]
@@ -3187,16 +3225,79 @@ async fn import_asset_payload(
         })?
 }
 
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoragePreferences {
+    projects_root: Option<PathBuf>,
+}
+
+fn storage_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("storage-preferences.json"))
+        .map_err(|error| format!("无法确定应用数据目录：{error}"))
+}
+
+fn load_storage_preferences(app: &AppHandle) -> Result<StoragePreferences, String> {
+    let path = storage_preferences_path(app)?;
+    if !path.exists() {
+        return Ok(StoragePreferences::default());
+    }
+    let payload = fs::read(&path).map_err(|error| format!("无法读取存储设置：{error}"))?;
+    serde_json::from_slice(&payload).map_err(|error| format!("存储设置格式无效：{error}"))
+}
+
+fn save_storage_preferences(
+    app: &AppHandle,
+    preferences: &StoragePreferences,
+) -> Result<(), String> {
+    let path = storage_preferences_path(app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
+    }
+    let payload = serde_json::to_vec_pretty(preferences)
+        .map_err(|error| format!("无法保存存储设置：{error}"))?;
+    fs::write(path, payload).map_err(|error| format!("无法保存存储设置：{error}"))
+}
+
+fn default_projects_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("projects"))
+        .map_err(|error| format!("无法确定应用数据目录：{error}"))
+}
+
+fn storage_info_with_preferences(
+    app: &AppHandle,
+    storage: &ProjectStorage,
+) -> Result<StorageInfo, String> {
+    let default_root = default_projects_root(app)?;
+    let configured_root = load_storage_preferences(app)?
+        .projects_root
+        .unwrap_or_else(|| default_root.clone());
+    let mut info = storage.info();
+    info.default_projects_root = default_root;
+    info.configured_projects_root = configured_root.clone();
+    info.restart_required = configured_root != info.projects_root;
+    info.configured_root_available = configured_root.is_dir();
+    Ok(info)
+}
+
 fn initialize_storage(app: &AppHandle) -> Result<ProjectStorage, String> {
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法确定应用数据目录：{error}"))?;
-    ProjectStorage::initialize(
-        app_data_dir.join("zhihua.sqlite3"),
-        app_data_dir.join("projects"),
-    )
-    .map_err(|error| error.to_string())
+    let database_path = app_data_dir.join("zhihua.sqlite3");
+    let default_root = app_data_dir.join("projects");
+    if let Some(configured_root) = load_storage_preferences(app)?.projects_root {
+        if configured_root.is_absolute() && configured_root.parent().is_some() {
+            if let Ok(storage) = ProjectStorage::initialize(&database_path, configured_root) {
+                return Ok(storage);
+            }
+        }
+    }
+    ProjectStorage::initialize(database_path, default_root).map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3206,6 +3307,11 @@ pub fn run() {
         .setup(|app| {
             let storage = initialize_storage(app.handle())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            app.asset_protocol_scope()
+                .allow_directory(&storage.info().projects_root, true)
+                .map_err(|error| -> Box<dyn std::error::Error> {
+                    format!("无法授权项目素材目录：{error}").into()
+                })?;
             let source_storage = SourceStorage::initialize(storage.clone())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let storyboard_storage = StoryboardStorage::initialize(storage.clone())
@@ -3315,6 +3421,8 @@ pub fn run() {
             set_compute_policy,
             get_storage_usage,
             open_projects_root,
+            set_projects_root,
+            reset_projects_root,
             create_project,
             list_projects,
             update_project,

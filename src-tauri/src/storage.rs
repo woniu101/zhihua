@@ -127,6 +127,10 @@ pub struct UpdateProjectInput {
 pub struct StorageInfo {
     pub database_path: PathBuf,
     pub projects_root: PathBuf,
+    pub configured_projects_root: PathBuf,
+    pub default_projects_root: PathBuf,
+    pub restart_required: bool,
+    pub configured_root_available: bool,
     pub schema_version: i64,
 }
 
@@ -187,6 +191,10 @@ impl ProjectStorage {
         StorageInfo {
             database_path: self.database_path.clone(),
             projects_root: self.projects_root.clone(),
+            configured_projects_root: self.projects_root.clone(),
+            default_projects_root: self.projects_root.clone(),
+            restart_required: false,
+            configured_root_available: true,
             schema_version: SCHEMA_VERSION,
         }
     }
