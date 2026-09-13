@@ -504,6 +504,17 @@ impl ComputeControlStore {
         self.get_instance(&instance.instance_id)
     }
 
+    pub fn refresh_platform_instance(
+        &self,
+        instance: &CompShareInstance,
+    ) -> Result<ManagedComputeInstance, ComputeControlError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        upsert_platform_instance(&transaction, instance, &now_iso())?;
+        transaction.commit()?;
+        self.get_instance(&instance.instance_id)
+    }
+
     pub fn register_zhihua_instance(
         &self,
         instance: &CompShareInstance,
@@ -1592,6 +1603,28 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("关机")));
+    }
+
+    #[test]
+    fn refreshing_one_worker_preserves_its_management_metadata() {
+        let store = store();
+        let stopped = instance("elastic", CompSharePowerState::Stopped);
+        store
+            .register_zhihua_instance(&stopped, ComputeInstanceRole::Elastic)
+            .unwrap();
+
+        let running = instance("elastic", CompSharePowerState::Running);
+        let refreshed = store.refresh_platform_instance(&running).unwrap();
+
+        assert_eq!(refreshed.role, ComputeInstanceRole::Elastic);
+        assert_eq!(
+            refreshed.ownership,
+            ComputeInstanceOwnership::ZhihuaManaged
+        );
+        assert_eq!(refreshed.cleanup_policy, ComputeCleanupPolicy::ReleaseWhenIdle);
+        assert_eq!(refreshed.platform_state, "Running");
+        assert_eq!(refreshed.running_mode, "gpu");
+        assert_eq!(refreshed.lifecycle_state, ComputeLifecycleState::Idle);
     }
 
     #[test]

@@ -1009,65 +1009,170 @@ async fn prepare_generation_service(
     compute: State<'_, ComputeControlStore>,
     lifecycle: State<'_, ComputeLifecycle>,
 ) -> Result<ServiceProbe, String> {
+    let instance_id = comp_share
+        .configuration()
+        .map_err(|error| error.message)?
+        .bound_instance_id
+        .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
+    prepare_compute_worker_impl(
+        &manager,
+        &service,
+        &comp_share,
+        &compute,
+        &lifecycle,
+        &instance_id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn prepare_compute_worker(
+    manager: State<'_, SshTunnelManager>,
+    service: State<'_, ServiceClient>,
+    comp_share: State<'_, CompShareProvider>,
+    compute: State<'_, ComputeControlStore>,
+    lifecycle: State<'_, ComputeLifecycle>,
+    instance_id: String,
+) -> Result<ServiceProbe, String> {
+    prepare_compute_worker_impl(
+        &manager,
+        &service,
+        &comp_share,
+        &compute,
+        &lifecycle,
+        &instance_id,
+    )
+    .await
+}
+
+async fn prepare_compute_worker_impl(
+    manager: &SshTunnelManager,
+    service: &ServiceClient,
+    comp_share: &CompShareProvider,
+    compute: &ComputeControlStore,
+    lifecycle: &ComputeLifecycle,
+    instance_id: &str,
+) -> Result<ServiceProbe, String> {
     lifecycle.invalidate_idle_shutdown();
+    let managed = compute
+        .get_instance(instance_id)
+        .map_err(|error| error.message)?;
+    if managed.role == ComputeInstanceRole::UserManaged {
+        return Err("该实例尚未被选为主实例，不能自动启动 GPU".to_owned());
+    }
+    let tunnel = manager
+        .status_for(instance_id)
+        .map_err(|error| error.message)?;
+    if !tunnel.configured {
+        let _ = compute.record_worker_readiness(
+            instance_id,
+            ComputeServiceState::Unreachable,
+            None,
+            None,
+            None,
+            None,
+            Some("实例尚未配置独立 SSH 连接"),
+        );
+        return Err("该实例尚未配置独立 SSH 连接，未启动 GPU 以避免产生空耗费用".to_owned());
+    }
+
+    let locator = compute_instance_locator(&managed);
     let mut instance = comp_share
-        .bound_instance()
+        .describe_instance(locator.clone())
         .await
         .map_err(|error| error.message)?;
-    if instance.running_mode == CompShareRunningMode::NoGpu {
-        comp_share
-            .stop_instance()
-            .await
-            .map_err(|error| error.message)?;
-        instance = wait_for_instance_state(
-            &comp_share,
+    compute
+        .refresh_platform_instance(&instance)
+        .map_err(|error| error.message)?;
+
+    if instance.state == CompSharePowerState::Stopping {
+        instance = wait_for_instance_state_for(
+            comp_share,
+            &locator,
             CompSharePowerState::Stopped,
             None,
-            Duration::from_secs(120),
+            Duration::from_secs(180),
+        )
+        .await?;
+    } else if instance.state == CompSharePowerState::Starting {
+        instance = wait_for_instance_state_for(
+            comp_share,
+            &locator,
+            CompSharePowerState::Running,
+            None,
+            Duration::from_secs(180),
+        )
+        .await?;
+    }
+
+    if instance.running_mode == CompShareRunningMode::NoGpu {
+        comp_share
+            .stop_instance_for(locator.clone())
+            .await
+            .map_err(|error| error.message)?;
+        instance = wait_for_instance_state_for(
+            comp_share,
+            &locator,
+            CompSharePowerState::Stopped,
+            None,
+            Duration::from_secs(180),
         )
         .await?;
     }
     if instance.state == CompSharePowerState::Stopped {
         comp_share
-            .start_instance(CompShareStartMode::Gpu)
+            .start_instance_for(locator.clone(), CompShareStartMode::Gpu)
             .await
             .map_err(|error| error.message)?;
+    } else if instance.state != CompSharePowerState::Running
+        || instance.running_mode != CompShareRunningMode::Gpu
+    {
+        return Err(format!(
+            "实例当前状态无法准备为 GPU worker：{}",
+            instance.raw_state
+        ));
     }
+
     let hard_limit_minutes = lifecycle.snapshot().hard_limit_minutes;
     if let Err(error) = comp_share
-        .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
-            stop_time: chrono::Utc::now().timestamp() + (hard_limit_minutes as i64) * 60,
-            project_id: None,
-        })
+        .update_stop_scheduler_for(
+            locator.clone(),
+            chrono::Utc::now().timestamp() + (hard_limit_minutes as i64) * 60,
+        )
         .await
     {
-        let _ = wait_for_instance_state(
-            &comp_share,
+        let _ = wait_for_instance_state_for(
+            comp_share,
+            &locator,
             CompSharePowerState::Running,
             Some(CompShareRunningMode::Gpu),
             Duration::from_secs(180),
         )
         .await;
-        let _ = comp_share.stop_instance().await;
+        let _ = comp_share.stop_instance_for(locator.clone()).await;
         return Err(format!(
-            "GPU 已启动，但无法设置 {hard_limit_minutes} 分钟定时关机保障，已请求关机且任务未提交：{}",
+            "GPU 已启动，但无法设置 {hard_limit_minutes} 分钟平台关机保障，已请求关机且任务未提交：{}",
             error.message
         ));
     }
-    wait_for_instance_state(
-        &comp_share,
+    let instance = wait_for_instance_state_for(
+        comp_share,
+        &locator,
         CompSharePowerState::Running,
         Some(CompShareRunningMode::Gpu),
         Duration::from_secs(180),
     )
     .await?;
+    compute
+        .refresh_platform_instance(&instance)
+        .map_err(|error| error.message)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {
         let readiness = match connect_service_through_tunnel_impl(
-            &manager,
-            &service,
-            &compute,
+            manager,
+            service,
+            compute,
             &instance.instance_id,
         )
         .await
@@ -1077,11 +1182,21 @@ async fn prepare_generation_service(
             Err(error) => error,
         };
         if tokio::time::Instant::now() >= deadline {
+            let _ = comp_share.stop_instance_for(locator.clone()).await;
             return Err(format!(
-                "GPU 已启动，但生成环境未在 4 分钟内就绪：{readiness}"
+                "生成环境未在 4 分钟内就绪，已请求关闭该实例的 GPU：{readiness}"
             ));
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+fn compute_instance_locator(instance: &ManagedComputeInstance) -> CompShareInstanceLocator {
+    CompShareInstanceLocator {
+        instance_id: instance.instance_id.clone(),
+        region: instance.region.clone(),
+        zone: instance.zone.clone(),
+        project_id: instance.project_id.clone(),
     }
 }
 
@@ -1091,10 +1206,33 @@ async fn wait_for_instance_state(
     expected_mode: Option<CompShareRunningMode>,
     timeout: Duration,
 ) -> Result<CompShareInstance, String> {
+    let configuration = provider.configuration().map_err(|error| error.message)?;
+    let locator = CompShareInstanceLocator {
+        instance_id: configuration
+            .bound_instance_id
+            .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?,
+        region: configuration
+            .region
+            .ok_or_else(|| "绑定实例缺少地域".to_owned())?,
+        zone: configuration
+            .zone
+            .ok_or_else(|| "绑定实例缺少可用区".to_owned())?,
+        project_id: configuration.project_id,
+    };
+    wait_for_instance_state_for(provider, &locator, expected_state, expected_mode, timeout).await
+}
+
+async fn wait_for_instance_state_for(
+    provider: &CompShareProvider,
+    locator: &CompShareInstanceLocator,
+    expected_state: CompSharePowerState,
+    expected_mode: Option<CompShareRunningMode>,
+    timeout: Duration,
+) -> Result<CompShareInstance, String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let instance = provider
-            .bound_instance()
+            .describe_instance(locator.clone())
             .await
             .map_err(|error| error.message)?;
         if instance.state == expected_state
@@ -2843,6 +2981,7 @@ pub fn run() {
             get_ssh_tunnel_status,
             connect_service_through_tunnel,
             connect_compute_worker,
+            prepare_compute_worker,
             prepare_generation_service,
         ])
         .run(tauri::generate_context!())

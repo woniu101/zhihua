@@ -763,9 +763,25 @@ impl CompShareProvider {
         &self,
         mode: CompShareStartMode,
     ) -> CompShareResult<CompShareActionResult> {
-        let credentials = self.credentials()?;
         let bound = self.required_bound_instance()?;
-        let current = self.describe_bound(&credentials, &bound).await?;
+        self.start_instance_for(bound_locator(&bound), mode).await
+    }
+
+    pub async fn start_instance_for(
+        &self,
+        locator: CompShareInstanceLocator,
+        mode: CompShareStartMode,
+    ) -> CompShareResult<CompShareActionResult> {
+        let locator = normalize_locator(locator)?;
+        let credentials = self.credentials()?;
+        let current = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
         match current.state {
             CompSharePowerState::Running => {
                 let expected = match mode {
@@ -805,7 +821,7 @@ impl CompShareProvider {
             ));
         }
 
-        let mut parameters = action_parameters(&bound);
+        let mut parameters = locator_parameters(&locator);
         if mode == CompShareStartMode::NoGpu {
             parameters.insert("WithoutGpuSpec".to_string(), "A".to_string());
         }
@@ -813,7 +829,14 @@ impl CompShareProvider {
             .api
             .invoke(&credentials, "StartCompShareInstance", parameters)
             .await?;
-        let instance = self.describe_bound(&credentials, &bound).await?;
+        let instance = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
         Ok(CompShareActionResult {
             request_sent: true,
             requested_mode: Some(mode),
@@ -822,9 +845,24 @@ impl CompShareProvider {
     }
 
     pub async fn stop_instance(&self) -> CompShareResult<CompShareActionResult> {
-        let credentials = self.credentials()?;
         let bound = self.required_bound_instance()?;
-        let current = self.describe_bound(&credentials, &bound).await?;
+        self.stop_instance_for(bound_locator(&bound)).await
+    }
+
+    pub async fn stop_instance_for(
+        &self,
+        locator: CompShareInstanceLocator,
+    ) -> CompShareResult<CompShareActionResult> {
+        let locator = normalize_locator(locator)?;
+        let credentials = self.credentials()?;
+        let current = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
         match current.state {
             CompSharePowerState::Stopped => {
                 return Ok(CompShareActionResult {
@@ -847,12 +885,19 @@ impl CompShareProvider {
                 ));
             }
         }
-        let parameters = action_parameters(&bound);
+        let parameters = locator_parameters(&locator);
         let _: InstanceActionResponseWire = self
             .api
             .invoke(&credentials, "StopCompShareInstance", parameters)
             .await?;
-        let instance = self.describe_bound(&credentials, &bound).await?;
+        let instance = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
         Ok(CompShareActionResult {
             request_sent: true,
             requested_mode: None,
@@ -879,11 +924,16 @@ impl CompShareProvider {
         } else {
             self.default_project_id(&credentials).await?
         };
-        let _current = self.describe_bound(&credentials, &bound).await?;
-        let parameters = stop_scheduler_parameters(&bound, &project_id, input.stop_time);
-        let _: EmptyResponseWire = self
-            .api
-            .invoke(&credentials, "UpdateCompShareStopScheduler", parameters)
+        let result = self
+            .update_stop_scheduler_for(
+                CompShareInstanceLocator {
+                    instance_id: bound.instance_id.clone(),
+                    region: bound.region.clone(),
+                    zone: bound.zone.clone(),
+                    project_id: Some(project_id.clone()),
+                },
+                input.stop_time,
+            )
             .await?;
         if bound.project_id.as_deref() != Some(project_id.as_str()) {
             bound.project_id = Some(project_id);
@@ -891,9 +941,51 @@ impl CompShareProvider {
                 bound_instance: Some(bound.clone()),
             })?;
         }
-        let instance = self.describe_bound(&credentials, &bound).await?;
+        Ok(result)
+    }
+
+    pub async fn update_stop_scheduler_for(
+        &self,
+        locator: CompShareInstanceLocator,
+        stop_time: i64,
+    ) -> CompShareResult<CompShareSchedulerResult> {
+        if stop_time < chrono::Utc::now().timestamp() + 300 {
+            return Err(CompShareError::new(
+                "INVALID_STOP_TIME",
+                "定时关机时间必须至少晚于当前时间 5 分钟",
+            ));
+        }
+        let credentials = self.credentials()?;
+        let mut locator = normalize_locator(locator)?;
+        let project_id = if let Some(project_id) = locator.project_id.clone() {
+            project_id
+        } else {
+            self.default_project_id(&credentials).await?
+        };
+        locator.project_id = Some(project_id.clone());
+        let _current = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
+        let parameters = stop_scheduler_parameters(&locator, &project_id, stop_time);
+        let _: EmptyResponseWire = self
+            .api
+            .invoke(&credentials, "UpdateCompShareStopScheduler", parameters)
+            .await?;
+        let instance = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
         Ok(CompShareSchedulerResult {
-            stop_time: input.stop_time,
+            stop_time,
             instance,
         })
     }
@@ -906,12 +998,13 @@ impl CompShareProvider {
         } else {
             self.default_project_id(&credentials).await?
         };
-        let _current = self.describe_bound(&credentials, &bound).await?;
-        let mut parameters = action_parameters(&bound);
-        parameters.insert("ProjectId".to_owned(), project_id.clone());
-        let _: EmptyResponseWire = self
-            .api
-            .invoke(&credentials, "DeleteCompShareStopScheduler", parameters)
+        let result = self
+            .delete_stop_scheduler_for(CompShareInstanceLocator {
+                instance_id: bound.instance_id.clone(),
+                region: bound.region.clone(),
+                zone: bound.zone.clone(),
+                project_id: Some(project_id.clone()),
+            })
             .await?;
         if bound.project_id.as_deref() != Some(project_id.as_str()) {
             bound.project_id = Some(project_id);
@@ -919,7 +1012,43 @@ impl CompShareProvider {
                 bound_instance: Some(bound.clone()),
             })?;
         }
-        let instance = self.describe_bound(&credentials, &bound).await?;
+        Ok(result)
+    }
+
+    pub async fn delete_stop_scheduler_for(
+        &self,
+        locator: CompShareInstanceLocator,
+    ) -> CompShareResult<CompShareDeleteSchedulerResult> {
+        let credentials = self.credentials()?;
+        let mut locator = normalize_locator(locator)?;
+        let project_id = if let Some(project_id) = locator.project_id.clone() {
+            project_id
+        } else {
+            self.default_project_id(&credentials).await?
+        };
+        locator.project_id = Some(project_id.clone());
+        let _current = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
+        let mut parameters = locator_parameters(&locator);
+        parameters.insert("ProjectId".to_owned(), project_id);
+        let _: EmptyResponseWire = self
+            .api
+            .invoke(&credentials, "DeleteCompShareStopScheduler", parameters)
+            .await?;
+        let instance = self
+            .describe_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
         Ok(CompShareDeleteSchedulerResult {
             deleted: true,
             instance,
@@ -1311,23 +1440,21 @@ fn optional_string_field(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-fn action_parameters(bound: &BoundInstance) -> BTreeMap<String, String> {
-    let mut parameters = BTreeMap::new();
-    parameters.insert("Region".to_string(), bound.region.clone());
-    parameters.insert("Zone".to_string(), bound.zone.clone());
-    parameters.insert("UHostId".to_string(), bound.instance_id.clone());
-    if let Some(project_id) = bound.project_id.as_ref() {
-        parameters.insert("ProjectId".to_string(), project_id.clone());
+fn bound_locator(bound: &BoundInstance) -> CompShareInstanceLocator {
+    CompShareInstanceLocator {
+        instance_id: bound.instance_id.clone(),
+        region: bound.region.clone(),
+        zone: bound.zone.clone(),
+        project_id: bound.project_id.clone(),
     }
-    parameters
 }
 
 fn stop_scheduler_parameters(
-    bound: &BoundInstance,
+    locator: &CompShareInstanceLocator,
     project_id: &str,
     stop_time: i64,
 ) -> BTreeMap<String, String> {
-    let mut parameters = action_parameters(bound);
+    let mut parameters = locator_parameters(locator);
     parameters.insert("ProjectId".to_string(), project_id.to_owned());
     parameters.insert("SchedulerStopTime".to_string(), stop_time.to_string());
     parameters
@@ -1741,13 +1868,13 @@ mod tests {
 
     #[test]
     fn scheduler_uses_current_api_parameter_and_prefers_default_project() {
-        let bound = BoundInstance {
+        let locator = CompShareInstanceLocator {
             instance_id: "uhost-test".to_owned(),
             region: "cn-test".to_owned(),
             zone: "cn-test-01".to_owned(),
             project_id: None,
         };
-        let parameters = stop_scheduler_parameters(&bound, "org-default", 1_800_000_000);
+        let parameters = stop_scheduler_parameters(&locator, "org-default", 1_800_000_000);
         assert_eq!(
             parameters.get("SchedulerStopTime").map(String::as_str),
             Some("1800000000")

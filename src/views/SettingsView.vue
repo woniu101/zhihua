@@ -525,15 +525,40 @@ async function checkManagedWorker(item: ManagedComputeInstance) {
   }
 }
 
+async function prepareManagedWorker(item: ManagedComputeInstance) {
+  busy.value = true;
+  setComputeNotice(`正在启动“${item.name ?? item.instanceId}”并准备生成服务……`, "neutral");
+  try {
+    const result = await serviceRepository.prepareWorker(item.instanceId);
+    if (!result?.comfyuiReady) throw new Error("GPU 已启动，但生成服务尚未就绪。");
+    probe.value = result;
+    await refreshCompute();
+    setComputeNotice(`“${item.name ?? item.instanceId}”已成为可用 GPU worker。`, "success");
+  } catch (error) {
+    setComputeNotice(normalizeConnectionFailure(error).message, "error");
+    await refreshCompute();
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function changeComputeMode(mode: "gpu" | "noGpu" | "stop") {
   busy.value = true;
   try {
+    if (mode === "gpu") {
+      const instanceId = computeConfiguration.value?.boundInstanceId;
+      if (!instanceId) throw new Error("请先选择主实例。");
+      probe.value = await serviceRepository.prepareWorker(instanceId);
+      await refreshCompute();
+      setComputeNotice("GPU 与生成服务已就绪。", "success");
+      return;
+    }
     const result = mode === "stop"
       ? await compShareRepository.stop()
       : await compShareRepository.start(mode);
     computeInstance.value = result.instance;
     setComputeNotice(
-      mode === "gpu" ? "已请求启动 GPU。" : mode === "noGpu" ? "已请求无卡启动。" : "已请求关机。",
+      mode === "noGpu" ? "已请求无卡启动。" : "已请求关机。",
       "success",
     );
     window.setTimeout(refreshCompute, 3500);
@@ -717,7 +742,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
                   <div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : 'GPU 规格待查询' }} · {{ ownershipLabel(item.ownership) }}　<em class="worker-readiness" :class="workerReadinessTone(item.instanceId)">● {{ workerReadinessLabel(item.instanceId) }}</em></small></div>
                   <strong>{{ managedModeLabel(item) }}</strong>
                 </div>
-                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
+                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.role !== 'user_managed' && item.runningMode !== 'gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="prepareManagedWorker(item)">准备 GPU</button><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
               </article>
               <p v-if="!managedInstances.length" class="empty-instances">平台没有返回可用实例。创建弹性实例前会先检查地域库存和实时报价，并再次让你确认。</p>
             </div>
