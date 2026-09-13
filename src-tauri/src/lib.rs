@@ -32,8 +32,8 @@ use comp_share::{
 };
 use compute_control::{
     ComputeControlError, ComputeControlStore, ComputeInstanceRole, ComputeOperation,
-    ComputeOperationAction, ComputeOperationStatus, ComputeServiceState, ComputeWorkerReadiness,
-    ManagedComputeInstance, ReleaseEligibility,
+    ComputeOperationAction, ComputeOperationStatus, ComputeServiceState, ComputeWorkerLease,
+    ComputeWorkerReadiness, ManagedComputeInstance, ReleaseEligibility,
 };
 use compute_pool::{plan_compute_pool, ComputePoolPlan, ComputePoolPlanInput};
 use export::{
@@ -1718,16 +1718,23 @@ async fn submit_service_job(
     let request_id = input.client_request_id.clone();
     let result = async {
         queue.stage(&input).map_err(queue_service_error)?;
-        let primary = compute.primary_instance().map_err(compute_service_error)?;
-        let worker_id = format!("instance:{}:gpu:0", primary.instance_id);
-        compute
-            .acquire_worker_lease(&worker_id, &primary.instance_id, &request_id, 3_600)
-            .map_err(compute_service_error)?;
+        let lease = match compute.worker_lease(&request_id) {
+            Ok(lease) => lease,
+            Err(error) if error.code == "WORKER_LEASE_NOT_FOUND" => {
+                let primary = compute.primary_instance().map_err(compute_service_error)?;
+                let worker_id = format!("instance:{}:gpu:0", primary.instance_id);
+                compute
+                    .acquire_worker_lease(&worker_id, &primary.instance_id, &request_id, 3_600)
+                    .map_err(compute_service_error)?
+            }
+            Err(error) => return Err(compute_service_error(error)),
+        };
+        let worker_id = lease.worker_id.clone();
         if let Err(error) = queue.claim_for_worker(&request_id, &worker_id, 3_600) {
             let _ = compute.release_worker_lease(&request_id);
             return Err(queue_service_error(error));
         }
-        match service.submit_job_for(&primary.instance_id, input).await {
+        match service.submit_job_for(&lease.instance_id, input).await {
             Ok(job) => {
                 queue.record_remote(&job).map_err(queue_service_error)?;
                 Ok(job)
@@ -1857,18 +1864,95 @@ fn plan_generation_compute_pool(input: ComputePoolPlanInput) -> ComputePoolPlan 
 }
 
 #[tauri::command]
+fn reserve_service_worker(
+    compute: State<'_, ComputeControlStore>,
+    service: State<'_, ServiceClient>,
+    client_request_id: String,
+) -> Result<ComputeWorkerLease, ServiceConnectionError> {
+    let lease = compute
+        .acquire_ready_worker_lease(&client_request_id, 3_600)
+        .map_err(compute_service_error)?;
+    let connected = service.info_for(&lease.instance_id)?;
+    if !connected.configured || !connected.credential_stored {
+        let _ = compute.release_worker_lease(&client_request_id);
+        return Err(ServiceConnectionError {
+            code: "worker_connection_missing",
+            message: "已选 worker 尚未建立独立服务连接，请刷新实例状态后重试。".to_owned(),
+        });
+    }
+    Ok(lease)
+}
+
+#[tauri::command]
+fn release_service_worker_reservation(
+    compute: State<'_, ComputeControlStore>,
+    client_request_id: String,
+) -> Result<bool, ComputeControlError> {
+    compute.release_worker_lease(&client_request_id)
+}
+
+#[tauri::command]
 async fn upload_service_input(
     service: State<'_, ServiceClient>,
+    compute: State<'_, ComputeControlStore>,
     source_path: String,
+    client_request_id: Option<String>,
+    instance_id: Option<String>,
 ) -> Result<ServiceInputUpload, ServiceConnectionError> {
+    if let Some(request_id) = client_request_id {
+        let lease = compute
+            .worker_lease(&request_id)
+            .map_err(compute_service_error)?;
+        if instance_id
+            .as_deref()
+            .is_some_and(|value| value != lease.instance_id)
+        {
+            return Err(ServiceConnectionError {
+                code: "worker_route_mismatch",
+                message: "素材目标实例与任务预留的 worker 不一致。".to_owned(),
+            });
+        }
+        return service
+            .upload_input_for(&lease.instance_id, &source_path)
+            .await;
+    }
+    if let Some(instance_id) = instance_id {
+        return service.upload_input_for(&instance_id, &source_path).await;
+    }
     service.upload_input(&source_path).await
 }
 
 #[tauri::command]
 async fn delete_service_input(
     service: State<'_, ServiceClient>,
+    compute: State<'_, ComputeControlStore>,
     input_id: String,
+    client_request_id: Option<String>,
+    instance_id: Option<String>,
 ) -> Result<(), ServiceConnectionError> {
+    if let Some(request_id) = client_request_id {
+        match compute.worker_lease(&request_id) {
+            Ok(lease) => {
+                if instance_id
+                    .as_deref()
+                    .is_some_and(|value| value != lease.instance_id)
+                {
+                    return Err(ServiceConnectionError {
+                        code: "worker_route_mismatch",
+                        message: "素材所在实例与任务预留的 worker 不一致。".to_owned(),
+                    });
+                }
+                return service
+                    .delete_input_for(&lease.instance_id, &input_id)
+                    .await;
+            }
+            Err(error) if error.code == "WORKER_LEASE_NOT_FOUND" => {}
+            Err(error) => return Err(compute_service_error(error)),
+        }
+    }
+    if let Some(instance_id) = instance_id {
+        return service.delete_input_for(&instance_id, &input_id).await;
+    }
     service.delete_input(&input_id).await
 }
 
@@ -2668,6 +2752,8 @@ pub fn run() {
             cancel_service_job,
             list_local_jobs,
             plan_generation_compute_pool,
+            reserve_service_worker,
+            release_service_worker_reservation,
             upload_service_input,
             delete_service_input,
             download_service_artifact,

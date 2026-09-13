@@ -144,6 +144,13 @@ export interface ServiceInputUpload {
   sha256: string;
 }
 
+export interface ComputeWorkerLease {
+  workerId: string;
+  instanceId: string;
+  jobId: string;
+  leaseExpiresAt: string;
+}
+
 export interface ServiceArtifactDownload {
   destinationPath: string;
   sizeBytes: number;
@@ -225,10 +232,26 @@ export const serviceRepository = {
   },
   planComputePool: (input: ComputePoolPlanInput) =>
     invokeNative<ComputePoolPlan>("plan_generation_compute_pool", { input }),
-  uploadInput: (sourcePath: string) =>
-    invokeNative<ServiceInputUpload>("upload_service_input", { sourcePath }),
-  deleteInput: (inputId: string) =>
-    invokeNative<void>("delete_service_input", { inputId }),
+  reserveWorker: (clientRequestId: string) =>
+    invokeNative<ComputeWorkerLease>("reserve_service_worker", { clientRequestId }),
+  releaseWorker: (clientRequestId: string) =>
+    invokeNative<boolean>("release_service_worker_reservation", { clientRequestId }),
+  uploadInput: (
+    sourcePath: string,
+    target?: { clientRequestId: string; instanceId: string },
+  ) => invokeNative<ServiceInputUpload>("upload_service_input", {
+    sourcePath,
+    clientRequestId: target?.clientRequestId,
+    instanceId: target?.instanceId,
+  }),
+  deleteInput: (
+    inputId: string,
+    target?: { clientRequestId: string; instanceId: string },
+  ) => invokeNative<void>("delete_service_input", {
+    inputId,
+    clientRequestId: target?.clientRequestId,
+    instanceId: target?.instanceId,
+  }),
   downloadArtifact: (input: {
     jobId: string;
     artifactId: string;
@@ -272,14 +295,18 @@ export class ComfyUiH3Provider implements VideoProvider {
     if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
       throw new Error(`工作流 ${workflowId} 尚未安装，当前不会启动 GPU。`);
     }
-    const uploaded: ServiceInputUpload[] = [];
     const parameters: Record<string, unknown> = {};
+    const pendingUploads: Array<{
+      parameter: string;
+      path: string;
+      label: string;
+    }> = [];
     if (request.mode !== "t2v") {
       const assets = await assetRepository.list(request.projectId);
       const selected = request.assetIds
         .map((id) => assets.find((asset) => asset.id === id))
         .filter((asset): asset is NonNullable<typeof asset> => Boolean(asset));
-      const upload = async (
+      const stage = async (
         asset: (typeof selected)[number],
         frameBound = false,
       ) => {
@@ -309,31 +336,47 @@ export class ComfyUiH3Provider implements VideoProvider {
           }
           path = composition.derivativePath;
         }
-        const result = await serviceRepository.uploadInput(path);
-        if (!result) throw new Error(`参考素材“${asset.name}”上传失败。`);
-        uploaded.push(result);
-        return result.remoteFile;
+        return path;
       };
-      try {
-        if (request.mode === "i2v" || request.mode === "continue") {
-          const image = selected.find((asset) => asset.mediaType === "image");
-          if (!image) throw new Error("“从这张画面开始”需要选择一张首帧图片。");
-          parameters.firstFrameFile = await upload(image, true);
-        } else if (request.mode === "flf2v") {
-          const images = selected.filter((asset) => asset.mediaType === "image");
-          if (images.length < 2) throw new Error("“首尾画面过渡”需要按顺序选择首帧和尾帧图片。");
-          parameters.firstFrameFile = await upload(images[0], true);
-          parameters.lastFrameFile = await upload(images[1], true);
-        } else if (request.mode === "r2v") {
-          const video = selected.find((asset) => asset.mediaType === "video");
-          const image = selected.find((asset) => asset.mediaType === "image");
-          if (!video || !image) throw new Error("“保持角色与场景”需要一段参考视频和一张参考图片。");
-          parameters.referenceVideoFile = await upload(video);
-          parameters.referenceImageFile = await upload(image);
-        }
-      } catch (error) {
-        await Promise.allSettled(uploaded.map((item) => serviceRepository.deleteInput(item.inputId)));
-        throw error;
+      if (request.mode === "i2v" || request.mode === "continue") {
+        const image = selected.find((asset) => asset.mediaType === "image");
+        if (!image) throw new Error("“从这张画面开始”需要选择一张首帧图片。");
+        pendingUploads.push({
+          parameter: "firstFrameFile",
+          path: await stage(image, true),
+          label: image.name,
+        });
+      } else if (request.mode === "flf2v") {
+        const images = selected.filter((asset) => asset.mediaType === "image");
+        if (images.length < 2) throw new Error("“首尾画面过渡”需要按顺序选择首帧和尾帧图片。");
+        pendingUploads.push(
+          {
+            parameter: "firstFrameFile",
+            path: await stage(images[0], true),
+            label: images[0].name,
+          },
+          {
+            parameter: "lastFrameFile",
+            path: await stage(images[1], true),
+            label: images[1].name,
+          },
+        );
+      } else if (request.mode === "r2v") {
+        const video = selected.find((asset) => asset.mediaType === "video");
+        const image = selected.find((asset) => asset.mediaType === "image");
+        if (!video || !image) throw new Error("“保持角色与场景”需要一段参考视频和一张参考图片。");
+        pendingUploads.push(
+          {
+            parameter: "referenceVideoFile",
+            path: await stage(video),
+            label: video.name,
+          },
+          {
+            parameter: "referenceImageFile",
+            path: await stage(image),
+            label: image.name,
+          },
+        );
       }
     }
     const dimensions = candidateDimensions(request.aspectRatio);
@@ -349,10 +392,25 @@ export class ComfyUiH3Provider implements VideoProvider {
       durationSec: request.durationSec,
       audioPolicy: request.h3AudioPolicy,
     });
+    const uploaded: ServiceInputUpload[] = [];
+    let lease: ComputeWorkerLease | undefined;
     try {
       const probe = await serviceRepository.prepareGeneration();
       if (!probe?.comfyuiReady) {
         throw new Error(probe?.detail ?? "生成环境尚未就绪，请稍后重试。");
+      }
+      const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
+      if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
+      lease = reserved;
+      const target = {
+        clientRequestId: request.clientRequestId,
+        instanceId: reserved.instanceId,
+      };
+      for (const pending of pendingUploads) {
+        const result = await serviceRepository.uploadInput(pending.path, target);
+        if (!result) throw new Error(`参考素材“${pending.label}”上传失败。`);
+        uploaded.push(result);
+        parameters[pending.parameter] = result.remoteFile;
       }
       const job = await invokeNative<NativeServiceJob>("submit_service_job", {
         input: {
@@ -388,7 +446,16 @@ export class ComfyUiH3Provider implements VideoProvider {
       if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
       return mapJob(job);
     } catch (error) {
-      await Promise.allSettled(uploaded.map((item) => serviceRepository.deleteInput(item.inputId)));
+      if (lease) {
+        const target = {
+          clientRequestId: request.clientRequestId,
+          instanceId: lease.instanceId,
+        };
+        await Promise.allSettled(
+          uploaded.map((item) => serviceRepository.deleteInput(item.inputId, target)),
+        );
+        await serviceRepository.releaseWorker(request.clientRequestId).catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -402,13 +469,22 @@ export class ComfyUiH3Provider implements VideoProvider {
     if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
       throw new Error("SeedVR2 1080p 工作流或公共模型尚未就绪，当前不会启动 GPU。");
     }
-    const uploaded = await serviceRepository.uploadInput(request.sourcePath);
-    if (!uploaded) throw new Error("正式版本上传失败。");
+    let lease: ComputeWorkerLease | undefined;
+    let uploaded: ServiceInputUpload | undefined;
     try {
       const probe = await serviceRepository.prepareGeneration();
       if (!probe?.comfyuiReady) {
         throw new Error(probe?.detail ?? "1080p 生成环境尚未就绪，请稍后重试。");
       }
+      const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
+      if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
+      lease = reserved;
+      const target = {
+        clientRequestId: request.clientRequestId,
+        instanceId: reserved.instanceId,
+      };
+      uploaded = await serviceRepository.uploadInput(request.sourcePath, target);
+      if (!uploaded) throw new Error("正式版本上传失败。");
       const job = await invokeNative<NativeServiceJob>("submit_service_job", {
         input: {
           clientRequestId: request.clientRequestId,
@@ -425,7 +501,16 @@ export class ComfyUiH3Provider implements VideoProvider {
       if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
       return mapJob(job);
     } catch (error) {
-      await serviceRepository.deleteInput(uploaded.inputId).catch(() => undefined);
+      if (lease) {
+        const target = {
+          clientRequestId: request.clientRequestId,
+          instanceId: lease.instanceId,
+        };
+        if (uploaded) {
+          await serviceRepository.deleteInput(uploaded.inputId, target).catch(() => undefined);
+        }
+        await serviceRepository.releaseWorker(request.clientRequestId).catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -464,14 +549,16 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
       throw new Error(`工作流 ${workflowId} 尚未就绪，当前不会启动 GPU。`);
     }
     const profile = frameProfile(request.aspectRatio);
-        const parameters: Record<string, unknown> = {
+    const parameters: Record<string, unknown> = {
       prompt: request.prompt,
       negativePrompt: request.negativePrompt ?? "模糊、畸形、乱码、水印、低清晰度",
       width: profile.workWidth,
       height: profile.workHeight,
       seed: request.seed,
     };
+    let sourcePath: string | undefined;
     let uploaded: ServiceInputUpload | undefined;
+    let lease: ComputeWorkerLease | undefined;
     try {
       if (request.mode === "edit") {
         if (!request.sourceAssetId) throw new Error("图片编辑需要选择一张来源图片。");
@@ -498,14 +585,22 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
         }
         composition = await frameCompositionRepository.prepare(key);
         if (!composition?.derivativePath) throw new Error("来源图片的项目画幅准备失败。");
-        uploaded = await serviceRepository.uploadInput(composition.derivativePath);
-        if (!uploaded) throw new Error("来源图片上传失败。");
-        parameters.sourceImageFile = uploaded.remoteFile;
-        parameters.width = profile.workWidth;
-        parameters.height = profile.workHeight;
+        sourcePath = composition.derivativePath;
       }
       const probe = await serviceRepository.prepareGeneration();
       if (!probe?.comfyuiReady) throw new Error(probe?.detail ?? "图片生成环境尚未就绪。");
+      const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
+      if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
+      lease = reserved;
+      const target = {
+        clientRequestId: request.clientRequestId,
+        instanceId: reserved.instanceId,
+      };
+      if (sourcePath) {
+        uploaded = await serviceRepository.uploadInput(sourcePath, target);
+        if (!uploaded) throw new Error("来源图片上传失败。");
+        parameters.sourceImageFile = uploaded.remoteFile;
+      }
       const job = await invokeNative<NativeServiceJob>("submit_service_job", {
         input: {
           clientRequestId: request.clientRequestId,
@@ -519,7 +614,16 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
       if (!job) throw new Error("知画服务仅可在桌面客户端中使用");
       return mapJob(job);
     } catch (error) {
-      if (uploaded) await serviceRepository.deleteInput(uploaded.inputId).catch(() => undefined);
+      if (lease) {
+        const target = {
+          clientRequestId: request.clientRequestId,
+          instanceId: lease.instanceId,
+        };
+        if (uploaded) {
+          await serviceRepository.deleteInput(uploaded.inputId, target).catch(() => undefined);
+        }
+        await serviceRepository.releaseWorker(request.clientRequestId).catch(() => undefined);
+      }
       throw error;
     }
   }

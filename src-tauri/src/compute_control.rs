@@ -1,6 +1,6 @@
 use crate::comp_share::{CompShareInstance, CompSharePowerState, CompShareRunningMode};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, path::PathBuf, str::FromStr, time::Duration};
 use uuid::Uuid;
@@ -362,6 +362,7 @@ impl ComputeControlStore {
     pub fn initialize(database_path: PathBuf) -> Result<Self, ComputeControlError> {
         let store = Self { database_path };
         let connection = store.connection()?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS compute_instances (
@@ -448,7 +449,6 @@ impl ComputeControlStore {
         let connection = Connection::open(&self.database_path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         Ok(connection)
     }
 
@@ -566,6 +566,7 @@ impl ComputeControlStore {
                 now,
             ],
         )?;
+        drop(connection);
         self.get_instance(&instance.instance_id)
     }
 
@@ -653,7 +654,7 @@ impl ComputeControlStore {
         }
 
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         release_expired_worker_leases_in_transaction(&transaction)?;
         let instance = transaction
             .query_row(
@@ -714,6 +715,73 @@ impl ComputeControlStore {
         )?;
         transaction.commit()?;
         self.worker_lease(job_id)
+    }
+
+    pub fn acquire_ready_worker_lease(
+        &self,
+        job_id: &str,
+        lease_seconds: u32,
+    ) -> Result<ComputeWorkerLease, ComputeControlError> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() || !(30..=3_600).contains(&lease_seconds) {
+            return Err(ComputeControlError::new(
+                "INVALID_WORKER_LEASE",
+                "任务不能为空，租约时长须在 30～3600 秒之间",
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        release_expired_worker_leases_in_transaction(&transaction)?;
+        if let Some(existing) = worker_lease_in_transaction(&transaction, job_id)? {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let now = now_iso();
+        let instance_id: Option<String> = transaction
+            .query_row(
+                "SELECT instance.instance_id
+                 FROM compute_instances instance
+                 JOIN compute_worker_readiness readiness
+                   ON readiness.instance_id=instance.instance_id AND readiness.state='ready'
+                 WHERE lower(instance.platform_state)='running'
+                   AND instance.running_mode='gpu'
+                   AND instance.lifecycle_state IN ('idle','discovered','retained')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM worker_leases lease
+                     WHERE lease.instance_id=instance.instance_id AND lease.lease_expires_at>?1
+                   )
+                 ORDER BY CASE instance.role WHEN 'primary' THEN 0 WHEN 'elastic' THEN 1 ELSE 2 END,
+                          instance.updated_at ASC
+                 LIMIT 1",
+                [&now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let instance_id = instance_id.ok_or_else(|| {
+            ComputeControlError::new(
+                "READY_WORKER_UNAVAILABLE",
+                "当前没有空闲且服务就绪的 GPU worker",
+            )
+        })?;
+        let worker_id = format!("instance:{instance_id}:gpu:0");
+        let expires = (Utc::now() + ChronoDuration::seconds(i64::from(lease_seconds)))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        transaction.execute(
+            "INSERT INTO worker_leases
+                 (job_id, worker_id, instance_id, lease_expires_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![job_id, worker_id, instance_id, expires, now],
+        )?;
+        transaction.execute(
+            "UPDATE compute_instances SET lifecycle_state='busy', current_job_id=?2,
+                    updated_at=?3 WHERE instance_id=?1",
+            params![instance_id, job_id, now],
+        )?;
+        let lease = worker_lease_in_transaction(&transaction, job_id)?.ok_or_else(|| {
+            ComputeControlError::new("WORKER_LEASE_NOT_FOUND", "无法读取刚创建的 worker 租约")
+        })?;
+        transaction.commit()?;
+        Ok(lease)
     }
 
     pub fn renew_worker_lease(
@@ -821,6 +889,7 @@ impl ComputeControlStore {
                 "worker 就绪状态对应的实例尚未纳入管理",
             ));
         }
+        drop(connection);
         self.worker_readiness(instance_id)
     }
 
@@ -856,7 +925,7 @@ impl ComputeControlStore {
             })
     }
 
-    fn worker_lease(&self, job_id: &str) -> Result<ComputeWorkerLease, ComputeControlError> {
+    pub fn worker_lease(&self, job_id: &str) -> Result<ComputeWorkerLease, ComputeControlError> {
         self.connection()?
             .query_row(
                 "SELECT worker_id, instance_id, job_id, lease_expires_at, created_at, updated_at
@@ -1177,6 +1246,30 @@ fn release_expired_worker_leases_in_transaction(
         update_instance_after_lease_change(transaction, &instance_id)?;
     }
     Ok(released)
+}
+
+fn worker_lease_in_transaction(
+    transaction: &Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<ComputeWorkerLease>, ComputeControlError> {
+    transaction
+        .query_row(
+            "SELECT worker_id, instance_id, job_id, lease_expires_at, created_at, updated_at
+             FROM worker_leases WHERE job_id=?1",
+            [job_id],
+            |row| {
+                Ok(ComputeWorkerLease {
+                    worker_id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    job_id: row.get(2)?,
+                    lease_expires_at: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(ComputeControlError::from)
 }
 
 fn update_instance_after_lease_change(
@@ -1591,6 +1684,98 @@ mod tests {
         let idle = store.get_instance("primary").unwrap();
         assert_eq!(idle.lifecycle_state, ComputeLifecycleState::Idle);
         assert!(idle.current_job_id.is_none());
+    }
+
+    #[test]
+    fn ready_worker_reservation_uses_distinct_idle_instances() {
+        let store = store();
+        let primary = instance("primary", CompSharePowerState::Running);
+        let elastic = instance("elastic", CompSharePowerState::Running);
+        store
+            .reconcile(&[primary.clone(), elastic.clone()], None)
+            .unwrap();
+        store.adopt_primary(&primary).unwrap();
+        store
+            .register_zhihua_instance(&elastic, ComputeInstanceRole::Elastic)
+            .unwrap();
+        for instance_id in ["primary", "elastic"] {
+            store
+                .record_worker_readiness(
+                    instance_id,
+                    ComputeServiceState::Ready,
+                    Some("0.4.0"),
+                    Some("v1"),
+                    Some("workflows"),
+                    Some("models"),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let first = store.acquire_ready_worker_lease("job-1", 300).unwrap();
+        let second = store.acquire_ready_worker_lease("job-2", 300).unwrap();
+        assert_eq!(first.instance_id, "primary");
+        assert_eq!(second.instance_id, "elastic");
+        assert_eq!(
+            store
+                .acquire_ready_worker_lease("job-1", 300)
+                .unwrap()
+                .instance_id,
+            "primary"
+        );
+        assert_eq!(
+            store
+                .acquire_ready_worker_lease("job-3", 300)
+                .unwrap_err()
+                .code,
+            "READY_WORKER_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn concurrent_ready_worker_reservations_do_not_select_the_same_instance() {
+        use std::sync::{Arc, Barrier};
+
+        let store = store();
+        let primary = instance("primary", CompSharePowerState::Running);
+        let elastic = instance("elastic", CompSharePowerState::Running);
+        store
+            .reconcile(&[primary.clone(), elastic.clone()], None)
+            .unwrap();
+        store.adopt_primary(&primary).unwrap();
+        store
+            .register_zhihua_instance(&elastic, ComputeInstanceRole::Elastic)
+            .unwrap();
+        for instance_id in ["primary", "elastic"] {
+            store
+                .record_worker_readiness(
+                    instance_id,
+                    ComputeServiceState::Ready,
+                    Some("0.4.0"),
+                    Some("v1"),
+                    Some("workflows"),
+                    Some("models"),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = ["job-1", "job-2"].map(|job_id| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.acquire_ready_worker_lease(job_id, 300).unwrap()
+            })
+        });
+        barrier.wait();
+        let mut instance_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().instance_id)
+            .collect::<Vec<_>>();
+        instance_ids.sort();
+        assert_eq!(instance_ids, vec!["elastic", "primary"]);
     }
 
     #[test]
