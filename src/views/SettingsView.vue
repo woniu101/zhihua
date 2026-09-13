@@ -63,9 +63,10 @@ const elasticCreateBusy = ref(false);
 const elasticCreateNotice = ref("");
 const elasticCreateNoticeTone = ref<"success" | "error" | "neutral">("neutral");
 const elasticPreflight = ref<CompShareCreatePreflight>();
-const elasticIdempotencyKey = ref("");
+const elasticIdempotencyKeys = ref<string[]>([]);
 const elasticForm = reactive({
   name: "",
+  count: 1,
   region: "",
   zone: "",
   gpuType: "",
@@ -217,6 +218,18 @@ const elasticTemplateAvailable = computed(() => Boolean(
   && computeInstance.value.memoryMb
   && computeInstance.value.imageId,
 ));
+const elasticCreateCount = computed(() => Math.min(50, Math.max(1, Math.round(elasticForm.count || 1))));
+const elasticTotalHourlyPrice = computed(() => {
+  const price = elasticPreflight.value?.estimatedHourlyPrice;
+  return price == null ? undefined : price * elasticCreateCount.value;
+});
+
+function resetElasticIdempotencyKeys() {
+  elasticIdempotencyKeys.value = Array.from(
+    { length: elasticCreateCount.value },
+    () => crypto.randomUUID(),
+  );
+}
 
 function elasticCreateSpec(): CompShareCreateSpec {
   return {
@@ -240,6 +253,7 @@ function openElasticCreate() {
   }
   Object.assign(elasticForm, {
     name: `zhihua-elastic-${new Date().toISOString().slice(5, 16).replace(/[-T:]/g, "")}`,
+    count: 1,
     region: template.region,
     zone: template.zone,
     gpuType: template.gpuType ?? "",
@@ -249,7 +263,7 @@ function openElasticCreate() {
     projectId: template.projectId ?? "",
   });
   elasticPreflight.value = undefined;
-  elasticIdempotencyKey.value = crypto.randomUUID();
+  resetElasticIdempotencyKeys();
   elasticCreateNotice.value = "先查询实时库存与按量报价；预检不会创建实例或产生 GPU 费用。";
   elasticCreateNoticeTone.value = "neutral";
   computeOpen.value = false;
@@ -284,29 +298,35 @@ async function preflightElasticCreate() {
 async function confirmElasticCreate() {
   if (!elasticPreflight.value?.capacityAvailable || elasticCreateBusy.value) return;
   elasticCreateBusy.value = true;
-  elasticCreateNotice.value = "已确认费用，正在幂等创建一台弹性实例…";
+  const count = elasticCreateCount.value;
+  elasticCreateNotice.value = `已确认费用，正在提交 ${count} 个相互独立的幂等创建请求…`;
   elasticCreateNoticeTone.value = "neutral";
   try {
-    const operation = await compShareRepository.createManagedInstance({
-      idempotencyKey: elasticIdempotencyKey.value,
-      name: elasticForm.name.trim(),
-      spec: elasticCreateSpec(),
-      role: "elastic",
-      confirmed: true,
+    if (elasticIdempotencyKeys.value.length !== count) resetElasticIdempotencyKeys();
+    const baseName = elasticForm.name.trim();
+    const requests = elasticIdempotencyKeys.value.map((idempotencyKey, index) => {
+      const suffix = count > 1 ? `-${String(index + 1).padStart(2, "0")}` : "";
+      return compShareRepository.createManagedInstance({
+        idempotencyKey,
+        name: `${baseName.slice(0, 63 - suffix.length)}${suffix}`,
+        spec: elasticCreateSpec(),
+        role: "elastic",
+        confirmed: true,
+      });
     });
-    if (operation.status === "succeeded") {
-      elasticCreateNotice.value = `实例 ${operation.instanceId ?? ""} 已提交创建，并已纳入弹性实例管理。`;
-      elasticCreateNoticeTone.value = "success";
-      await refreshCompute();
+    const results = await Promise.allSettled(requests);
+    const operations = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    const succeeded = operations.filter((item) => item.status === "succeeded").length;
+    const unknown = operations.filter((item) => item.status === "unknown").length;
+    const failed = count - succeeded - unknown;
+    await refreshCompute();
+    if (succeeded === count) {
       elasticCreateOpen.value = false;
       computeOpen.value = true;
-      setComputeNotice("弹性实例已创建。服务准备完成前不会领取生成任务。", "success");
-    } else if (operation.status === "unknown") {
-      elasticCreateNotice.value = "平台创建结果暂不确定。已停止重复提交，请返回实例中心刷新对账。";
-      elasticCreateNoticeTone.value = "neutral";
+      setComputeNotice(`${succeeded} 个弹性实例已创建。服务准备完成前不会领取生成任务。`, "success");
     } else {
-      elasticCreateNotice.value = operation.errorMessage ?? "弹性实例创建失败，未再次提交。";
-      elasticCreateNoticeTone.value = "error";
+      elasticCreateNotice.value = `扩容结果：成功 ${succeeded}，待对账 ${unknown}，失败 ${failed}。不会自动补购；请先刷新实例中心核对。`;
+      elasticCreateNoticeTone.value = failed > 0 ? "error" : "neutral";
     }
   } catch (error) {
     elasticCreateNotice.value = normalizeCompShareError(error).message;
@@ -317,11 +337,11 @@ async function confirmElasticCreate() {
 }
 
 watch(
-  () => [elasticForm.region, elasticForm.zone, elasticForm.gpuType, elasticForm.cpu, elasticForm.memoryGb, elasticForm.imageId, elasticForm.projectId],
+  () => [elasticForm.count, elasticForm.region, elasticForm.zone, elasticForm.gpuType, elasticForm.cpu, elasticForm.memoryGb, elasticForm.imageId, elasticForm.projectId],
   () => {
     if (elasticPreflight.value) {
       elasticPreflight.value = undefined;
-      elasticIdempotencyKey.value = crypto.randomUUID();
+      resetElasticIdempotencyKeys();
       elasticCreateNotice.value = "规格已经变化，请重新查询实时库存和报价。";
       elasticCreateNoticeTone.value = "neutral";
     }
@@ -689,24 +709,25 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
     <div v-if="elasticCreateOpen" class="connection-backdrop" role="presentation" @click.self="closeElasticCreate">
       <section class="connection-dialog elastic-create-dialog" role="dialog" aria-modal="true" aria-labelledby="elastic-create-title">
-        <header><div><h2 id="elastic-create-title">创建弹性实例</h2><p>复用当前主实例的地域、镜像和单卡规格。预检只查询库存与报价，最终确认后才创建按量实例。</p></div><button type="button" aria-label="关闭" :disabled="elasticCreateBusy" @click="closeElasticCreate"><X :size="20"/></button></header>
+        <header><div><h2 id="elastic-create-title">创建弹性实例</h2><p>复用当前主实例的地域、镜像和单卡规格。预检只查询库存与单台报价，最终确认后才提交按量实例。</p></div><button type="button" aria-label="关闭" :disabled="elasticCreateBusy" @click="closeElasticCreate"><X :size="20"/></button></header>
         <div class="connection-form elastic-create-form">
           <label><span>实例名称</span><input v-model.trim="elasticForm.name" maxlength="63" autocomplete="off"/></label>
+          <label><span>创建数量</span><input v-model.number="elasticForm.count" type="number" min="1" max="50" step="1"/><small>每台实例分别使用幂等操作；实时库存和账号配额不足时允许部分成功，知画不会自动补购。</small></label>
           <div class="elastic-summary-grid">
             <article><span>地域 / 可用区</span><b>{{ elasticForm.region }} / {{ elasticForm.zone }}</b></article>
             <article><span>GPU</span><b>1 × RTX {{ elasticForm.gpuType }}</b></article>
             <article><span>CPU / 内存</span><b>{{ elasticForm.cpu }} 核 / {{ elasticForm.memoryGb }} GB</b></article>
-            <article><span>计费方式</span><b>按量后付费</b></article>
+            <article><span>数量 / 计费</span><b>{{ elasticCreateCount }} 台 · 按量后付费</b></article>
           </div>
           <label><span>镜像 ID</span><input v-model.trim="elasticForm.imageId" autocomplete="off"/><small>弹性 worker 必须使用已经包含知画服务的兼容镜像；创建后仍会执行版本与模型清单检查。</small></label>
           <div v-if="elasticPreflight" class="preflight-result" :class="{ unavailable: !elasticPreflight.capacityAvailable }">
-            <span>{{ elasticPreflight.capacityAvailable ? '库存匹配' : '当前无匹配库存' }}</span>
-            <b>{{ elasticPreflight.estimatedHourlyPrice == null ? '平台未返回费率' : `预计 ¥ ${elasticPreflight.estimatedHourlyPrice.toFixed(2)} / 小时` }}</b>
-            <small>查询时间 {{ new Date(elasticPreflight.checkedAt).toLocaleString('zh-CN') }}；实际费用以优云智算账单为准。</small>
+            <span>{{ elasticPreflight.capacityAvailable ? '单台规格当前有库存' : '当前无匹配库存' }}</span>
+            <b>{{ elasticTotalHourlyPrice == null ? '平台未返回费率' : `合计约 ¥ ${elasticTotalHourlyPrice.toFixed(2)} / 小时` }}</b>
+            <small>单台约 {{ elasticPreflight.estimatedHourlyPrice == null ? '--' : `¥ ${elasticPreflight.estimatedHourlyPrice.toFixed(2)} / 小时` }}；查询时间 {{ new Date(elasticPreflight.checkedAt).toLocaleString('zh-CN') }}。多台库存以各创建响应和实际账单为准。</small>
           </div>
           <p v-if="elasticCreateNotice" class="connection-notice elastic-notice" :class="elasticCreateNoticeTone">{{ elasticCreateNotice }}</p>
         </div>
-        <footer><span></span><span></span><button class="btn" type="button" :disabled="elasticCreateBusy" @click="closeElasticCreate">取消</button><button v-if="!elasticPreflight?.capacityAvailable" class="btn primary" type="button" :disabled="elasticCreateBusy || !elasticForm.name || !elasticForm.imageId" @click="preflightElasticCreate"><RefreshCw :size="16"/>{{ elasticCreateBusy ? '正在查询' : '查询库存与报价' }}</button><button v-else class="btn primary" type="button" :disabled="elasticCreateBusy" @click="confirmElasticCreate"><Plus :size="16"/>{{ elasticCreateBusy ? '正在创建' : '确认创建并开始计费' }}</button></footer>
+        <footer><span></span><span></span><button class="btn" type="button" :disabled="elasticCreateBusy" @click="closeElasticCreate">取消</button><button v-if="!elasticPreflight?.capacityAvailable" class="btn primary" type="button" :disabled="elasticCreateBusy || !elasticForm.name || !elasticForm.imageId || elasticCreateCount < 1" @click="preflightElasticCreate"><RefreshCw :size="16"/>{{ elasticCreateBusy ? '正在查询' : '查询库存与报价' }}</button><button v-else class="btn primary" type="button" :disabled="elasticCreateBusy" @click="confirmElasticCreate"><Plus :size="16"/>{{ elasticCreateBusy ? '正在创建' : `确认创建 ${elasticCreateCount} 台并开始计费` }}</button></footer>
       </section>
     </div>
 
