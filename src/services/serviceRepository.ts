@@ -270,40 +270,44 @@ export const serviceRepository = {
   }) => invokeNative<ServiceArtifactDownload>("download_service_artifact", { input }),
 };
 
+function capabilitiesFromProbe(probe: ServiceProbe): RuntimeCapabilities {
+  if (!probe.compatible) throw new Error(probe.detail);
+  return {
+    serviceVersion: probe.serviceVersion,
+    apiVersion: probe.apiVersion ?? "v1",
+    workflowVersion: probe.workflowManifestVersion,
+    modelManifestVersion: probe.modelManifestVersion,
+    comfyUiReady: probe.comfyuiReady,
+    acceptedWorkflowIds: probe.workflows,
+    availableWorkflowIds: probe.availableWorkflows,
+    workflows: [
+      probe.availableWorkflows.includes("qwen-image-generate-v1") && "image_generate",
+      probe.availableWorkflows.includes("qwen-image-edit-v1") && "image_edit",
+      probe.availableWorkflows.some((item) => item.startsWith("h3-t2v-")) && "t2v",
+      probe.availableWorkflows.some((item) => item.startsWith("h3-i2v-")) && "i2v",
+      probe.availableWorkflows.some((item) => item.startsWith("h3-flf2v-")) && "flf2v",
+      probe.availableWorkflows.some((item) => item.startsWith("h3-ref2va-")) && "r2v",
+      probe.availableWorkflows.some((item) => item.startsWith("seedvr2-")) && "seedvr2",
+    ].filter((item): item is RuntimeCapabilities["workflows"][number] => Boolean(item)),
+  };
+}
+
+async function requirePreparedGeneration(fallbackMessage: string): Promise<ServiceProbe> {
+  const probe = await serviceRepository.prepareGeneration();
+  if (!probe) throw new Error("知画服务仅可在桌面客户端中使用");
+  if (!probe.comfyuiReady) throw new Error(probe.detail || fallbackMessage);
+  return probe;
+}
+
 export class ComfyUiH3Provider implements VideoProvider {
   async getCapabilities(): Promise<RuntimeCapabilities> {
     const probe = await serviceRepository.probe();
     if (!probe) throw new Error("知画服务仅可在桌面客户端中使用");
-    if (!probe.compatible) throw new Error(probe.detail);
-    return {
-      serviceVersion: probe.serviceVersion,
-      apiVersion: probe.apiVersion ?? "v1",
-      workflowVersion: probe.workflowManifestVersion,
-      modelManifestVersion: probe.modelManifestVersion,
-      comfyUiReady: probe.comfyuiReady,
-      acceptedWorkflowIds: probe.workflows,
-      availableWorkflowIds: probe.availableWorkflows,
-      workflows: [
-        probe.availableWorkflows.includes("qwen-image-generate-v1") && "image_generate",
-        probe.availableWorkflows.includes("qwen-image-edit-v1") && "image_edit",
-        probe.availableWorkflows.some((item) => item.startsWith("h3-t2v-")) && "t2v",
-        probe.availableWorkflows.some((item) => item.startsWith("h3-i2v-")) && "i2v",
-        probe.availableWorkflows.some((item) => item.startsWith("h3-flf2v-")) && "flf2v",
-        probe.availableWorkflows.some((item) => item.startsWith("h3-ref2va-")) && "r2v",
-        probe.availableWorkflows.some((item) => item.startsWith("seedvr2-")) && "seedvr2",
-      ].filter((item): item is RuntimeCapabilities["workflows"][number] => Boolean(item)),
-    };
+    return capabilitiesFromProbe(probe);
   }
 
   async submit(request: VideoGenerationRequest): Promise<GenerationJob> {
-    const capabilities = await this.getCapabilities();
     const workflowId = workflowFor(request);
-    if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
-      throw new Error(`知画服务不接受工作流 ${workflowId}，请先更新服务。`);
-    }
-    if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
-      throw new Error(`工作流 ${workflowId} 尚未安装，当前不会启动 GPU。`);
-    }
     const parameters: Record<string, unknown> = {};
     const pendingUploads: Array<{
       parameter: string;
@@ -404,11 +408,14 @@ export class ComfyUiH3Provider implements VideoProvider {
     const uploaded: ServiceInputUpload[] = [];
     let lease: ComputeWorkerLease | undefined;
     try {
-      if (!request.workerPoolPrepared) {
-        const probe = await serviceRepository.prepareGeneration();
-        if (!probe?.comfyuiReady) {
-          throw new Error(probe?.detail ?? "生成环境尚未就绪，请稍后重试。");
-        }
+      const capabilities = request.workerPoolPrepared
+        ? await this.getCapabilities()
+        : capabilitiesFromProbe(await requirePreparedGeneration("生成环境尚未就绪，请稍后重试。"));
+      if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
+        throw new Error(`知画服务不接受工作流 ${workflowId}，请先更新服务。`);
+      }
+      if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
+        throw new Error(`工作流 ${workflowId} 尚未安装。`);
       }
       const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
       if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
@@ -473,19 +480,17 @@ export class ComfyUiH3Provider implements VideoProvider {
 
   async submitUpscale(request: VideoUpscaleRequest): Promise<GenerationJob> {
     const workflowId = "seedvr2-1080p-v1";
-    const capabilities = await this.getCapabilities();
-    if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
-      throw new Error("知画服务版本尚未接受 SeedVR2 1080p 工作流，请先更新服务。");
-    }
-    if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
-      throw new Error("SeedVR2 1080p 工作流或公共模型尚未就绪，当前不会启动 GPU。");
-    }
     let lease: ComputeWorkerLease | undefined;
     let uploaded: ServiceInputUpload | undefined;
     try {
-      const probe = await serviceRepository.prepareGeneration();
-      if (!probe?.comfyuiReady) {
-        throw new Error(probe?.detail ?? "1080p 生成环境尚未就绪，请稍后重试。");
+      const capabilities = capabilitiesFromProbe(
+        await requirePreparedGeneration("1080p 生成环境尚未就绪，请稍后重试。"),
+      );
+      if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
+        throw new Error("知画服务版本尚未接受 SeedVR2 1080p 工作流，请先更新服务。");
+      }
+      if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
+        throw new Error("SeedVR2 1080p 工作流或公共模型尚未就绪。");
       }
       const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
       if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
@@ -549,16 +554,9 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
   }
 
   async submit(request: ImageGenerationRequest): Promise<GenerationJob> {
-    const capabilities = await this.getCapabilities();
     const workflowId = request.mode === "edit"
       ? "qwen-image-edit-v1"
       : "qwen-image-generate-v1";
-    if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
-      throw new Error(`知画服务不接受工作流 ${workflowId}，请先更新服务。`);
-    }
-    if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
-      throw new Error(`工作流 ${workflowId} 尚未就绪，当前不会启动 GPU。`);
-    }
     const profile = frameProfile(request.aspectRatio);
     const parameters: Record<string, unknown> = {
       prompt: request.prompt,
@@ -598,8 +596,15 @@ export class ComfyUiQwenImageProvider implements ImageProvider {
         if (!composition?.derivativePath) throw new Error("来源图片的项目画幅准备失败。");
         sourcePath = composition.derivativePath;
       }
-      const probe = await serviceRepository.prepareGeneration();
-      if (!probe?.comfyuiReady) throw new Error(probe?.detail ?? "图片生成环境尚未就绪。");
+      const capabilities = capabilitiesFromProbe(
+        await requirePreparedGeneration("图片生成环境尚未就绪。"),
+      );
+      if (!capabilities.acceptedWorkflowIds?.includes(workflowId)) {
+        throw new Error(`知画服务不接受工作流 ${workflowId}，请先更新服务。`);
+      }
+      if (!capabilities.availableWorkflowIds?.includes(workflowId)) {
+        throw new Error(`工作流 ${workflowId} 尚未就绪。`);
+      }
       const reserved = await serviceRepository.reserveWorker(request.clientRequestId);
       if (!reserved) throw new Error("知画服务没有返回可用的生成实例。");
       lease = reserved;

@@ -1206,6 +1206,7 @@ async fn provision_compute_worker_connection_impl(
 
 #[tauri::command]
 async fn prepare_generation_service(
+    app: AppHandle,
     manager: State<'_, SshTunnelManager>,
     service: State<'_, ServiceClient>,
     comp_share: State<'_, CompShareProvider>,
@@ -1217,7 +1218,7 @@ async fn prepare_generation_service(
         .map_err(|error| error.message)?
         .bound_instance_id
         .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
-    prepare_compute_worker_impl(
+    let result = prepare_compute_worker_impl(
         &manager,
         &service,
         &comp_share,
@@ -1225,11 +1226,16 @@ async fn prepare_generation_service(
         &lifecycle,
         &instance_id,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        restart_idle_gpu_shutdown(&app, &lifecycle);
+    }
+    result
 }
 
 #[tauri::command]
 async fn prepare_compute_worker(
+    app: AppHandle,
     manager: State<'_, SshTunnelManager>,
     service: State<'_, ServiceClient>,
     comp_share: State<'_, CompShareProvider>,
@@ -1237,7 +1243,7 @@ async fn prepare_compute_worker(
     lifecycle: State<'_, ComputeLifecycle>,
     instance_id: String,
 ) -> Result<ServiceProbe, String> {
-    prepare_compute_worker_impl(
+    let result = prepare_compute_worker_impl(
         &manager,
         &service,
         &comp_share,
@@ -1245,7 +1251,11 @@ async fn prepare_compute_worker(
         &lifecycle,
         &instance_id,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        restart_idle_gpu_shutdown(&app, &lifecycle);
+    }
+    result
 }
 
 async fn prepare_compute_worker_impl(
