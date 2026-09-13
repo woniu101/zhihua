@@ -3,9 +3,10 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { compShareRepository, type CompShareInstance } from "../services/compShareRepository";
 import { serviceRepository, type ServiceProbe } from "../services/serviceRepository";
 
-const props = withDefaults(defineProps<{ context?: string; localOnly?: boolean }>(), {
+const props = withDefaults(defineProps<{ context?: string; localOnly?: boolean; compact?: boolean }>(), {
   context: "需要生成时自动启动 GPU",
   localOnly: false,
+  compact: false,
 });
 
 const instance = ref<CompShareInstance>();
@@ -62,10 +63,9 @@ onBeforeUnmount(() => {
 <template>
   <div class="compute-status" :class="tone" :title="instance ? `${instance.region} · ${instance.zone} · ${instance.instanceId}` : modeLabel">
     <span class="compute-status-dot"></span>
-    <strong>优云智算</strong>
+    <strong v-if="!compact">优云智算</strong>
     <b>{{ modeLabel }}</b>
-    <span class="compute-status-divider">|</span>
-    <span>{{ detail }}</span>
+    <template v-if="!compact"><span class="compute-status-divider">|</span><span>{{ detail }}</span></template>
   </div>
 </template>
 

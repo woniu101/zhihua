@@ -13,6 +13,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import TaskCenter from "./components/TaskCenter.vue";
 import ProjectWorkspaceBar from "./components/ProjectWorkspaceBar.vue";
+import BrandLogo from "./components/BrandLogo.vue";
+import ComputeStatus from "./components/ComputeStatus.vue";
 
 const route = useRoute();
 const appWindow = isTauri() ? getCurrentWindow() : null;
@@ -59,36 +61,28 @@ const nav = [
 
 <template>
   <div class="app-frame">
-    <div class="titlebar" data-tauri-drag-region>
-      <div class="titlebar-name" data-tauri-drag-region>知画</div>
-      <TaskCenter />
+    <header class="appbar">
+      <RouterLink class="app-brand" to="/projects" aria-label="知画首页">
+        <BrandLogo :size="36" />
+        <span><strong>知画</strong><small>AI 视频工作台</small></span>
+      </RouterLink>
+      <nav class="global-nav" aria-label="全局导航">
+        <RouterLink v-for="item in nav" :key="item.path" :to="item.path">
+          <component :is="item.icon" :size="18" stroke-width="2" />
+          <span>{{ item.label }}</span>
+        </RouterLink>
+        <TaskCenter />
+      </nav>
+      <div class="appbar-drag" data-tauri-drag-region></div>
+      <RouterLink class="topbar-compute" to="/settings" title="打开算力设置"><ComputeStatus compact /></RouterLink>
+      <button type="button" class="appbar-icon" aria-label="帮助" title="帮助" @click="helpOpen = true"><HelpCircle :size="18" /></button>
+      <RouterLink class="appbar-icon" to="/settings" :class="{ active: isSettings }" aria-label="设置与算力" title="设置与算力"><Settings :size="18" /></RouterLink>
       <div class="window-actions">
         <button aria-label="最小化" @click="minimizeWindow"><Minus :size="16" /></button>
         <button aria-label="最大化" @click="toggleMaximizeWindow"><Square :size="13" /></button>
         <button aria-label="关闭" class="close" @click="closeWindow"><X :size="17" /></button>
       </div>
-    </div>
-
-    <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">知</span>
-        <strong>知画</strong>
-      </div>
-      <nav class="main-nav">
-        <RouterLink v-for="item in nav" :key="item.path" :to="item.path">
-          <component :is="item.icon" :size="21" stroke-width="2" />
-          <span>{{ item.label }}</span>
-        </RouterLink>
-      </nav>
-      <div class="sidebar-footer">
-        <button type="button" class="utility-link" aria-label="帮助" title="帮助" @click="helpOpen = true">
-          <HelpCircle :size="20" /><span>帮助</span>
-        </button>
-        <RouterLink to="/settings" :class="{ active: isSettings }" aria-label="设置与算力" title="设置与算力">
-          <Settings :size="20" /><span>设置</span>
-        </RouterLink>
-      </div>
-    </aside>
+    </header>
 
     <main class="main-area" :class="{ 'with-project-bar': isProjectWorkspace }">
       <ProjectWorkspaceBar v-if="isProjectWorkspace" />
@@ -98,7 +92,7 @@ const nav = [
     <div v-if="helpOpen" class="help-backdrop" role="presentation" @click.self="helpOpen = false">
       <section class="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
         <header>
-          <div><span class="brand-mark">知</span><div><h2 id="help-title">开始使用知画</h2><p>选择完整视频或快速素材，知画会提示下一步。</p></div></div>
+          <div><BrandLogo :size="40" /><div><h2 id="help-title">开始使用知画</h2><p>选择完整视频或快速素材，知画会提示下一步。</p></div></div>
           <button type="button" aria-label="关闭帮助" @click="helpOpen = false"><X :size="20" /></button>
         </header>
         <ol>
