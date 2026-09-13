@@ -504,6 +504,27 @@ async function bindManagedInstance(item: ManagedComputeInstance) {
   await refreshCompute();
 }
 
+async function checkManagedWorker(item: ManagedComputeInstance) {
+  busy.value = true;
+  setComputeNotice(`正在连接“${item.name ?? item.instanceId}”并检查知画服务……`, "neutral");
+  try {
+    const result = await serviceRepository.connectWorker(item.instanceId);
+    if (!result) throw new Error("知画服务没有返回检查结果。");
+    await refreshCompute();
+    setComputeNotice(
+      result.comfyuiReady
+        ? `“${item.name ?? item.instanceId}”的知画服务与 ComfyUI 已就绪。`
+        : `“${item.name ?? item.instanceId}”的基础服务可达，等待 GPU 后即可生成。`,
+      result.comfyuiReady ? "success" : "neutral",
+    );
+  } catch (error) {
+    setComputeNotice(normalizeConnectionFailure(error).message, "error");
+    await refreshCompute();
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function changeComputeMode(mode: "gpu" | "noGpu" | "stop") {
   busy.value = true;
   try {
@@ -696,7 +717,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
                   <div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : 'GPU 规格待查询' }} · {{ ownershipLabel(item.ownership) }}　<em class="worker-readiness" :class="workerReadinessTone(item.instanceId)">● {{ workerReadinessLabel(item.instanceId) }}</em></small></div>
                   <strong>{{ managedModeLabel(item) }}</strong>
                 </div>
-                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
+                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
               </article>
               <p v-if="!managedInstances.length" class="empty-instances">平台没有返回可用实例。创建弹性实例前会先检查地域库存和实时报价，并再次让你确认。</p>
             </div>

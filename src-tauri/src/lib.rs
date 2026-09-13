@@ -886,16 +886,11 @@ fn tunnel_bound_instance_id(provider: &CompShareProvider) -> Result<String, Tunn
 async fn connect_service_through_tunnel_impl(
     manager: &SshTunnelManager,
     service: &ServiceClient,
-    comp_share: &CompShareProvider,
     compute: &ComputeControlStore,
+    instance_id: &str,
 ) -> Result<ServiceProbe, String> {
-    let instance_id = comp_share
-        .configuration()
-        .map_err(|error| error.message)?
-        .bound_instance_id
-        .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
     let _ = compute.record_worker_readiness(
-        &instance_id,
+        instance_id,
         ComputeServiceState::Connecting,
         None,
         None,
@@ -905,37 +900,37 @@ async fn connect_service_through_tunnel_impl(
     );
     let result = async {
         let tunnel = manager
-            .start_for(&instance_id)
+            .start_for(instance_id)
             .await
             .map_err(|error| error.message)?;
         let local_url = tunnel
             .local_url
             .ok_or_else(|| "SSH 隧道没有返回本机服务地址".to_owned())?;
         let connection_info = service
-            .info_for(&instance_id)
+            .info_for(instance_id)
             .map_err(|error| error.message)?;
         if connection_info.configured
             && connection_info.credential_stored
-            && connection_info.instance_id.as_deref() == Some(instance_id.as_str())
+            && connection_info.instance_id.as_deref() == Some(instance_id)
         {
             service
-                .retarget_for(&instance_id, local_url)
+                .retarget_for(instance_id, local_url)
                 .map_err(|error| error.message)?;
         } else {
             let token = manager
-                .read_service_token_for(&instance_id)
+                .read_service_token_for(instance_id)
                 .await
                 .map_err(|error| error.message)?;
             service
                 .save_for(SaveServiceConnectionInput {
-                    instance_id: instance_id.clone(),
+                    instance_id: instance_id.to_owned(),
                     base_url: local_url,
                     token,
                 })
                 .map_err(|error| error.message)?;
         }
         service
-            .probe_for(&instance_id)
+            .probe_for(instance_id)
             .await
             .map_err(|error| error.message)
     }
@@ -952,7 +947,7 @@ async fn connect_service_through_tunnel_impl(
             };
             compute
                 .record_worker_readiness(
-                    &instance_id,
+                    instance_id,
                     state,
                     Some(&probe.service_version),
                     probe.api_version.as_deref(),
@@ -965,7 +960,7 @@ async fn connect_service_through_tunnel_impl(
         }
         Err(message) => {
             let _ = compute.record_worker_readiness(
-                &instance_id,
+                instance_id,
                 ComputeServiceState::Unreachable,
                 None,
                 None,
@@ -985,7 +980,25 @@ async fn connect_service_through_tunnel(
     comp_share: State<'_, CompShareProvider>,
     compute: State<'_, ComputeControlStore>,
 ) -> Result<ServiceProbe, String> {
-    connect_service_through_tunnel_impl(&manager, &service, &comp_share, &compute).await
+    let instance_id = comp_share
+        .configuration()
+        .map_err(|error| error.message)?
+        .bound_instance_id
+        .ok_or_else(|| "尚未绑定优云智算实例".to_owned())?;
+    connect_service_through_tunnel_impl(&manager, &service, &compute, &instance_id).await
+}
+
+#[tauri::command]
+async fn connect_compute_worker(
+    manager: State<'_, SshTunnelManager>,
+    service: State<'_, ServiceClient>,
+    compute: State<'_, ComputeControlStore>,
+    instance_id: String,
+) -> Result<ServiceProbe, String> {
+    compute
+        .get_instance(&instance_id)
+        .map_err(|error| error.message)?;
+    connect_service_through_tunnel_impl(&manager, &service, &compute, &instance_id).await
 }
 
 #[tauri::command]
@@ -1051,14 +1064,18 @@ async fn prepare_generation_service(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {
-        let readiness =
-            match connect_service_through_tunnel_impl(&manager, &service, &comp_share, &compute)
-                .await
-            {
-                Ok(probe) if probe.comfyui_ready => return Ok(probe),
-                Ok(probe) => probe.detail,
-                Err(error) => error,
-            };
+        let readiness = match connect_service_through_tunnel_impl(
+            &manager,
+            &service,
+            &compute,
+            &instance.instance_id,
+        )
+        .await
+        {
+            Ok(probe) if probe.comfyui_ready => return Ok(probe),
+            Ok(probe) => probe.detail,
+            Err(error) => error,
+        };
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
                 "GPU 已启动，但生成环境未在 4 分钟内就绪：{readiness}"
@@ -2701,21 +2718,24 @@ pub fn run() {
                     }
                 }
                 let manager = app_handle.state::<SshTunnelManager>();
-                let configured = comp_share
+                let configured_instance = comp_share
                     .configuration()
                     .ok()
                     .and_then(|configuration| configuration.bound_instance_id)
-                    .and_then(|instance_id| manager.status_for(&instance_id).ok())
-                    .map(|status| status.configured)
-                    .unwrap_or(false);
-                if configured {
+                    .filter(|instance_id| {
+                        manager
+                            .status_for(instance_id)
+                            .map(|status| status.configured)
+                            .unwrap_or(false)
+                    });
+                if let Some(instance_id) = configured_instance {
                     let service = app_handle.state::<ServiceClient>();
                     let compute = app_handle.state::<ComputeControlStore>();
                     let _ = connect_service_through_tunnel_impl(
                         &manager,
                         &service,
-                        &comp_share,
                         &compute,
+                        &instance_id,
                     )
                     .await;
                 }
@@ -2822,6 +2842,7 @@ pub fn run() {
             stop_ssh_tunnel,
             get_ssh_tunnel_status,
             connect_service_through_tunnel,
+            connect_compute_worker,
             prepare_generation_service,
         ])
         .run(tauri::generate_context!())

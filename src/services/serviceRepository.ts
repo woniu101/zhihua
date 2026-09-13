@@ -216,6 +216,8 @@ export const serviceRepository = {
     invokeNative<ServiceConnectionInfo>("save_service_connection", { input }),
   clear: () => invokeNative<void>("clear_service_connection"),
   probe: () => invokeNative<ServiceProbe>("probe_service"),
+  connectWorker: (instanceId: string) =>
+    invokeNative<ServiceProbe>("connect_compute_worker", { instanceId }),
   prepareGeneration: () =>
     invokeNative<ServiceProbe>("prepare_generation_service"),
   listLocalJobs: (projectId?: string) =>
