@@ -63,6 +63,7 @@ const selectedVersionIndex = computed(() => {
 const replacementAccept = computed(() => selected.value?.mediaType === "audio" ? "audio/*" : selected.value?.mediaType === "video" ? "video/*" : "image/*");
 let unlistenDragDrop: UnlistenFn | undefined;
 let imagePollTimer: number | undefined;
+let imageRecoveryDelay = 2500;
 
 const imageProgress = computed(() => Math.round((imageJob.value?.progress ?? 0) * 100));
 const styleConfigured = computed(() => Boolean(projectStylePrompt(workspace.project.value?.styleProfile)));
@@ -149,8 +150,30 @@ async function pollImageJob(jobId: string) {
     imageNotice.value = job.stageMessage || "远端正在生成图片。";
   } catch (error) {
     imageNotice.value = `${normalizeConnectionFailure(error).message}，正在继续恢复远端任务。`;
+    scheduleImageRecovery(jobId);
+    return;
   }
   imagePollTimer = window.setTimeout(() => void pollImageJob(jobId), 2500);
+}
+
+function scheduleImageRecovery(jobId: string) {
+  if (imagePollTimer !== undefined) window.clearTimeout(imagePollTimer);
+  const delay = imageRecoveryDelay;
+  imageRecoveryDelay = Math.min(imageRecoveryDelay * 2, 20_000);
+  imagePollTimer = window.setTimeout(() => void resumeImageJob(jobId), delay);
+}
+
+async function resumeImageJob(jobId: string) {
+  try {
+    imageNotice.value = "正在连接结果所在实例。";
+    await serviceRepository.prepareJobResultAccess(jobId);
+    imageRecoveryDelay = 2500;
+    imageNotice.value = "实例已连接，正在核对远端状态。";
+    await pollImageJob(jobId);
+  } catch (error) {
+    imageNotice.value = `结果实例暂时无法连接，知画会继续重试：${normalizeConnectionFailure(error).message}`;
+    scheduleImageRecovery(jobId);
+  }
 }
 
 async function submitImage() {
@@ -216,8 +239,8 @@ async function recoverImageJob() {
   imageMode.value = resumable.kind === "image_edit" ? "edit" : "generate";
   imagePanelOpen.value = true;
   imageBusy.value = true;
-  imageNotice.value = "已从本地任务队列恢复图片任务，正在核对远端状态。";
-  await pollImageJob(resumable.remoteJobId);
+  imageNotice.value = "已从本地任务队列恢复图片任务，正在连接结果所在实例。";
+  await resumeImageJob(resumable.remoteJobId);
 }
 
 async function chooseFiles() {

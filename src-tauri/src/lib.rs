@@ -1064,6 +1064,10 @@ async fn provision_compute_worker_connection_impl(
     instance_id: &str,
 ) -> Result<ServiceProbe, String> {
     lifecycle.invalidate_idle_shutdown();
+    let needs_bootstrap = !manager
+        .status_for(instance_id)
+        .map_err(|error| error.message)?
+        .configured;
     let managed = compute
         .get_instance(&instance_id)
         .map_err(|error| error.message)?;
@@ -1137,41 +1141,43 @@ async fn provision_compute_worker_connection_impl(
             .refresh_platform_instance(&instance)
             .map_err(|error| error.message)?;
 
-        let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
-        loop {
-            let access = match comp_share.ssh_access_for(locator.clone()).await {
-                Ok(access) => access,
-                Err(error)
-                    if matches!(
-                        error.code.as_str(),
-                        "SSH_ENDPOINT_UNAVAILABLE" | "SSH_PASSWORD_UNAVAILABLE"
-                    ) && tokio::time::Instant::now() < bootstrap_deadline =>
+        if needs_bootstrap {
+            let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+            loop {
+                let access = match comp_share.ssh_access_for(locator.clone()).await {
+                    Ok(access) => access,
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "SSH_ENDPOINT_UNAVAILABLE" | "SSH_PASSWORD_UNAVAILABLE"
+                        ) && tokio::time::Instant::now() < bootstrap_deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.message),
+                };
+                match manager
+                    .bootstrap_configuration(
+                        instance_id,
+                        &access.host,
+                        access.port,
+                        &access.username,
+                        &access.password,
+                    )
+                    .await
                 {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "SSH_CONNECT_TIMEOUT" | "SSH_CONNECT_FAILED"
+                        ) && tokio::time::Instant::now() < bootstrap_deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    Err(error) => return Err(error.message),
                 }
-                Err(error) => return Err(error.message),
-            };
-            match manager
-                .bootstrap_configuration(
-                    &instance_id,
-                    &access.host,
-                    access.port,
-                    &access.username,
-                    &access.password,
-                )
-                .await
-            {
-                Ok(_) => break,
-                Err(error)
-                    if matches!(
-                        error.code.as_str(),
-                        "SSH_CONNECT_TIMEOUT" | "SSH_CONNECT_FAILED"
-                    ) && tokio::time::Instant::now() < bootstrap_deadline =>
-                {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                }
-                Err(error) => return Err(error.message),
             }
         }
 
@@ -1202,6 +1208,28 @@ async fn provision_compute_worker_connection_impl(
         let _ = comp_share.stop_instance_for(locator).await;
     }
     result
+}
+
+#[tauri::command]
+async fn prepare_job_result_access(
+    manager: State<'_, SshTunnelManager>,
+    service: State<'_, ServiceClient>,
+    comp_share: State<'_, CompShareProvider>,
+    compute: State<'_, ComputeControlStore>,
+    lifecycle: State<'_, ComputeLifecycle>,
+    queue: State<'_, JobQueueStorage>,
+    job_id: String,
+) -> Result<ServiceProbe, String> {
+    let instance_id = remote_job_instance_id(&queue, &job_id).map_err(|error| error.message)?;
+    provision_compute_worker_connection_impl(
+        &manager,
+        &service,
+        &comp_share,
+        &compute,
+        &lifecycle,
+        &instance_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2438,6 +2466,8 @@ fn select_candidate_version(
 #[tauri::command]
 async fn download_completed_job(
     app: AppHandle,
+    manager: State<'_, SshTunnelManager>,
+    provider: State<'_, CompShareProvider>,
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
@@ -2478,6 +2508,7 @@ async fn download_completed_job(
     }
     let manifest = job
         .result_manifest
+        .clone()
         .ok_or_else(|| "远端任务已完成，但没有返回成品清单。".to_owned())?;
     if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
         return Err("远端成品清单与任务不匹配，已停止下载。".to_owned());
@@ -2575,14 +2606,10 @@ async fn download_completed_job(
                 .map_err(|error| error.message)?,
         );
     }
-    compute
-        .release_worker_lease(&job.client_request_id)
-        .map_err(|error| error.message)?;
-    let revision = lifecycle.invalidate_idle_shutdown();
-    schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
-    queue
-        .mark_local_complete(&job.id)
-        .map_err(|error| error.message)?;
+    finish_result_transfer(
+        &app, &manager, &provider, &compute, &queue, &lifecycle, &job,
+    )
+    .await?;
     Ok(candidates)
 }
 
@@ -2613,6 +2640,8 @@ async fn preview_project_video(
 #[tauri::command]
 async fn download_completed_image_job(
     app: AppHandle,
+    manager: State<'_, SshTunnelManager>,
+    provider: State<'_, CompShareProvider>,
     projects: State<'_, ProjectStorage>,
     assets: State<'_, AssetStorage>,
     queue: State<'_, JobQueueStorage>,
@@ -2643,6 +2672,7 @@ async fn download_completed_image_job(
     }
     let manifest = job
         .result_manifest
+        .clone()
         .ok_or_else(|| "远端图片任务已完成，但没有返回成品清单。".to_owned())?;
     if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
         return Err("远端图片清单与任务不匹配，已停止下载。".to_owned());
@@ -2688,20 +2718,18 @@ async fn download_completed_image_job(
         let _ = fs::remove_file(&downloaded.destination_path);
         imported.push(result?);
     }
-    compute
-        .release_worker_lease(&job.client_request_id)
-        .map_err(|error| error.message)?;
-    queue
-        .mark_local_complete(&job.id)
-        .map_err(|error| error.message)?;
-    let revision = lifecycle.invalidate_idle_shutdown();
-    schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
+    finish_result_transfer(
+        &app, &manager, &provider, &compute, &queue, &lifecycle, &job,
+    )
+    .await?;
     Ok(imported)
 }
 
 #[tauri::command]
 async fn download_completed_enhancement(
     app: AppHandle,
+    manager: State<'_, SshTunnelManager>,
+    provider: State<'_, CompShareProvider>,
     projects: State<'_, ProjectStorage>,
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
@@ -2746,6 +2774,7 @@ async fn download_completed_enhancement(
     }
     let manifest = job
         .result_manifest
+        .clone()
         .ok_or_else(|| "1080p 增强任务已完成，但没有返回文件清单。".to_owned())?;
     if manifest.job_id != job.id || manifest.workflow_id != job.workflow_id {
         return Err("1080p 增强文件清单与任务不匹配，已停止下载。".to_owned());
@@ -2805,15 +2834,42 @@ async fn download_completed_enhancement(
                 .map_err(|error| error.message)?,
         );
     }
+    finish_result_transfer(
+        &app, &manager, &provider, &compute, &queue, &lifecycle, &job,
+    )
+    .await?;
+    Ok(enhanced_versions)
+}
+
+async fn finish_result_transfer(
+    app: &AppHandle,
+    manager: &SshTunnelManager,
+    provider: &CompShareProvider,
+    compute: &ComputeControlStore,
+    queue: &JobQueueStorage,
+    lifecycle: &ComputeLifecycle,
+    job: &ServiceJob,
+) -> Result<(), String> {
     compute
         .release_worker_lease(&job.client_request_id)
         .map_err(|error| error.message)?;
-    let revision = lifecycle.invalidate_idle_shutdown();
-    schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
     queue
         .mark_local_complete(&job.id)
         .map_err(|error| error.message)?;
-    Ok(enhanced_versions)
+    restart_idle_gpu_shutdown(app, lifecycle);
+
+    let Ok(managed) = compute
+        .get_instance(&remote_job_instance_id(queue, &job.id).map_err(|error| error.message)?)
+    else {
+        return Ok(());
+    };
+    if managed.running_mode == "no_gpu" {
+        let _ = manager.stop_for(&managed.instance_id).await;
+        let _ = provider
+            .stop_instance_for(compute_instance_locator(&managed))
+            .await;
+    }
+    Ok(())
 }
 
 fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revision: u64) {
@@ -3247,6 +3303,7 @@ pub fn run() {
             connect_service_through_tunnel,
             connect_compute_worker,
             provision_compute_worker_connection,
+            prepare_job_result_access,
             prepare_compute_worker,
             prepare_generation_service,
         ])

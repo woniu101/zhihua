@@ -55,6 +55,7 @@ let narrationAudio: HTMLAudioElement | undefined;
 const pollTimers = new Map<string, number>();
 const pollRetryDelays = new Map<string, number>();
 const pollingJobs = new Set<string>();
+const recoveringJobs = new Set<string>();
 
 function effectiveVisualPlan(scene: SceneDraft): string {
   const intent = scene.visualIntent;
@@ -454,6 +455,30 @@ function schedulePoll(jobId: string, callback: () => void, delay = 2500) {
   const current = pollTimers.get(jobId);
   if (current !== undefined) window.clearTimeout(current);
   pollTimers.set(jobId, window.setTimeout(callback, delay));
+}
+
+async function resumeRemoteTask(sceneId: string, jobId: string, callback: () => Promise<void>) {
+  if (recoveringJobs.has(jobId)) return;
+  recoveringJobs.add(jobId);
+  try {
+    if (selectedSceneId.value === sceneId) {
+      taskError.value = "正在连接远端任务所在实例并恢复结果…";
+    }
+    await serviceRepository.prepareJobResultAccess(jobId);
+    pollRetryDelays.set(jobId, 2500);
+    await callback();
+  } catch (error) {
+    const failure = normalizeConnectionFailure(error);
+    if (selectedSceneId.value === sceneId) {
+      taskError.value = `结果实例暂时无法连接，知画会继续重试：${failure.message}`;
+    }
+    update(sceneId, { status: "generating", generationStage: "正在恢复结果实例连接" });
+    const delay = Math.min((pollRetryDelays.get(jobId) ?? 2500) * 2, 20_000);
+    pollRetryDelays.set(jobId, delay);
+    schedulePoll(jobId, () => void resumeRemoteTask(sceneId, jobId, callback), delay);
+  } finally {
+    recoveringJobs.delete(jobId);
+  }
 }
 
 function sceneStatusFor(job: GenerationJob) {
@@ -893,9 +918,13 @@ async function recoverPendingSceneJob(sceneId: string): Promise<boolean> {
       generationStage: "已从本地任务队列恢复远端任务",
     });
     if (enhancement && scene.selectedVersionId) {
-      await refreshEnhancementTask(scene.id, queued.remoteJobId, scene.selectedVersionId);
+      await resumeRemoteTask(
+        scene.id,
+        queued.remoteJobId,
+        () => refreshEnhancementTask(scene.id, queued.remoteJobId!, scene.selectedVersionId!),
+      );
     } else {
-      await refreshTask(scene.id, queued.remoteJobId);
+      await resumeRemoteTask(scene.id, queued.remoteJobId, () => refreshTask(scene.id, queued.remoteJobId!));
     }
     return true;
   } catch (error) {
@@ -913,10 +942,15 @@ watch(selectedSceneId, (sceneId) => {
   void loadCandidateVersions(scene?.projectId, scene?.id).then(async () => {
     if (!scene) return;
     if (await recoverPendingSceneJob(scene.id)) return;
+    if (scene.status !== "generating") return;
     if (scene.lastUpscaleJobId && scene.selectedVersionId) {
-      await refreshEnhancementTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
+      await resumeRemoteTask(
+        scene.id,
+        scene.lastUpscaleJobId,
+        () => refreshEnhancementTask(scene.id, scene.lastUpscaleJobId!, scene.selectedVersionId!),
+      );
     } else if (scene.lastJobId) {
-      await refreshTask(scene.id, scene.lastJobId);
+      await resumeRemoteTask(scene.id, scene.lastJobId, () => refreshTask(scene.id, scene.lastJobId!));
     }
   });
 }, { immediate: true });
@@ -927,10 +961,15 @@ watch([loading, () => scenes.value[0]?.projectId], async ([isLoading, projectId]
   await loadAllScenePreviews();
   for (const scene of scenes.value) {
     if (await recoverPendingSceneJob(scene.id)) continue;
+    if (scene.status !== "generating") continue;
     if (scene.lastUpscaleJobId && scene.selectedVersionId) {
-      void refreshEnhancementTask(scene.id, scene.lastUpscaleJobId, scene.selectedVersionId);
+      await resumeRemoteTask(
+        scene.id,
+        scene.lastUpscaleJobId,
+        () => refreshEnhancementTask(scene.id, scene.lastUpscaleJobId!, scene.selectedVersionId!),
+      );
     } else if (scene.lastJobId) {
-      void refreshTask(scene.id, scene.lastJobId);
+      await resumeRemoteTask(scene.id, scene.lastJobId, () => refreshTask(scene.id, scene.lastJobId!));
     }
   }
 }, { immediate: true });

@@ -224,6 +224,8 @@ export const serviceRepository = {
     invokeNative<ServiceProbe>("prepare_compute_worker", { instanceId }),
   prepareGeneration: () =>
     invokeNative<ServiceProbe>("prepare_generation_service"),
+  prepareJobResultAccess: (jobId: string) =>
+    invokeNative<ServiceProbe>("prepare_job_result_access", { jobId }),
   listLocalJobs: (projectId?: string) =>
     invokeNative<LocalGenerationJob[]>("list_local_jobs", { projectId }),
   syncJob: async (jobId: string) => {
