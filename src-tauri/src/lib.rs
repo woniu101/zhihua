@@ -718,104 +718,127 @@ async fn stop_compshare_instance(
 async fn prepare_application_exit(
     provider: State<'_, CompShareProvider>,
     service: State<'_, ServiceClient>,
+    compute: State<'_, ComputeControlStore>,
     lifecycle: State<'_, ComputeLifecycle>,
 ) -> Result<ApplicationExitProtection, String> {
     lifecycle.invalidate_idle_shutdown();
     let keep_alive_policy = lifecycle.policy();
+    let managed_instances = compute.list_instances().map_err(|error| error.message)?;
+    let mut gpu_instances = 0_u32;
+    let mut stopped_instances = 0_u32;
+    let mut protected_instances = 0_u32;
+    let mut active_remote_tasks = 0_u64;
+    let mut unreachable_instances = 0_u32;
+    let snapshot = lifecycle.snapshot();
 
-    let instance = match provider.bound_instance().await {
-        Ok(instance) => instance,
-        Err(error) => {
-            return Ok(ApplicationExitProtection {
-                active_remote_tasks: 0,
-                action: "no-bound-instance".to_owned(),
-                detail: format!("没有可处理的运行实例：{}", error.message),
-            });
+    for managed in managed_instances {
+        if managed.role == ComputeInstanceRole::UserManaged
+            || !managed.platform_state.eq_ignore_ascii_case("running")
+            || managed.running_mode != "gpu"
+        {
+            continue;
         }
-    };
-    if instance.state != CompSharePowerState::Running
-        || instance.running_mode != CompShareRunningMode::Gpu
-    {
+        let locator = compute_instance_locator(&managed);
+        let instance = provider
+            .describe_instance(locator.clone())
+            .await
+            .map_err(|error| {
+                format!(
+                    "无法确认实例 {} 的退出状态：{}",
+                    managed.instance_id, error.message
+                )
+            })?;
+        compute
+            .refresh_platform_instance(&instance)
+            .map_err(|error| error.message)?;
+        if instance.state != CompSharePowerState::Running
+            || instance.running_mode != CompShareRunningMode::Gpu
+        {
+            continue;
+        }
+        gpu_instances += 1;
+
+        let ensure_watchdog = async {
+            if instance.stop_scheduler_time.is_none() {
+                provider
+                    .update_stop_scheduler_for(
+                        locator.clone(),
+                        chrono::Utc::now().timestamp() + (snapshot.hard_limit_minutes as i64) * 60,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "实例 {} 无法补设平台关机保障：{}",
+                            managed.instance_id, error.message
+                        )
+                    })?;
+            }
+            Ok::<(), String>(())
+        };
+
+        if keep_alive_policy == ComputeKeepAlivePolicy::Continuous {
+            ensure_watchdog.await?;
+            protected_instances += 1;
+            continue;
+        }
+
+        let probe = match service.probe_for(&managed.instance_id).await {
+            Ok(probe) => probe,
+            Err(_) => {
+                ensure_watchdog.await?;
+                unreachable_instances += 1;
+                protected_instances += 1;
+                continue;
+            }
+        };
+        let worker_tasks = probe.queue_active.saturating_add(probe.queue_queued);
+        active_remote_tasks = active_remote_tasks.saturating_add(u64::from(worker_tasks));
+        if worker_tasks > 0 {
+            ensure_watchdog.await?;
+            protected_instances += 1;
+            continue;
+        }
+
+        provider
+            .stop_instance_for(locator.clone())
+            .await
+            .map_err(|error| {
+                format!(
+                    "实例 {} 的远端队列已空，但请求关闭 GPU 失败：{}",
+                    managed.instance_id, error.message
+                )
+            })?;
+        let _ = provider.delete_stop_scheduler_for(locator.clone()).await;
+        stopped_instances += 1;
+    }
+
+    if gpu_instances == 0 {
         return Ok(ApplicationExitProtection {
             active_remote_tasks: 0,
             action: "no-gpu-cost".to_owned(),
             detail: "当前没有运行中的 GPU，无需额外处理。".to_owned(),
         });
     }
-
     if keep_alive_policy == ComputeKeepAlivePolicy::Continuous {
-        if instance.stop_scheduler_time.is_none() {
-            let snapshot = lifecycle.snapshot();
-            provider
-                .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
-                    stop_time: chrono::Utc::now().timestamp()
-                        + (snapshot.hard_limit_minutes as i64) * 60,
-                    project_id: instance.project_id.clone(),
-                })
-                .await
-                .map_err(|error| format!("持续 GPU 尚未获得平台关机保障：{}", error.message))?;
-        }
-        return Ok(ApplicationExitProtection {
-            active_remote_tasks: 0,
-            action: "continuous-gpu".to_owned(),
-            detail: "持续 GPU 模式已启用；客户端退出后保持 GPU，并由 12 小时平台硬上限兜底。"
-                .to_owned(),
-        });
-    }
-
-    // The service queue is authoritative. Local jobs may be stale after a tunnel
-    // interruption, so an unreachable service must keep the platform watchdog.
-    let probe = match service.probe().await {
-        Ok(probe) => probe,
-        Err(error) => {
-            return Ok(ApplicationExitProtection {
-                active_remote_tasks: 0,
-                action: "platform-watchdog".to_owned(),
-                detail: format!(
-                    "无法确认远端队列（{}）；保留优云智算平台定时关机，避免误停仍在执行的任务。",
-                    error.message
-                ),
-            });
-        }
-    };
-    let active_remote_tasks = probe.queue_active.saturating_add(probe.queue_queued);
-    if active_remote_tasks > 0 {
-        if instance.stop_scheduler_time.is_none() {
-            let snapshot = lifecycle.snapshot();
-            provider
-                .update_stop_scheduler(UpdateCompShareStopSchedulerInput {
-                    stop_time: chrono::Utc::now().timestamp()
-                        + (snapshot.hard_limit_minutes as i64) * 60,
-                    project_id: instance.project_id.clone(),
-                })
-                .await
-                .map_err(|error| {
-                    format!(
-                        "远端任务仍在运行，但无法补设平台关机保障：{}",
-                        error.message
-                    )
-                })?;
-        }
         return Ok(ApplicationExitProtection {
             active_remote_tasks,
-            action: "continue-until-watchdog".to_owned(),
+            action: "continuous-gpu".to_owned(),
             detail: format!(
-                "远端仍有 {active_remote_tasks} 个任务，退出后继续执行，并由平台运行上限定时关机兜底。"
+                "持续 GPU 模式保留 {protected_instances} 个实例，并已逐台确认平台硬上限。"
             ),
         });
     }
-
-    provider
-        .stop_instance()
-        .await
-        .map_err(|error| format!("远端队列已空，但请求关闭 GPU 失败：{}", error.message))?;
-    // A new GPU start always overwrites the safeguard. Deleting it here avoids
-    // an old deadline unexpectedly affecting a later no-GPU maintenance boot.
-    let _ = provider.delete_stop_scheduler().await;
+    let action = if protected_instances > 0 {
+        "mixed-worker-protection"
+    } else {
+        "gpu-stop-requested"
+    };
     Ok(ApplicationExitProtection {
-        active_remote_tasks: 0,
-        action: "gpu-stop-requested".to_owned(),
-        detail: "远端队列为空，已在客户端退出前请求关闭 GPU。".to_owned(),
+        active_remote_tasks,
+        action: action.to_owned(),
+        detail: format!(
+            "已请求关闭 {stopped_instances} 个空闲 GPU；{protected_instances} 个实例因任务运行或队列不可达而保留平台兜底，其中 {unreachable_instances} 个暂时无法确认队列。"
+        ),
     })
 }
 
@@ -2586,23 +2609,41 @@ fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revis
             return;
         }
         let service = app.state::<ServiceClient>();
-        let Ok(probe) = service.probe().await else {
-            return;
-        };
-        if probe.queue_active > 0 || probe.queue_queued > 0 || !lifecycle.is_current(revision) {
-            return;
-        }
         let provider = app.state::<CompShareProvider>();
-        let Ok(instance) = provider.bound_instance().await else {
+        let compute = app.state::<ComputeControlStore>();
+        let Ok(instances) = compute.list_instances() else {
             return;
         };
-        if instance.state == CompSharePowerState::Running
-            && instance.running_mode == CompShareRunningMode::Gpu
-            && lifecycle.is_current(revision)
-        {
-            if provider.stop_instance().await.is_ok()
-                && wait_for_instance_state(
+        for managed in instances {
+            if managed.role == ComputeInstanceRole::UserManaged
+                || !managed.platform_state.eq_ignore_ascii_case("running")
+                || managed.running_mode != "gpu"
+                || compute
+                    .active_worker_lease_count(&managed.instance_id)
+                    .map_or(true, |count| count > 0)
+                || !lifecycle.is_current(revision)
+            {
+                continue;
+            }
+            let Ok(probe) = service.probe_for(&managed.instance_id).await else {
+                continue;
+            };
+            if probe.queue_active > 0 || probe.queue_queued > 0 || !lifecycle.is_current(revision) {
+                continue;
+            }
+            let locator = compute_instance_locator(&managed);
+            let Ok(instance) = provider.describe_instance(locator.clone()).await else {
+                continue;
+            };
+            if instance.state != CompSharePowerState::Running
+                || instance.running_mode != CompShareRunningMode::Gpu
+            {
+                continue;
+            }
+            if provider.stop_instance_for(locator.clone()).await.is_ok()
+                && wait_for_instance_state_for(
                     &provider,
+                    &locator,
                     CompSharePowerState::Stopped,
                     None,
                     Duration::from_secs(120),
@@ -2611,8 +2652,14 @@ fn schedule_idle_gpu_shutdown(app: AppHandle, lifecycle: ComputeLifecycle, revis
                 .is_ok()
                 && lifecycle.is_current(revision)
             {
-                let _ = provider.delete_stop_scheduler().await;
-                let _ = provider.start_instance(CompShareStartMode::NoGpu).await;
+                let _ = provider.delete_stop_scheduler_for(locator.clone()).await;
+                if managed.role == ComputeInstanceRole::Primary
+                    && instance.support_without_gpu_start
+                {
+                    let _ = provider
+                        .start_instance_for(locator, CompShareStartMode::NoGpu)
+                        .await;
+                }
             }
         }
     });

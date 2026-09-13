@@ -37,7 +37,7 @@ onMounted(async () => {
     try {
       await Promise.race([
         invoke("prepare_application_exit"),
-        new Promise((_, reject) => window.setTimeout(() => reject(new Error("退出保护检查超时")), 8_000)),
+        new Promise((_, reject) => window.setTimeout(() => reject(new Error("退出保护检查超时")), 30_000)),
       ]);
     } catch (error) {
       console.info("[知画] 退出保护由平台定时关机继续接管。", error);

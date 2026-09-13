@@ -954,6 +954,18 @@ impl ComputeControlStore {
             .ok_or_else(|| ComputeControlError::new("WORKER_LEASE_NOT_FOUND", "找不到 worker 租约"))
     }
 
+    pub fn active_worker_lease_count(&self, instance_id: &str) -> Result<u32, ComputeControlError> {
+        let count: i64 = self.connection()?.query_row(
+            "SELECT COUNT(*) FROM worker_leases
+             WHERE instance_id=?1 AND lease_expires_at>?2",
+            params![instance_id.trim(), now_iso()],
+            |row| row.get(0),
+        )?;
+        u32::try_from(count).map_err(|_| {
+            ComputeControlError::new("INVALID_WORKER_LEASE_COUNT", "worker 租约数量超出可用范围")
+        })
+    }
+
     #[cfg(test)]
     pub fn begin_operation(
         &self,
@@ -1617,11 +1629,11 @@ mod tests {
         let refreshed = store.refresh_platform_instance(&running).unwrap();
 
         assert_eq!(refreshed.role, ComputeInstanceRole::Elastic);
+        assert_eq!(refreshed.ownership, ComputeInstanceOwnership::ZhihuaManaged);
         assert_eq!(
-            refreshed.ownership,
-            ComputeInstanceOwnership::ZhihuaManaged
+            refreshed.cleanup_policy,
+            ComputeCleanupPolicy::ReleaseWhenIdle
         );
-        assert_eq!(refreshed.cleanup_policy, ComputeCleanupPolicy::ReleaseWhenIdle);
         assert_eq!(refreshed.platform_state, "Running");
         assert_eq!(refreshed.running_mode, "gpu");
         assert_eq!(refreshed.lifecycle_state, ComputeLifecycleState::Idle);
@@ -1709,11 +1721,13 @@ mod tests {
         let busy = store.get_instance("primary").unwrap();
         assert_eq!(busy.lifecycle_state, ComputeLifecycleState::Busy);
         assert_eq!(busy.current_job_id.as_deref(), Some("job-1"));
+        assert_eq!(store.active_worker_lease_count("primary").unwrap(), 1);
 
         assert!(store.release_worker_lease("job-1").unwrap());
         let idle = store.get_instance("primary").unwrap();
         assert_eq!(idle.lifecycle_state, ComputeLifecycleState::Idle);
         assert!(idle.current_job_id.is_none());
+        assert_eq!(store.active_worker_lease_count("primary").unwrap(), 0);
     }
 
     #[test]
