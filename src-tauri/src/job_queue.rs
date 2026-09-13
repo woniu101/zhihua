@@ -252,7 +252,6 @@ impl JobQueueStorage {
             .execute(
                 "UPDATE generation_jobs SET status=?2, progress=?3, error_code=?4,
              error_message=?5,
-             worker_id=CASE WHEN ?2 IN ('completed','failed','cancelled','interrupted') THEN NULL ELSE worker_id END,
              lease_expires_at=CASE WHEN ?2 IN ('completed','failed','cancelled','interrupted') THEN NULL ELSE lease_expires_at END,
              updated_at=?6 WHERE remote_job_id=?1",
                 params![
@@ -275,7 +274,7 @@ impl JobQueueStorage {
         self.connection()?
             .execute(
                 "UPDATE generation_jobs SET status='completed_local', progress=1,
-             worker_id=NULL, lease_expires_at=NULL, updated_at=?2 WHERE remote_job_id=?1",
+             lease_expires_at=NULL, updated_at=?2 WHERE remote_job_id=?1",
                 params![remote_job_id, now_iso()],
             )
             .map_err(database_error)?;
@@ -373,6 +372,19 @@ impl JobQueueStorage {
                 format!("本地任务生成参数无法读取：{error}"),
             )
         })
+    }
+
+    pub fn find_by_remote(&self, remote_job_id: &str) -> QueueResult<LocalJob> {
+        self.connection()?
+            .query_row(
+                "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
+                    workflow_id, status, progress, worker_id, lease_expires_at,
+                    attempt, error_code, error_message, created_at, updated_at
+             FROM generation_jobs WHERE remote_job_id=?1",
+                [remote_job_id],
+                local_job_from_row,
+            )
+            .map_err(database_error)
     }
 
     fn find_by_request(&self, request_id: &str) -> QueueResult<LocalJob> {
@@ -489,6 +501,9 @@ mod tests {
         };
         queue.stage(&input).expect("stage");
         queue.stage(&input).expect("stage idempotently");
+        queue
+            .claim_for_worker("request-1", "instance:worker-one:gpu:0", 60)
+            .expect("claim worker");
         let job = ServiceJob {
             id: "remote-1".into(),
             client_request_id: input.client_request_id.clone(),
@@ -509,11 +524,32 @@ mod tests {
         let stored = queue.record_remote(&job).expect("remote");
         assert_eq!(stored.remote_job_id.as_deref(), Some("remote-1"));
         assert_eq!(stored.attempt, 1);
-        assert_eq!(queue.list(Some(&stored.project_id)).expect("list").len(), 1);
-        queue.mark_local_complete("remote-1").expect("complete");
         assert_eq!(
-            queue.find_by_request("request-1").expect("find").status,
-            "completed_local"
+            stored.worker_id.as_deref(),
+            Some("instance:worker-one:gpu:0")
+        );
+        assert_eq!(queue.list(Some(&stored.project_id)).expect("list").len(), 1);
+        let mut completed = job.clone();
+        completed.status = "completed".into();
+        let synced = queue.sync(&completed).expect("sync completed job");
+        assert_eq!(
+            synced.worker_id.as_deref(),
+            Some("instance:worker-one:gpu:0")
+        );
+        assert_eq!(
+            queue
+                .find_by_remote("remote-1")
+                .expect("find remote")
+                .worker_id
+                .as_deref(),
+            Some("instance:worker-one:gpu:0")
+        );
+        queue.mark_local_complete("remote-1").expect("complete");
+        let local = queue.find_by_request("request-1").expect("find");
+        assert_eq!(local.status, "completed_local");
+        assert_eq!(
+            local.worker_id.as_deref(),
+            Some("instance:worker-one:gpu:0")
         );
     }
 

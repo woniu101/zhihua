@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::RwLock,
@@ -47,11 +48,25 @@ struct ActiveConnection {
     token: String,
 }
 
+#[derive(Clone, Default)]
+struct ActiveConnectionPool {
+    selected_instance_id: Option<String>,
+    connections: BTreeMap<String, ActiveConnection>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionRegistry {
+    selected_instance_id: Option<String>,
+    #[serde(default)]
+    connections: BTreeMap<String, ConnectionMetadata>,
+}
+
 pub struct ServiceClient {
     client: Client,
     transfer_client: Client,
     metadata_path: PathBuf,
-    active: RwLock<Option<ActiveConnection>>,
+    active: RwLock<ActiveConnectionPool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,14 +306,25 @@ impl ServiceClient {
     pub fn new(app_data_dir: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&app_data_dir).map_err(|error| error.to_string())?;
         let metadata_path = app_data_dir.join("service-connection.json");
-        let active = load_metadata(&metadata_path)
-            .ok()
-            .flatten()
-            .and_then(|metadata| {
-                load_token(&metadata.instance_id)
-                    .ok()
-                    .map(|token| ActiveConnection { metadata, token })
-            });
+        let registry = load_connection_registry(&metadata_path).map_err(|error| error.message)?;
+        let mut active = ActiveConnectionPool {
+            selected_instance_id: registry.selected_instance_id,
+            connections: BTreeMap::new(),
+        };
+        for (instance_id, metadata) in registry.connections {
+            if let Ok(token) = load_token(&instance_id) {
+                active
+                    .connections
+                    .insert(instance_id, ActiveConnection { metadata, token });
+            }
+        }
+        if active
+            .selected_instance_id
+            .as_ref()
+            .is_some_and(|id| !active.connections.contains_key(id))
+        {
+            active.selected_instance_id = active.connections.keys().next().cloned();
+        }
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(15))
@@ -318,7 +344,11 @@ impl ServiceClient {
 
     pub fn info(&self) -> ServiceResult<ServiceConnectionInfo> {
         let active = self.active.read().map_err(lock_error)?;
-        if let Some(connection) = active.as_ref() {
+        if let Some(connection) = active
+            .selected_instance_id
+            .as_ref()
+            .and_then(|instance_id| active.connections.get(instance_id))
+        {
             return Ok(ServiceConnectionInfo {
                 configured: true,
                 instance_id: Some(connection.metadata.instance_id.clone()),
@@ -326,16 +356,42 @@ impl ServiceClient {
                 credential_stored: true,
             });
         }
-        let metadata = load_metadata(&self.metadata_path)?;
         Ok(ServiceConnectionInfo {
-            configured: metadata.is_some(),
-            instance_id: metadata.as_ref().map(|value| value.instance_id.clone()),
-            base_url: metadata.as_ref().map(|value| value.base_url.clone()),
+            configured: false,
+            instance_id: None,
+            base_url: None,
             credential_stored: false,
         })
     }
 
+    pub fn info_for(&self, instance_id: &str) -> ServiceResult<ServiceConnectionInfo> {
+        let instance_id = validate_identifier(instance_id, "实例 ID")?;
+        let active = self.active.read().map_err(lock_error)?;
+        let connection = active.connections.get(&instance_id);
+        Ok(ServiceConnectionInfo {
+            configured: connection.is_some(),
+            instance_id: connection.map(|value| value.metadata.instance_id.clone()),
+            base_url: connection.map(|value| value.metadata.base_url.clone()),
+            credential_stored: connection.is_some(),
+        })
+    }
+
     pub fn save(&self, input: SaveServiceConnectionInput) -> ServiceResult<ServiceConnectionInfo> {
+        self.save_connection(input, true)
+    }
+
+    pub fn save_for(
+        &self,
+        input: SaveServiceConnectionInput,
+    ) -> ServiceResult<ServiceConnectionInfo> {
+        self.save_connection(input, false)
+    }
+
+    fn save_connection(
+        &self,
+        input: SaveServiceConnectionInput,
+        select: bool,
+    ) -> ServiceResult<ServiceConnectionInfo> {
         let instance_id = validate_identifier(&input.instance_id, "实例 ID")?;
         let base_url = validate_base_url(&input.base_url)?;
         if !(32..=512).contains(&input.token.chars().count()) {
@@ -349,19 +405,26 @@ impl ServiceClient {
             base_url,
         };
         save_token(&metadata.instance_id, &input.token)?;
-        let encoded = serde_json::to_vec_pretty(&metadata)
-            .map_err(|_| service_error("metadata_failed", "无法编码知画服务连接信息。"))?;
-        if fs::write(&self.metadata_path, encoded).is_err() {
+        let mut active = self.active.write().map_err(lock_error)?;
+        let mut updated = active.clone();
+        if select || updated.selected_instance_id.is_none() {
+            updated.selected_instance_id = Some(metadata.instance_id.clone());
+        }
+        updated.connections.insert(
+            metadata.instance_id.clone(),
+            ActiveConnection {
+                metadata: metadata.clone(),
+                token: input.token.clone(),
+            },
+        );
+        if save_connection_registry(&self.metadata_path, &updated).is_err() {
             let _ = delete_token(&metadata.instance_id);
             return Err(service_error(
                 "metadata_failed",
                 "无法保存知画服务连接信息。",
             ));
         }
-        *self.active.write().map_err(lock_error)? = Some(ActiveConnection {
-            metadata: metadata.clone(),
-            token: input.token,
-        });
+        *active = updated;
         Ok(ServiceConnectionInfo {
             configured: true,
             instance_id: Some(metadata.instance_id),
@@ -369,10 +432,18 @@ impl ServiceClient {
             credential_stored: true,
         })
     }
-
     pub fn retarget(&self, base_url: String) -> ServiceResult<ServiceConnectionInfo> {
         let connection = self.connection()?;
-        self.save(SaveServiceConnectionInput {
+        self.retarget_for(&connection.metadata.instance_id, base_url)
+    }
+
+    pub fn retarget_for(
+        &self,
+        instance_id: &str,
+        base_url: String,
+    ) -> ServiceResult<ServiceConnectionInfo> {
+        let connection = self.connection_for(instance_id)?;
+        self.save_for(SaveServiceConnectionInput {
             instance_id: connection.metadata.instance_id,
             base_url,
             token: connection.token,
@@ -380,14 +451,15 @@ impl ServiceClient {
     }
 
     pub fn clear(&self) -> ServiceResult<()> {
-        if let Some(metadata) = load_metadata(&self.metadata_path)? {
-            let _ = delete_token(&metadata.instance_id);
+        let active = self.active.read().map_err(lock_error)?.clone();
+        for instance_id in active.connections.keys() {
+            let _ = delete_token(instance_id);
         }
         if self.metadata_path.exists() {
             fs::remove_file(&self.metadata_path)
                 .map_err(|_| service_error("metadata_failed", "无法删除知画服务连接信息。"))?;
         }
-        *self.active.write().map_err(lock_error)? = None;
+        *self.active.write().map_err(lock_error)? = ActiveConnectionPool::default();
         Ok(())
     }
 
@@ -411,6 +483,15 @@ impl ServiceClient {
 
     pub async fn probe(&self) -> ServiceResult<ServiceProbe> {
         let connection = self.connection()?;
+        self.probe_connection(connection).await
+    }
+
+    pub async fn probe_for(&self, instance_id: &str) -> ServiceResult<ServiceProbe> {
+        let connection = self.connection_for(instance_id)?;
+        self.probe_connection(connection).await
+    }
+
+    async fn probe_connection(&self, connection: ActiveConnection) -> ServiceResult<ServiceProbe> {
         let base_url = &connection.metadata.base_url;
         let health: HealthWire = decode_response(
             self.client
@@ -486,8 +567,25 @@ impl ServiceClient {
     }
 
     pub async fn submit_job(&self, input: SubmitServiceJobInput) -> ServiceResult<ServiceJob> {
-        validate_job_input(&input)?;
         let connection = self.connection()?;
+        self.submit_job_with(connection, input).await
+    }
+
+    pub async fn submit_job_for(
+        &self,
+        instance_id: &str,
+        input: SubmitServiceJobInput,
+    ) -> ServiceResult<ServiceJob> {
+        let connection = self.connection_for(instance_id)?;
+        self.submit_job_with(connection, input).await
+    }
+
+    async fn submit_job_with(
+        &self,
+        connection: ActiveConnection,
+        input: SubmitServiceJobInput,
+    ) -> ServiceResult<ServiceJob> {
+        validate_job_input(&input)?;
         let job: JobWire = decode_response(
             self.send_with_retry(|| {
                 self.authenticated(&connection, Method::POST, "/api/v1/jobs")
@@ -507,8 +605,21 @@ impl ServiceClient {
     }
 
     pub async fn get_job(&self, job_id: &str) -> ServiceResult<ServiceJob> {
-        validate_identifier(job_id, "任务 ID")?;
         let connection = self.connection()?;
+        self.get_job_with(connection, job_id).await
+    }
+
+    pub async fn get_job_for(&self, instance_id: &str, job_id: &str) -> ServiceResult<ServiceJob> {
+        let connection = self.connection_for(instance_id)?;
+        self.get_job_with(connection, job_id).await
+    }
+
+    async fn get_job_with(
+        &self,
+        connection: ActiveConnection,
+        job_id: &str,
+    ) -> ServiceResult<ServiceJob> {
+        validate_identifier(job_id, "任务 ID")?;
         let job: JobWire = decode_response(
             self.send_with_retry(|| {
                 self.authenticated(&connection, Method::GET, &format!("/api/v1/jobs/{job_id}"))
@@ -520,8 +631,25 @@ impl ServiceClient {
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> ServiceResult<ServiceJob> {
-        validate_identifier(job_id, "任务 ID")?;
         let connection = self.connection()?;
+        self.cancel_job_with(connection, job_id).await
+    }
+
+    pub async fn cancel_job_for(
+        &self,
+        instance_id: &str,
+        job_id: &str,
+    ) -> ServiceResult<ServiceJob> {
+        let connection = self.connection_for(instance_id)?;
+        self.cancel_job_with(connection, job_id).await
+    }
+
+    async fn cancel_job_with(
+        &self,
+        connection: ActiveConnection,
+        job_id: &str,
+    ) -> ServiceResult<ServiceJob> {
+        validate_identifier(job_id, "任务 ID")?;
         let _: Value = decode_response(
             self.authenticated(
                 &connection,
@@ -533,10 +661,28 @@ impl ServiceClient {
             .map_err(connection_error)?,
         )
         .await?;
-        self.get_job(job_id).await
+        self.get_job_with(connection, job_id).await
     }
 
     pub async fn upload_input(&self, source_path: &str) -> ServiceResult<ServiceInputUpload> {
+        let connection = self.connection()?;
+        self.upload_input_with(connection, source_path).await
+    }
+
+    pub async fn upload_input_for(
+        &self,
+        instance_id: &str,
+        source_path: &str,
+    ) -> ServiceResult<ServiceInputUpload> {
+        let connection = self.connection_for(instance_id)?;
+        self.upload_input_with(connection, source_path).await
+    }
+
+    async fn upload_input_with(
+        &self,
+        connection: ActiveConnection,
+        source_path: &str,
+    ) -> ServiceResult<ServiceInputUpload> {
         let path = validate_input_path(source_path)?;
         let metadata = tokio::fs::metadata(&path)
             .await
@@ -552,7 +698,6 @@ impl ServiceClient {
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or_else(|| service_error("input_name_invalid", "参考素材文件名无效。"))?;
-        let connection = self.connection()?;
         let file = File::open(&path)
             .await
             .map_err(|_| service_error("input_unavailable", "无法打开本地参考素材。"))?;
@@ -582,8 +727,21 @@ impl ServiceClient {
     }
 
     pub async fn delete_input(&self, input_id: &str) -> ServiceResult<()> {
-        validate_input_id(input_id)?;
         let connection = self.connection()?;
+        self.delete_input_with(connection, input_id).await
+    }
+
+    pub async fn delete_input_for(&self, instance_id: &str, input_id: &str) -> ServiceResult<()> {
+        let connection = self.connection_for(instance_id)?;
+        self.delete_input_with(connection, input_id).await
+    }
+
+    async fn delete_input_with(
+        &self,
+        connection: ActiveConnection,
+        input_id: &str,
+    ) -> ServiceResult<()> {
+        validate_input_id(input_id)?;
         let response = self
             .authenticated(
                 &connection,
@@ -598,6 +756,24 @@ impl ServiceClient {
 
     pub async fn download_artifact(
         &self,
+        input: DownloadServiceArtifactInput,
+    ) -> ServiceResult<ServiceArtifactDownload> {
+        let connection = self.connection()?;
+        self.download_artifact_with(connection, input).await
+    }
+
+    pub async fn download_artifact_for(
+        &self,
+        instance_id: &str,
+        input: DownloadServiceArtifactInput,
+    ) -> ServiceResult<ServiceArtifactDownload> {
+        let connection = self.connection_for(instance_id)?;
+        self.download_artifact_with(connection, input).await
+    }
+
+    async fn download_artifact_with(
+        &self,
+        connection: ActiveConnection,
         input: DownloadServiceArtifactInput,
     ) -> ServiceResult<ServiceArtifactDownload> {
         let job_id = validate_identifier(&input.job_id, "任务 ID")?;
@@ -637,7 +813,6 @@ impl ServiceClient {
             let _ = tokio::fs::remove_file(&partial).await;
             existing = 0;
         }
-        let connection = self.connection()?;
         let path = format!("/api/v1/jobs/{job_id}/artifacts/{artifact_id}");
         let mut request =
             self.authenticated_with(&self.transfer_client, &connection, Method::GET, &path);
@@ -713,11 +888,29 @@ impl ServiceClient {
     }
 
     fn connection(&self) -> ServiceResult<ActiveConnection> {
+        let active = self.active.read().map_err(lock_error)?;
+        active
+            .selected_instance_id
+            .as_ref()
+            .and_then(|instance_id| active.connections.get(instance_id))
+            .cloned()
+            .ok_or_else(|| service_error("not_configured", "尚未配置知画服务，或系统凭据已丢失。"))
+    }
+
+    fn connection_for(&self, instance_id: &str) -> ServiceResult<ActiveConnection> {
+        let instance_id = validate_identifier(instance_id, "实例 ID")?;
         self.active
             .read()
             .map_err(lock_error)?
-            .clone()
-            .ok_or_else(|| service_error("not_configured", "尚未配置知画服务，或系统凭据已丢失。"))
+            .connections
+            .get(&instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                service_error(
+                    "instance_not_configured",
+                    "目标 worker 尚未建立独立的知画服务连接。",
+                )
+            })
     }
 
     fn authenticated(
@@ -1035,17 +1228,69 @@ fn delete_token(instance_id: &str) -> ServiceResult<()> {
         .map_err(|_| service_error("credential_error", "无法删除知画服务凭据。"))
 }
 
-fn load_metadata(path: &PathBuf) -> ServiceResult<Option<ConnectionMetadata>> {
+fn load_connection_registry(path: &PathBuf) -> ServiceResult<ConnectionRegistry> {
     if !path.exists() {
-        return Ok(None);
+        return Ok(ConnectionRegistry::default());
     }
     let bytes = fs::read(path)
         .map_err(|_| service_error("metadata_failed", "无法读取知画服务连接信息。"))?;
-    let metadata: ConnectionMetadata = serde_json::from_slice(&bytes)
-        .map_err(|_| service_error("metadata_failed", "知画服务连接信息已损坏。"))?;
-    validate_identifier(&metadata.instance_id, "实例 ID")?;
-    validate_base_url(&metadata.base_url)?;
-    Ok(Some(metadata))
+    let mut registry = match serde_json::from_slice::<ConnectionRegistry>(&bytes) {
+        Ok(registry) => registry,
+        Err(_) => {
+            let metadata: ConnectionMetadata = serde_json::from_slice(&bytes)
+                .map_err(|_| service_error("metadata_failed", "知画服务连接信息已损坏。"))?;
+            ConnectionRegistry {
+                selected_instance_id: Some(metadata.instance_id.clone()),
+                connections: [(metadata.instance_id.clone(), metadata)]
+                    .into_iter()
+                    .collect(),
+            }
+        }
+    };
+    for (instance_id, metadata) in &registry.connections {
+        validate_identifier(instance_id, "实例 ID")?;
+        validate_identifier(&metadata.instance_id, "实例 ID")?;
+        if instance_id != &metadata.instance_id {
+            return Err(service_error(
+                "metadata_failed",
+                "知画服务连接信息中的实例 ID 不一致。",
+            ));
+        }
+        validate_base_url(&metadata.base_url)?;
+    }
+    if let Some(selected) = registry.selected_instance_id.as_ref() {
+        validate_identifier(selected, "实例 ID")?;
+        if !registry.connections.contains_key(selected) {
+            registry.selected_instance_id = registry.connections.keys().next().cloned();
+        }
+    } else {
+        registry.selected_instance_id = registry.connections.keys().next().cloned();
+    }
+    Ok(registry)
+}
+
+fn save_connection_registry(path: &PathBuf, active: &ActiveConnectionPool) -> ServiceResult<()> {
+    let registry = ConnectionRegistry {
+        selected_instance_id: active.selected_instance_id.clone(),
+        connections: active
+            .connections
+            .iter()
+            .map(|(instance_id, connection)| (instance_id.clone(), connection.metadata.clone()))
+            .collect(),
+    };
+    let encoded = serde_json::to_vec_pretty(&registry)
+        .map_err(|_| service_error("metadata_failed", "无法编码知画服务连接信息。"))?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, encoded)
+        .map_err(|_| service_error("metadata_failed", "无法保存知画服务连接信息。"))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|_| service_error("metadata_failed", "无法更新知画服务连接信息。"))?;
+    }
+    fs::rename(&temporary, path).map_err(|_| {
+        let _ = fs::remove_file(&temporary);
+        service_error("metadata_failed", "无法保存知画服务连接信息。")
+    })
 }
 
 fn invalid_address() -> ServiceConnectionError {
@@ -1128,13 +1373,19 @@ mod tests {
 
     fn connected_client(base_url: String) -> ServiceClient {
         let client = client();
-        *client.active.write().expect("active connection") = Some(ActiveConnection {
+        let connection = ActiveConnection {
             metadata: ConnectionMetadata {
                 instance_id: "test-instance".to_owned(),
                 base_url,
             },
             token: "a".repeat(32),
-        });
+        };
+        *client.active.write().expect("active connection") = ActiveConnectionPool {
+            selected_instance_id: Some("test-instance".to_owned()),
+            connections: [("test-instance".to_owned(), connection)]
+                .into_iter()
+                .collect(),
+        };
         client
     }
 
@@ -1173,6 +1424,49 @@ mod tests {
         ] {
             assert!(validate_base_url(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn persists_multiple_instance_connection_metadata_without_tokens() {
+        let directory = TempDir::new().expect("metadata directory");
+        let path = directory.path().join("service-connection.json");
+        let first = ActiveConnection {
+            metadata: ConnectionMetadata {
+                instance_id: "instance-one".to_owned(),
+                base_url: "http://127.0.0.1:18001".to_owned(),
+            },
+            token: String::new(),
+        };
+        let second = ActiveConnection {
+            metadata: ConnectionMetadata {
+                instance_id: "instance-two".to_owned(),
+                base_url: "http://127.0.0.1:18002".to_owned(),
+            },
+            token: String::new(),
+        };
+        let active = ActiveConnectionPool {
+            selected_instance_id: Some("instance-one".to_owned()),
+            connections: [
+                ("instance-one".to_owned(), first),
+                ("instance-two".to_owned(), second),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        save_connection_registry(&path, &active).expect("save registry");
+        let registry = load_connection_registry(&path).expect("load registry");
+        assert_eq!(
+            registry.selected_instance_id.as_deref(),
+            Some("instance-one")
+        );
+        assert_eq!(registry.connections.len(), 2);
+        assert_eq!(
+            registry
+                .connections
+                .get("instance-two")
+                .map(|metadata| metadata.base_url.as_str()),
+            Some("http://127.0.0.1:18002")
+        );
     }
 
     #[test]
@@ -1253,6 +1547,64 @@ mod tests {
             validate_job_input(&input).expect_err("invalid kind").code,
             "invalid_job_kind"
         );
+    }
+
+    #[test]
+    fn routes_each_job_request_to_its_instance_connection() {
+        fn job_server(job_id: &'static str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind job server");
+            let address = listener.local_addr().expect("job server address");
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept job request");
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).expect("read job request");
+                assert!(String::from_utf8_lossy(&request[..read])
+                    .starts_with(&format!("GET /api/v1/jobs/{job_id} HTTP/1.1")));
+                let body = format!(
+                    r#"{{"id":"{job_id}","client_request_id":"request-{job_id}","project_id":"project-1","scene_id":"scene-1","kind":"video_candidate","workflow_id":"h3-t2v-turbo-v1","status":"running","prompt_id":"prompt-1","progress":0.5,"error_code":null,"error_message":null,"status_detail":"running","created_at":"2026-09-13T00:00:00Z","updated_at":"2026-09-13T00:00:01Z","result_manifest":null}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("job response");
+            });
+            format!("http://{address}")
+        }
+
+        let client = client();
+        let first = ActiveConnection {
+            metadata: ConnectionMetadata {
+                instance_id: "instance-one".to_owned(),
+                base_url: job_server("job-one"),
+            },
+            token: "a".repeat(32),
+        };
+        let second = ActiveConnection {
+            metadata: ConnectionMetadata {
+                instance_id: "instance-two".to_owned(),
+                base_url: job_server("job-two"),
+            },
+            token: "b".repeat(32),
+        };
+        *client.active.write().expect("connection pool") = ActiveConnectionPool {
+            selected_instance_id: Some("instance-one".to_owned()),
+            connections: [
+                ("instance-one".to_owned(), first),
+                ("instance-two".to_owned(), second),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let (first_job, second_job) = tauri::async_runtime::block_on(async {
+            tokio::join!(
+                client.get_job_for("instance-one", "job-one"),
+                client.get_job_for("instance-two", "job-two")
+            )
+        });
+        assert_eq!(first_job.expect("first worker job").id, "job-one");
+        assert_eq!(second_job.expect("second worker job").id, "job-two");
     }
 
     #[test]

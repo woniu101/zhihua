@@ -8,6 +8,7 @@ use russh::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -55,6 +56,7 @@ struct TunnelConfiguration {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveTunnelConfigurationInput {
+    pub instance_id: String,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -76,6 +78,7 @@ pub enum TunnelPhase {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelStatus {
+    pub instance_id: Option<String>,
     pub configured: bool,
     pub phase: TunnelPhase,
     pub local_url: Option<String>,
@@ -103,40 +106,40 @@ impl client::Handler for FingerprintHandler {
 }
 
 pub struct SshTunnelManager {
-    metadata_path: PathBuf,
-    credential_user: String,
+    app_data_dir: PathBuf,
+    credential_user_prefix: String,
+    slots: RwLock<BTreeMap<String, Arc<TunnelSlot>>>,
+}
+
+struct TunnelSlot {
     status: Arc<RwLock<TunnelStatus>>,
     stop_sender: Mutex<Option<watch::Sender<bool>>>,
 }
 
 impl SshTunnelManager {
     pub fn new(app_data_dir: PathBuf) -> TunnelResult<Self> {
-        fs::create_dir_all(&app_data_dir).map_err(|error| {
+        fs::create_dir_all(app_data_dir.join("ssh-tunnels")).map_err(|error| {
             TunnelError::new("TUNNEL_CONFIG_IO", format!("无法创建隧道配置目录：{error}"))
         })?;
-        let manager = Self {
-            metadata_path: app_data_dir.join("ssh-tunnel.json"),
-            credential_user: CREDENTIAL_USER.to_owned(),
-            status: Arc::new(RwLock::new(TunnelStatus::default())),
-            stop_sender: Mutex::new(None),
-        };
-        let configured =
-            manager.read_configuration()?.is_some() && manager.private_key()?.is_some();
-        manager.write_status(|status| status.configured = configured);
-        Ok(manager)
+        Ok(Self {
+            app_data_dir,
+            credential_user_prefix: CREDENTIAL_USER.to_owned(),
+            slots: RwLock::new(BTreeMap::new()),
+        })
     }
 
     pub fn save_configuration(
         &self,
         input: SaveTunnelConfigurationInput,
     ) -> TunnelResult<TunnelStatus> {
+        let instance_id = validate_instance_id(&input.instance_id)?;
         validate_endpoint(&input.host, input.port)?;
         let username = required_text(input.username, "SSH 用户名")?;
         let fingerprint = normalize_fingerprint(input.host_key_fingerprint)?;
         decode_secret_key(&input.private_key, None).map_err(|_| {
             TunnelError::new("SSH_PRIVATE_KEY_INVALID", "SSH 私钥不是有效的 OpenSSH 私钥")
         })?;
-        self.credential_entry()?
+        self.credential_entry_for(&instance_id)?
             .set_password(&input.private_key)
             .map_err(|error| credential_error("保存", error))?;
         let configuration = TunnelConfiguration {
@@ -147,33 +150,42 @@ impl SshTunnelManager {
             remote_host: "127.0.0.1".to_owned(),
             remote_port: 8000,
         };
-        write_json_atomically(&self.metadata_path, &configuration)?;
-        self.write_status(|status| {
+        write_json_atomically(&self.metadata_path_for(&instance_id), &configuration)?;
+        let slot = self.slot_for(&instance_id)?;
+        write_slot_status(&slot.status, |status| {
             status.configured = true;
             status.last_error = None;
         });
-        self.status()
+        self.status_for(&instance_id)
     }
 
-    pub async fn start(&self) -> TunnelResult<TunnelStatus> {
-        let mut stop_guard = self.stop_sender.lock().await;
+    pub async fn start_for(&self, instance_id: &str) -> TunnelResult<TunnelStatus> {
+        let instance_id = validate_instance_id(instance_id)?;
+        self.ensure_profile(&instance_id)?;
+        let slot = self.slot_for(&instance_id)?;
+        let mut stop_guard = slot.stop_sender.lock().await;
         if stop_guard.is_some() {
-            return self.status();
+            return read_slot_status(&slot.status);
         }
-        let configuration = self
-            .read_configuration()?
-            .ok_or_else(|| TunnelError::new("TUNNEL_NOT_CONFIGURED", "尚未配置 SSH 隧道"))?;
-        let private_key = self.private_key()?.ok_or_else(|| {
+        let configuration = self.read_configuration_for(&instance_id)?.ok_or_else(|| {
+            TunnelError::new("TUNNEL_NOT_CONFIGURED", "目标实例尚未配置 SSH 隧道")
+        })?;
+        let private_key = self.private_key_for(&instance_id)?.ok_or_else(|| {
             TunnelError::new(
                 "SSH_PRIVATE_KEY_MISSING",
-                "Windows 凭据管理器中没有 SSH 私钥",
+                "Windows 凭据管理器中没有目标实例的 SSH 私钥",
             )
         })?;
-        self.set_phase(TunnelPhase::Connecting, None, None);
+        set_slot_phase(&slot.status, TunnelPhase::Connecting, None, None);
         let session = connect_session(&configuration, &private_key)
             .await
             .map_err(|error| {
-                self.set_phase(TunnelPhase::Error, None, Some(error.message.clone()));
+                set_slot_phase(
+                    &slot.status,
+                    TunnelPhase::Error,
+                    None,
+                    Some(error.message.clone()),
+                );
                 error
             })?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -185,11 +197,11 @@ impl SshTunnelManager {
             TunnelError::new("LOCAL_BIND_FAILED", format!("无法读取本机入口：{error}"))
         })?;
         let local_url = format!("http://127.0.0.1:{}", local_address.port());
-        self.set_phase(TunnelPhase::Connected, Some(local_url), None);
+        set_slot_phase(&slot.status, TunnelPhase::Connected, Some(local_url), None);
 
         let (stop_sender, stop_receiver) = watch::channel(false);
         *stop_guard = Some(stop_sender);
-        let status = self.status.clone();
+        let status = slot.status.clone();
         tauri::async_runtime::spawn(run_supervisor(
             listener,
             configuration,
@@ -198,25 +210,29 @@ impl SshTunnelManager {
             stop_receiver,
             status,
         ));
-        self.status()
+        read_slot_status(&slot.status)
     }
 
-    pub async fn stop(&self) -> TunnelResult<TunnelStatus> {
-        if let Some(sender) = self.stop_sender.lock().await.take() {
+    pub async fn stop_for(&self, instance_id: &str) -> TunnelResult<TunnelStatus> {
+        let instance_id = validate_instance_id(instance_id)?;
+        let slot = self.slot_for(&instance_id)?;
+        if let Some(sender) = slot.stop_sender.lock().await.take() {
             let _ = sender.send(true);
         }
-        self.set_phase(TunnelPhase::Stopped, None, None);
-        self.status()
+        set_slot_phase(&slot.status, TunnelPhase::Stopped, None, None);
+        read_slot_status(&slot.status)
     }
 
-    pub async fn read_service_token(&self) -> TunnelResult<String> {
-        let configuration = self
-            .read_configuration()?
-            .ok_or_else(|| TunnelError::new("TUNNEL_NOT_CONFIGURED", "尚未配置 SSH 隧道"))?;
-        let private_key = self.private_key()?.ok_or_else(|| {
+    pub async fn read_service_token_for(&self, instance_id: &str) -> TunnelResult<String> {
+        let instance_id = validate_instance_id(instance_id)?;
+        self.ensure_profile(&instance_id)?;
+        let configuration = self.read_configuration_for(&instance_id)?.ok_or_else(|| {
+            TunnelError::new("TUNNEL_NOT_CONFIGURED", "目标实例尚未配置 SSH 隧道")
+        })?;
+        let private_key = self.private_key_for(&instance_id)?.ok_or_else(|| {
             TunnelError::new(
                 "SSH_PRIVATE_KEY_MISSING",
-                "Windows 凭据管理器中没有 SSH 私钥",
+                "Windows 凭据管理器中没有目标实例的 SSH 私钥",
             )
         })?;
         let session = connect_session(&configuration, &private_key).await?;
@@ -273,18 +289,91 @@ impl SshTunnelManager {
         Ok(token.to_owned())
     }
 
-    pub fn status(&self) -> TunnelResult<TunnelStatus> {
-        self.status
-            .read()
-            .map(|status| status.clone())
-            .map_err(|_| TunnelError::new("TUNNEL_STATE_ERROR", "SSH 隧道状态锁已损坏"))
+    pub fn status_for(&self, instance_id: &str) -> TunnelResult<TunnelStatus> {
+        let instance_id = validate_instance_id(instance_id)?;
+        self.ensure_profile(&instance_id)?;
+        let slot = self.slot_for(&instance_id)?;
+        let configured = self.read_configuration_for(&instance_id)?.is_some()
+            && self.private_key_for(&instance_id)?.is_some();
+        write_slot_status(&slot.status, |status| status.configured = configured);
+        read_slot_status(&slot.status)
     }
 
-    fn read_configuration(&self) -> TunnelResult<Option<TunnelConfiguration>> {
-        if !self.metadata_path.exists() {
+    fn ensure_profile(&self, instance_id: &str) -> TunnelResult<()> {
+        let metadata_path = self.metadata_path_for(instance_id);
+        let mut migrated_legacy_configuration = false;
+        if !metadata_path.exists() {
+            let legacy_path = self.app_data_dir.join("ssh-tunnel.json");
+            if legacy_path.exists() {
+                let bytes = fs::read(&legacy_path).map_err(|error| {
+                    TunnelError::new("TUNNEL_CONFIG_IO", format!("无法读取旧隧道配置：{error}"))
+                })?;
+                let configuration: TunnelConfiguration =
+                    serde_json::from_slice(&bytes).map_err(|_| {
+                        TunnelError::new("TUNNEL_CONFIG_INVALID", "旧 SSH 隧道配置已损坏")
+                    })?;
+                write_json_atomically(&metadata_path, &configuration)?;
+                migrated_legacy_configuration = true;
+            }
+        }
+        if self.private_key_for(instance_id)?.is_none() {
+            match Entry::new(CREDENTIAL_SERVICE, &self.credential_user_prefix)
+                .map_err(|error| credential_error("打开", error))?
+                .get_password()
+            {
+                Ok(private_key) => self
+                    .credential_entry_for(instance_id)?
+                    .set_password(&private_key)
+                    .map_err(|error| credential_error("迁移", error))?,
+                Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(credential_error("读取", error)),
+            }
+        }
+        if migrated_legacy_configuration {
+            let _ = fs::remove_file(self.app_data_dir.join("ssh-tunnel.json"));
+        }
+        Ok(())
+    }
+
+    fn slot_for(&self, instance_id: &str) -> TunnelResult<Arc<TunnelSlot>> {
+        if let Some(slot) = self
+            .slots
+            .read()
+            .map_err(|_| TunnelError::new("TUNNEL_STATE_ERROR", "SSH 隧道池状态锁已损坏"))?
+            .get(instance_id)
+            .cloned()
+        {
+            return Ok(slot);
+        }
+        let slot = Arc::new(TunnelSlot {
+            status: Arc::new(RwLock::new(TunnelStatus {
+                instance_id: Some(instance_id.to_owned()),
+                ..TunnelStatus::default()
+            })),
+            stop_sender: Mutex::new(None),
+        });
+        self.slots
+            .write()
+            .map_err(|_| TunnelError::new("TUNNEL_STATE_ERROR", "SSH 隧道池状态锁已损坏"))?
+            .insert(instance_id.to_owned(), slot.clone());
+        Ok(slot)
+    }
+
+    fn metadata_path_for(&self, instance_id: &str) -> PathBuf {
+        self.app_data_dir
+            .join("ssh-tunnels")
+            .join(format!("{instance_id}.json"))
+    }
+
+    fn read_configuration_for(
+        &self,
+        instance_id: &str,
+    ) -> TunnelResult<Option<TunnelConfiguration>> {
+        let path = self.metadata_path_for(instance_id);
+        if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&self.metadata_path).map_err(|error| {
+        let bytes = fs::read(path).map_err(|error| {
             TunnelError::new("TUNNEL_CONFIG_IO", format!("无法读取隧道配置：{error}"))
         })?;
         serde_json::from_slice(&bytes)
@@ -292,34 +381,64 @@ impl SshTunnelManager {
             .map_err(|_| TunnelError::new("TUNNEL_CONFIG_INVALID", "SSH 隧道配置已损坏"))
     }
 
-    fn private_key(&self) -> TunnelResult<Option<String>> {
-        match self.credential_entry()?.get_password() {
+    fn private_key_for(&self, instance_id: &str) -> TunnelResult<Option<String>> {
+        match self.credential_entry_for(instance_id)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(credential_error("读取", error)),
         }
     }
 
-    fn credential_entry(&self) -> TunnelResult<Entry> {
-        Entry::new(CREDENTIAL_SERVICE, &self.credential_user)
-            .map_err(|error| credential_error("打开", error))
-    }
-
-    fn set_phase(&self, phase: TunnelPhase, local_url: Option<String>, last_error: Option<String>) {
-        self.write_status(|status| {
-            status.phase = phase;
-            status.local_url = local_url;
-            status.last_error = last_error;
-        });
-    }
-
-    fn write_status(&self, update: impl FnOnce(&mut TunnelStatus)) {
-        if let Ok(mut status) = self.status.write() {
-            update(&mut status);
-        }
+    fn credential_entry_for(&self, instance_id: &str) -> TunnelResult<Entry> {
+        Entry::new(
+            CREDENTIAL_SERVICE,
+            &format!("{}:{instance_id}", self.credential_user_prefix),
+        )
+        .map_err(|error| credential_error("打开", error))
     }
 }
 
+fn validate_instance_id(value: &str) -> TunnelResult<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".:_-".contains(character))
+    {
+        return Err(TunnelError::new(
+            "TUNNEL_INSTANCE_INVALID",
+            "算力实例 ID 格式无效",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn read_slot_status(status: &Arc<RwLock<TunnelStatus>>) -> TunnelResult<TunnelStatus> {
+    status
+        .read()
+        .map(|status| status.clone())
+        .map_err(|_| TunnelError::new("TUNNEL_STATE_ERROR", "SSH 隧道状态锁已损坏"))
+}
+
+fn write_slot_status(status: &Arc<RwLock<TunnelStatus>>, update: impl FnOnce(&mut TunnelStatus)) {
+    if let Ok(mut status) = status.write() {
+        update(&mut status);
+    }
+}
+
+fn set_slot_phase(
+    status: &Arc<RwLock<TunnelStatus>>,
+    phase: TunnelPhase,
+    local_url: Option<String>,
+    last_error: Option<String>,
+) {
+    write_slot_status(status, |status| {
+        status.phase = phase;
+        status.local_url = local_url;
+        status.last_error = last_error;
+    });
+}
 async fn connect_session(
     configuration: &TunnelConfiguration,
     private_key: &str,
@@ -550,6 +669,11 @@ fn write_json_atomically(path: &PathBuf, value: &impl Serialize) -> TunnelResult
     fs::write(&temporary, bytes).map_err(|error| {
         TunnelError::new("TUNNEL_CONFIG_IO", format!("无法写入隧道配置：{error}"))
     })?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| {
+            TunnelError::new("TUNNEL_CONFIG_IO", format!("无法更新隧道配置：{error}"))
+        })?;
+    }
     fs::rename(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         TunnelError::new("TUNNEL_CONFIG_IO", format!("无法保存隧道配置：{error}"))
@@ -563,7 +687,7 @@ mod tests {
 
     fn isolated_manager(app_data_dir: PathBuf) -> SshTunnelManager {
         let mut manager = SshTunnelManager::new(app_data_dir).expect("manager");
-        manager.credential_user = format!("test-private-key-{}", std::process::id());
+        manager.credential_user_prefix = format!("test-private-key-{}", std::process::id());
         manager
     }
 
@@ -576,6 +700,35 @@ mod tests {
         )
         .is_ok());
         assert!(normalize_fingerprint("ssh-ed25519 unknown".to_owned()).is_err());
+    }
+
+    #[test]
+    fn keeps_runtime_status_independent_for_each_instance() {
+        let directory = tempfile::tempdir().expect("temporary app data");
+        let manager = isolated_manager(directory.path().to_path_buf());
+        let first = manager.slot_for("instance-one").expect("first slot");
+        let second = manager.slot_for("instance-two").expect("second slot");
+        set_slot_phase(
+            &first.status,
+            TunnelPhase::Connected,
+            Some("http://127.0.0.1:18001".to_owned()),
+            None,
+        );
+        set_slot_phase(
+            &second.status,
+            TunnelPhase::Reconnecting,
+            None,
+            Some("waiting".to_owned()),
+        );
+
+        let first = read_slot_status(&first.status).expect("first status");
+        let second = read_slot_status(&second.status).expect("second status");
+        assert_eq!(first.instance_id.as_deref(), Some("instance-one"));
+        assert_eq!(first.phase, TunnelPhase::Connected);
+        assert_eq!(first.local_url.as_deref(), Some("http://127.0.0.1:18001"));
+        assert_eq!(second.instance_id.as_deref(), Some("instance-two"));
+        assert_eq!(second.phase, TunnelPhase::Reconnecting);
+        assert_eq!(second.last_error.as_deref(), Some("waiting"));
     }
 
     #[test]
@@ -594,6 +747,7 @@ mod tests {
         let manager = isolated_manager(directory.path().to_path_buf());
         manager
             .save_configuration(SaveTunnelConfigurationInput {
+                instance_id: "live-test".to_owned(),
                 host,
                 port,
                 username: "root".to_owned(),
@@ -602,7 +756,7 @@ mod tests {
             })
             .expect("save tunnel configuration");
         let result = tauri::async_runtime::block_on(async {
-            let status = manager.start().await?;
+            let status = manager.start_for("live-test").await?;
             let url = status
                 .local_url
                 .ok_or_else(|| TunnelError::new("TEST", "missing local URL"))?;
@@ -612,18 +766,18 @@ mod tests {
                 .json::<serde_json::Value>()
                 .await
                 .map_err(|error| TunnelError::new("TEST", error.to_string()))?;
-            manager.stop().await?;
+            manager.stop_for("live-test").await?;
             Ok::<_, TunnelError>(health)
         })
         .expect("native SSH tunnel contract");
         assert_eq!(result["service"], "zhihua-service");
         assert_eq!(result["version"], "0.3.0");
-        let _ = manager
-            .credential_entry()
-            .and_then(|entry| match entry.delete_credential() {
+        let _ = manager.credential_entry_for("live-test").and_then(|entry| {
+            match entry.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(error) => Err(credential_error("清理", error)),
-            });
+            }
+        });
     }
 
     #[test]
@@ -645,6 +799,7 @@ mod tests {
         let manager = SshTunnelManager::new(app_data_dir.clone()).expect("manager");
         manager
             .save_configuration(SaveTunnelConfigurationInput {
+                instance_id: instance_id.clone(),
                 host,
                 port,
                 username: "root".to_owned(),
@@ -654,14 +809,14 @@ mod tests {
             .expect("save tunnel configuration");
         let service = ServiceClient::new(app_data_dir.clone()).expect("service client");
         let result = tauri::async_runtime::block_on(async {
-            let status = manager.start().await?;
+            let status = manager.start_for(&instance_id).await?;
             let local_url = status
                 .local_url
                 .ok_or_else(|| TunnelError::new("TEST", "missing local URL"))?;
-            let token = manager.read_service_token().await?;
+            let token = manager.read_service_token_for(&instance_id).await?;
             service
                 .save(SaveServiceConnectionInput {
-                    instance_id,
+                    instance_id: instance_id.clone(),
                     base_url: local_url,
                     token,
                 })
@@ -682,7 +837,7 @@ mod tests {
                 .await
                 .map_err(|error| TunnelError::new(error.code, error.message))?;
             let _ = fs::remove_file(smoke_path);
-            manager.stop().await?;
+            manager.stop_for(&instance_id).await?;
             Ok::<_, TunnelError>((probe, uploaded))
         })
         .expect("provision desktop connection");

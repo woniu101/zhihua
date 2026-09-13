@@ -62,6 +62,7 @@ async fn configure_desktop_for_running_instance() {
     let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
     tunnel
         .save_configuration(SaveTunnelConfigurationInput {
+            instance_id: instance_id.clone(),
             host: required("ZHIHUA_TEST_SSH_HOST"),
             port: required("ZHIHUA_TEST_SSH_PORT")
                 .parse::<u16>()
@@ -71,10 +72,13 @@ async fn configure_desktop_for_running_instance() {
             private_key,
         })
         .expect("save SSH tunnel configuration");
-    let tunnel_status = tunnel.start().await.expect("start SSH tunnel");
+    let tunnel_status = tunnel
+        .start_for(&instance_id)
+        .await
+        .expect("start SSH tunnel");
     let local_url = tunnel_status.local_url.expect("local tunnel URL");
     let token = tunnel
-        .read_service_token()
+        .read_service_token_for(&instance_id)
         .await
         .expect("read remote service token");
 
@@ -82,7 +86,7 @@ async fn configure_desktop_for_running_instance() {
     service.clear().expect("clear stale service connection");
     service
         .save(SaveServiceConnectionInput {
-            instance_id,
+            instance_id: instance_id.clone(),
             base_url: local_url,
             token,
         })
@@ -91,7 +95,10 @@ async fn configure_desktop_for_running_instance() {
     assert!(probe.compatible);
     assert!(probe.comfyui_ready);
     assert!(probe.available_workflows.len() >= 11);
-    tunnel.stop().await.expect("stop validation tunnel");
+    tunnel
+        .stop_for(&instance_id)
+        .await
+        .expect("stop validation tunnel");
 }
 
 #[tokio::test]
@@ -99,10 +106,14 @@ async fn configure_desktop_for_running_instance() {
 async fn generate_image_then_video_through_desktop_service_client() {
     let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
     let output_dir = PathBuf::from(required("ZHIHUA_TEST_OUTPUT_DIR"));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
     std::fs::create_dir_all(&output_dir).expect("create validation output directory");
 
     let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
-    let tunnel_status = tunnel.start().await.expect("start SSH tunnel");
+    let tunnel_status = tunnel
+        .start_for(&instance_id)
+        .await
+        .expect("start SSH tunnel");
     let service = ServiceClient::new(app_data_dir).expect("initialize service client");
     service
         .retarget(tunnel_status.local_url.expect("local tunnel URL"))
@@ -198,7 +209,10 @@ async fn generate_image_then_video_through_desktop_service_client() {
         .delete_input(&uploaded.input_id)
         .await
         .expect("delete uploaded first frame");
-    tunnel.stop().await.expect("stop validation tunnel");
+    tunnel
+        .stop_for(&instance_id)
+        .await
+        .expect("stop validation tunnel");
 }
 
 #[tokio::test]
@@ -206,6 +220,7 @@ async fn generate_image_then_video_through_desktop_service_client() {
 async fn generate_h3_native_audio_comparison() {
     let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
     let output_dir = PathBuf::from(required("ZHIHUA_TEST_OUTPUT_DIR"));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
     let image_path = output_dir.join("qwen-lightning-1344x768.png");
     assert!(
         image_path.is_file(),
@@ -214,7 +229,10 @@ async fn generate_h3_native_audio_comparison() {
     std::fs::create_dir_all(&output_dir).expect("create validation output directory");
 
     let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
-    let tunnel_status = tunnel.start().await.expect("start SSH tunnel");
+    let tunnel_status = tunnel
+        .start_for(&instance_id)
+        .await
+        .expect("start SSH tunnel");
     let service = ServiceClient::new(app_data_dir).expect("initialize service client");
     service
         .retarget(tunnel_status.local_url.expect("local tunnel URL"))
@@ -287,5 +305,8 @@ async fn generate_h3_native_audio_comparison() {
             .unwrap_or_else(|error| panic!("download H3 {label}: {error:?}"));
         let _ = service.delete_input(&uploaded.input_id).await;
     }
-    tunnel.stop().await.expect("stop validation tunnel");
+    tunnel
+        .stop_for(&instance_id)
+        .await
+        .expect("stop validation tunnel");
 }

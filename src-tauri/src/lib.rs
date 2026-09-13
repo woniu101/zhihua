@@ -845,22 +845,42 @@ fn save_ssh_tunnel_configuration(
 #[tauri::command]
 async fn start_ssh_tunnel(
     manager: State<'_, SshTunnelManager>,
+    provider: State<'_, CompShareProvider>,
 ) -> Result<TunnelStatus, TunnelError> {
-    manager.start().await
+    let instance_id = tunnel_bound_instance_id(&provider)?;
+    manager.start_for(&instance_id).await
 }
 
 #[tauri::command]
 async fn stop_ssh_tunnel(
     manager: State<'_, SshTunnelManager>,
+    provider: State<'_, CompShareProvider>,
 ) -> Result<TunnelStatus, TunnelError> {
-    manager.stop().await
+    let instance_id = tunnel_bound_instance_id(&provider)?;
+    manager.stop_for(&instance_id).await
 }
 
 #[tauri::command]
 fn get_ssh_tunnel_status(
     manager: State<'_, SshTunnelManager>,
+    provider: State<'_, CompShareProvider>,
 ) -> Result<TunnelStatus, TunnelError> {
-    manager.status()
+    let instance_id = tunnel_bound_instance_id(&provider)?;
+    manager.status_for(&instance_id)
+}
+
+fn tunnel_bound_instance_id(provider: &CompShareProvider) -> Result<String, TunnelError> {
+    provider
+        .configuration()
+        .map_err(|error| TunnelError {
+            code: error.code,
+            message: error.message,
+        })?
+        .bound_instance_id
+        .ok_or_else(|| TunnelError {
+            code: "TUNNEL_INSTANCE_NOT_BOUND".to_owned(),
+            message: "尚未绑定优云智算实例".to_owned(),
+        })
 }
 
 async fn connect_service_through_tunnel_impl(
@@ -884,30 +904,40 @@ async fn connect_service_through_tunnel_impl(
         Some("正在建立 SSH 隧道并检查知画服务"),
     );
     let result = async {
-        let tunnel = manager.start().await.map_err(|error| error.message)?;
+        let tunnel = manager
+            .start_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
         let local_url = tunnel
             .local_url
             .ok_or_else(|| "SSH 隧道没有返回本机服务地址".to_owned())?;
-        let connection_info = service.info().map_err(|error| error.message)?;
+        let connection_info = service
+            .info_for(&instance_id)
+            .map_err(|error| error.message)?;
         if connection_info.configured
             && connection_info.credential_stored
             && connection_info.instance_id.as_deref() == Some(instance_id.as_str())
         {
-            service.retarget(local_url).map_err(|error| error.message)?;
+            service
+                .retarget_for(&instance_id, local_url)
+                .map_err(|error| error.message)?;
         } else {
             let token = manager
-                .read_service_token()
+                .read_service_token_for(&instance_id)
                 .await
                 .map_err(|error| error.message)?;
             service
-                .save(SaveServiceConnectionInput {
+                .save_for(SaveServiceConnectionInput {
                     instance_id: instance_id.clone(),
                     base_url: local_url,
                     token,
                 })
                 .map_err(|error| error.message)?;
         }
-        service.probe().await.map_err(|error| error.message)
+        service
+            .probe_for(&instance_id)
+            .await
+            .map_err(|error| error.message)
     }
     .await;
 
@@ -1697,7 +1727,7 @@ async fn submit_service_job(
             let _ = compute.release_worker_lease(&request_id);
             return Err(queue_service_error(error));
         }
-        match service.submit_job(input).await {
+        match service.submit_job_for(&primary.instance_id, input).await {
             Ok(job) => {
                 queue.record_remote(&job).map_err(queue_service_error)?;
                 Ok(job)
@@ -1725,7 +1755,8 @@ async fn get_service_job(
     lifecycle: State<'_, ComputeLifecycle>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
-    let job = service.get_job(&job_id).await?;
+    let instance_id = remote_job_instance_id(&queue, &job_id)?;
+    let job = service.get_job_for(&instance_id, &job_id).await?;
     let local = queue.sync(&job).map_err(queue_service_error)?;
     if is_terminal_service_job(&job) {
         compute
@@ -1760,7 +1791,8 @@ async fn cancel_service_job(
     lifecycle: State<'_, ComputeLifecycle>,
     job_id: String,
 ) -> Result<ServiceJob, ServiceConnectionError> {
-    let job = service.cancel_job(&job_id).await?;
+    let instance_id = remote_job_instance_id(&queue, &job_id)?;
+    let job = service.cancel_job_for(&instance_id, &job_id).await?;
     queue.sync(&job).map_err(queue_service_error)?;
     compute
         .release_worker_lease(&job.client_request_id)
@@ -1802,6 +1834,23 @@ fn worker_instance_id(worker_id: &str) -> Result<&str, ServiceConnectionError> {
         })
 }
 
+fn remote_job_instance_id(
+    queue: &JobQueueStorage,
+    remote_job_id: &str,
+) -> Result<String, ServiceConnectionError> {
+    let local = queue
+        .find_by_remote(remote_job_id)
+        .map_err(queue_service_error)?;
+    let worker_id = local
+        .worker_id
+        .as_deref()
+        .ok_or_else(|| ServiceConnectionError {
+            code: "compute_control_error",
+            message: "远端任务缺少持久化的 worker 分配记录".to_owned(),
+        })?;
+    worker_instance_id(worker_id).map(str::to_owned)
+}
+
 #[tauri::command]
 fn plan_generation_compute_pool(input: ComputePoolPlanInput) -> ComputePoolPlan {
     plan_compute_pool(input)
@@ -1826,9 +1875,11 @@ async fn delete_service_input(
 #[tauri::command]
 async fn download_service_artifact(
     service: State<'_, ServiceClient>,
+    queue: State<'_, JobQueueStorage>,
     input: DownloadServiceArtifactInput,
 ) -> Result<ServiceArtifactDownload, ServiceConnectionError> {
-    service.download_artifact(input).await
+    let instance_id = remote_job_instance_id(&queue, &input.job_id)?;
+    service.download_artifact_for(&instance_id, input).await
 }
 
 #[tauri::command]
@@ -1912,8 +1963,10 @@ async fn download_completed_job(
     let project = projects
         .get_project(&input.project_id)
         .map_err(|error| error.to_string())?;
+    let instance_id =
+        remote_job_instance_id(&queue, &input.job_id).map_err(|error| error.message)?;
     let job = service
-        .get_job(&input.job_id)
+        .get_job_for(&instance_id, &input.job_id)
         .await
         .map_err(|error| error.message)?;
     if job.project_id != project.id {
@@ -1992,13 +2045,16 @@ async fn download_completed_job(
             .join(safe_path_component(&job.id)?)
             .join(&filename);
         let downloaded = service
-            .download_artifact(DownloadServiceArtifactInput {
-                job_id: job.id.clone(),
-                artifact_id: artifact.artifact_id.clone(),
-                destination_path: destination.to_string_lossy().into_owned(),
-                expected_size_bytes: artifact.size_bytes,
-                expected_sha256: artifact.sha256.clone(),
-            })
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: job.id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                    destination_path: destination.to_string_lossy().into_owned(),
+                    expected_size_bytes: artifact.size_bytes,
+                    expected_sha256: artifact.sha256.clone(),
+                },
+            )
             .await
             .map_err(|error| error.message)?;
         candidates.push(
@@ -2077,8 +2133,10 @@ async fn download_completed_image_job(
     let project = projects
         .get_project(&input.project_id)
         .map_err(|error| error.to_string())?;
+    let instance_id =
+        remote_job_instance_id(&queue, &input.job_id).map_err(|error| error.message)?;
     let job = service
-        .get_job(&input.job_id)
+        .get_job_for(&instance_id, &input.job_id)
         .await
         .map_err(|error| error.message)?;
     if job.project_id != project.id {
@@ -2117,13 +2175,16 @@ async fn download_completed_image_job(
             .join(safe_path_component(&job.id)?)
             .join(filename);
         let downloaded = service
-            .download_artifact(DownloadServiceArtifactInput {
-                job_id: job.id.clone(),
-                artifact_id: artifact.artifact_id,
-                destination_path: temporary.to_string_lossy().into_owned(),
-                expected_size_bytes: artifact.size_bytes,
-                expected_sha256: artifact.sha256,
-            })
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: job.id.clone(),
+                    artifact_id: artifact.artifact_id,
+                    destination_path: temporary.to_string_lossy().into_owned(),
+                    expected_size_bytes: artifact.size_bytes,
+                    expected_sha256: artifact.sha256,
+                },
+            )
             .await
             .map_err(|error| error.message)?;
         let result = assets
@@ -2158,6 +2219,8 @@ async fn download_completed_enhancement(
     let project = projects
         .get_project(&input.project_id)
         .map_err(|error| error.to_string())?;
+    let instance_id =
+        remote_job_instance_id(&queue, &input.job_id).map_err(|error| error.message)?;
     let source = generations
         .find(&input.source_candidate_id)
         .map_err(|error| error.message)?;
@@ -2174,7 +2237,7 @@ async fn download_completed_enhancement(
         return Err("正式版本已经变化，已停止保存旧任务的 1080p 增强版。".to_owned());
     }
     let job = service
-        .get_job(&input.job_id)
+        .get_job_for(&instance_id, &input.job_id)
         .await
         .map_err(|error| error.message)?;
     if job.project_id != project.id || job.scene_id != scene.id || job.kind != "video_upscale" {
@@ -2216,13 +2279,16 @@ async fn download_completed_enhancement(
             .join(safe_path_component(&job.id)?)
             .join(&filename);
         let downloaded = service
-            .download_artifact(DownloadServiceArtifactInput {
-                job_id: job.id.clone(),
-                artifact_id: artifact.artifact_id.clone(),
-                destination_path: destination.to_string_lossy().into_owned(),
-                expected_size_bytes: artifact.size_bytes,
-                expected_sha256: artifact.sha256.clone(),
-            })
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: job.id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                    destination_path: destination.to_string_lossy().into_owned(),
+                    expected_size_bytes: artifact.size_bytes,
+                    expected_sha256: artifact.sha256.clone(),
+                },
+            )
             .await
             .map_err(|error| error.message)?;
         enhanced_versions.push(
@@ -2532,8 +2598,11 @@ pub fn run() {
                     }
                 }
                 let manager = app_handle.state::<SshTunnelManager>();
-                let configured = manager
-                    .status()
+                let configured = comp_share
+                    .configuration()
+                    .ok()
+                    .and_then(|configuration| configuration.bound_instance_id)
+                    .and_then(|instance_id| manager.status_for(&instance_id).ok())
                     .map(|status| status.configured)
                     .unwrap_or(false);
                 if configured {
