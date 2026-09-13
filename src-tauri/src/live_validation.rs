@@ -1,5 +1,6 @@
 use crate::comp_share::{
-    BindCompShareInstanceInput, CompSharePowerState, CompShareProvider, CompShareRunningMode,
+    BindCompShareInstanceInput, CompShareInstanceLocator, CompSharePowerState, CompShareProvider,
+    CompShareRunningMode, CompShareStartMode, ListCompShareInstancesInput,
     SaveCompShareCredentialsInput,
 };
 use crate::service::{
@@ -170,6 +171,148 @@ async fn configure_desktop_worker_connection() {
         .stop_for(&instance_id)
         .await
         .expect("stop validation tunnel");
+}
+
+#[tokio::test]
+#[ignore = "starts one authorized instance without GPU, provisions its SSH key, probes the service, and stops it"]
+async fn provision_desktop_worker_connection_without_gpu() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+    let provider = CompShareProvider::new(app_data_dir.clone()).expect("initialize CompShare");
+    let platform = provider
+        .list_instances(ListCompShareInstancesInput {
+            region: None,
+            zone: None,
+        })
+        .await
+        .expect("list instances")
+        .into_iter()
+        .find(|instance| instance.instance_id == instance_id)
+        .expect("target instance exists");
+    let locator = CompShareInstanceLocator {
+        instance_id: instance_id.clone(),
+        region: platform.region,
+        zone: platform.zone,
+        project_id: platform.project_id,
+    };
+    assert!(
+        platform.support_without_gpu_start,
+        "instance supports no-GPU start"
+    );
+    if platform.state != CompSharePowerState::Stopped {
+        provider
+            .stop_instance_for(locator.clone())
+            .await
+            .expect("stop target before validation");
+        crate::wait_for_instance_state_for(
+            &provider,
+            &locator,
+            CompSharePowerState::Stopped,
+            None,
+            std::time::Duration::from_secs(180),
+        )
+        .await
+        .expect("wait for stopped target");
+    }
+
+    let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
+    let service = ServiceClient::new(app_data_dir).expect("initialize service client");
+    let validation = async {
+        provider
+            .start_instance_for(locator.clone(), CompShareStartMode::NoGpu)
+            .await
+            .map_err(|error| error.message)?;
+        provider
+            .update_stop_scheduler_for(locator.clone(), chrono::Utc::now().timestamp() + 10 * 60)
+            .await
+            .map_err(|error| error.message)?;
+        let running = crate::wait_for_instance_state_for(
+            &provider,
+            &locator,
+            CompSharePowerState::Running,
+            Some(CompShareRunningMode::NoGpu),
+            std::time::Duration::from_secs(180),
+        )
+        .await?;
+        if running.gpu_count != Some(0) {
+            return Err(format!(
+                "instance unexpectedly reported {:?} GPUs in no-GPU validation",
+                running.gpu_count
+            ));
+        }
+
+        let access = provider
+            .ssh_access_for(locator.clone())
+            .await
+            .map_err(|error| error.message)?;
+        tunnel
+            .bootstrap_configuration(
+                &instance_id,
+                &access.host,
+                access.port,
+                &access.username,
+                &access.password,
+            )
+            .await
+            .map_err(|error| error.message)?;
+        tunnel
+            .ensure_remote_service_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+        let status = tunnel
+            .start_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+        let token = tunnel
+            .read_service_token_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+        service
+            .save_for(SaveServiceConnectionInput {
+                instance_id: instance_id.clone(),
+                base_url: status.local_url.expect("local tunnel URL"),
+                token,
+            })
+            .map_err(|error| error.message)?;
+        let probe = service
+            .probe_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+        if !probe.compatible {
+            return Err("service API is incompatible".to_owned());
+        }
+        Ok::<_, String>(probe)
+    }
+    .await;
+
+    let cleanup = async {
+        let _ = tunnel.stop_for(&instance_id).await;
+        provider
+            .stop_instance_for(locator.clone())
+            .await
+            .map_err(|error| error.message)?;
+        crate::wait_for_instance_state_for(
+            &provider,
+            &locator,
+            CompSharePowerState::Stopped,
+            None,
+            std::time::Duration::from_secs(180),
+        )
+        .await
+        .map(|_| ())
+    }
+    .await;
+    if let Err(error) = cleanup {
+        panic!(
+            "failed to stop target after validation: {error}; validation result: {:?}",
+            validation.as_ref().err()
+        );
+    }
+    let probe = validation.expect("automatic no-GPU SSH provisioning succeeds");
+    assert!(
+        !probe.comfyui_ready,
+        "no-GPU mode does not report generation ready"
+    );
 }
 
 #[tokio::test]

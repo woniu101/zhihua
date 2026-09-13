@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use keyring::Entry;
 use russh::{
     client,
@@ -7,6 +8,7 @@ use russh::{
     ChannelMsg, Disconnect,
 };
 use serde::{Deserialize, Serialize};
+use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use std::{
     collections::BTreeMap,
     fs,
@@ -90,6 +92,35 @@ struct FingerprintHandler {
     expected: String,
 }
 
+#[derive(Clone)]
+struct BootstrapFingerprintHandler {
+    observed: Arc<RwLock<Option<String>>>,
+}
+
+impl client::Handler for BootstrapFingerprintHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let actual = server_public_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+        let Ok(mut observed) = self.observed.write() else {
+            return Ok(false);
+        };
+        match observed.as_deref() {
+            Some(previous) => Ok(previous == actual),
+            None => {
+                *observed = Some(actual);
+                Ok(true)
+            }
+        }
+    }
+}
+
 impl client::Handler for FingerprintHandler {
     type Error = russh::Error;
 
@@ -157,6 +188,144 @@ impl SshTunnelManager {
             status.last_error = None;
         });
         self.status_for(&instance_id)
+    }
+
+    pub(crate) async fn bootstrap_configuration(
+        &self,
+        instance_id: &str,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+    ) -> TunnelResult<TunnelStatus> {
+        let instance_id = validate_instance_id(instance_id)?;
+        validate_endpoint(host, port)?;
+        let username = required_text(username.to_owned(), "SSH 用户名")?;
+        if password.is_empty() || password.len() > 4096 {
+            return Err(TunnelError::new(
+                "SSH_PASSWORD_INVALID",
+                "平台返回的 SSH 临时密码无效",
+            ));
+        }
+
+        let mut private_key = {
+            let mut rng = rand::rng();
+            PrivateKey::random(&mut rng, Algorithm::Ed25519).map_err(|error| {
+                TunnelError::new(
+                    "SSH_KEY_GENERATION_FAILED",
+                    format!("无法生成客户端专用 SSH 密钥：{error}"),
+                )
+            })?
+        };
+        private_key.set_comment("zhihua-desktop");
+        let public_key = private_key.public_key().to_openssh().map_err(|error| {
+            TunnelError::new(
+                "SSH_KEY_GENERATION_FAILED",
+                format!("无法编码客户端 SSH 公钥：{error}"),
+            )
+        })?;
+        let private_key = private_key.to_openssh(LineEnding::LF).map_err(|error| {
+            TunnelError::new(
+                "SSH_KEY_GENERATION_FAILED",
+                format!("无法编码客户端 SSH 私钥：{error}"),
+            )
+        })?;
+
+        let observed = Arc::new(RwLock::new(None));
+        let config = client::Config {
+            nodelay: true,
+            inactivity_timeout: Some(Duration::from_secs(45)),
+            ..Default::default()
+        };
+        let mut session = tokio::time::timeout(
+            Duration::from_secs(20),
+            client::connect(
+                Arc::new(config),
+                (host.trim(), port),
+                BootstrapFingerprintHandler {
+                    observed: observed.clone(),
+                },
+            ),
+        )
+        .await
+        .map_err(|_| TunnelError::new("SSH_CONNECT_TIMEOUT", "连接实例 SSH 超时"))?
+        .map_err(|error| {
+            TunnelError::new("SSH_CONNECT_FAILED", format!("SSH 连接失败：{error}"))
+        })?;
+        let authentication = session
+            .authenticate_password(username.clone(), password)
+            .await
+            .map_err(|error| {
+                TunnelError::new(
+                    "SSH_PASSWORD_AUTH_FAILED",
+                    format!("实例临时密码认证失败：{error}"),
+                )
+            })?;
+        if !authentication.success() {
+            return Err(TunnelError::new(
+                "SSH_PASSWORD_AUTH_FAILED",
+                "实例临时密码认证未通过",
+            ));
+        }
+
+        let public_key_payload = BASE64_STANDARD.encode(public_key.as_bytes());
+        let command = authorized_key_install_command(&public_key_payload);
+        let mut channel = session.channel_open_session().await.map_err(|error| {
+            TunnelError::new(
+                "SSH_COMMAND_FAILED",
+                format!("无法打开 SSH 配置通道：{error}"),
+            )
+        })?;
+        channel.exec(true, command).await.map_err(|error| {
+            TunnelError::new(
+                "SSH_COMMAND_FAILED",
+                format!("无法安装客户端 SSH 公钥：{error}"),
+            )
+        })?;
+        let mut error_output = Vec::new();
+        let mut exit_status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::ExtendedData { data, .. } => {
+                    if error_output.len() < 2048 {
+                        let remaining = 2048 - error_output.len();
+                        error_output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status: value } => exit_status = Some(value),
+                _ => {}
+            }
+        }
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "bootstrap complete", "en")
+            .await;
+        if exit_status != Some(0) {
+            let detail = String::from_utf8_lossy(&error_output).trim().to_owned();
+            return Err(TunnelError::new(
+                "SSH_KEY_INSTALL_FAILED",
+                if detail.is_empty() {
+                    "实例未能保存客户端 SSH 公钥".to_owned()
+                } else {
+                    format!("实例未能保存客户端 SSH 公钥：{detail}")
+                },
+            ));
+        }
+        let fingerprint = observed
+            .read()
+            .map_err(|_| TunnelError::new("TUNNEL_STATE_ERROR", "SSH 指纹状态锁已损坏"))?
+            .clone()
+            .ok_or_else(|| {
+                TunnelError::new("SSH_FINGERPRINT_MISSING", "实例没有返回 SSH 主机指纹")
+            })?;
+
+        self.save_configuration(SaveTunnelConfigurationInput {
+            instance_id,
+            host: host.trim().to_owned(),
+            port,
+            username,
+            host_key_fingerprint: fingerprint,
+            private_key: private_key.to_string(),
+        })
     }
 
     pub async fn start_for(&self, instance_id: &str) -> TunnelResult<TunnelStatus> {
@@ -289,6 +458,63 @@ impl SshTunnelManager {
         Ok(token.to_owned())
     }
 
+    pub async fn ensure_remote_service_for(&self, instance_id: &str) -> TunnelResult<()> {
+        const START_SERVICE: &str = "set -eu; cfg=/usr/supervisor/supervisord.conf; test -f \"$cfg\"; test -x /root/zhihua-service/.venv/bin/python; if ! supervisorctl -c \"$cfg\" pid >/dev/null 2>&1; then supervisord -c \"$cfg\"; fi; supervisorctl -c \"$cfg\" reread >/dev/null; supervisorctl -c \"$cfg\" update >/dev/null; state=$(supervisorctl -c \"$cfg\" status zhihua-service | awk '{print $2}'); if [ \"$state\" != RUNNING ]; then supervisorctl -c \"$cfg\" start zhihua-service >/dev/null; fi";
+        let instance_id = validate_instance_id(instance_id)?;
+        self.ensure_profile(&instance_id)?;
+        let configuration = self.read_configuration_for(&instance_id)?.ok_or_else(|| {
+            TunnelError::new("TUNNEL_NOT_CONFIGURED", "目标实例尚未配置 SSH 隧道")
+        })?;
+        let private_key = self.private_key_for(&instance_id)?.ok_or_else(|| {
+            TunnelError::new(
+                "SSH_PRIVATE_KEY_MISSING",
+                "Windows 凭据管理器中没有目标实例的 SSH 私钥",
+            )
+        })?;
+        let session = connect_session(&configuration, &private_key).await?;
+        let mut channel = session.channel_open_session().await.map_err(|error| {
+            TunnelError::new(
+                "REMOTE_SERVICE_START_FAILED",
+                format!("无法打开远端服务管理通道：{error}"),
+            )
+        })?;
+        channel.exec(true, START_SERVICE).await.map_err(|error| {
+            TunnelError::new(
+                "REMOTE_SERVICE_START_FAILED",
+                format!("无法启动远端知画服务：{error}"),
+            )
+        })?;
+        let mut error_output = Vec::new();
+        let mut exit_status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::ExtendedData { data, .. } => {
+                    if error_output.len() + data.len() <= 4096 {
+                        error_output.extend_from_slice(&data);
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status: value } => exit_status = Some(value),
+                _ => {}
+            }
+        }
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "service ready", "en")
+            .await;
+        if exit_status != Some(0) {
+            let detail = String::from_utf8_lossy(&error_output);
+            let detail = detail.trim();
+            return Err(TunnelError::new(
+                "REMOTE_SERVICE_START_FAILED",
+                if detail.is_empty() {
+                    "远端知画服务未能启动，请检查镜像中的 Supervisor 配置".to_owned()
+                } else {
+                    format!("远端知画服务未能启动：{detail}")
+                },
+            ));
+        }
+        Ok(())
+    }
+
     pub fn status_for(&self, instance_id: &str) -> TunnelResult<TunnelStatus> {
         let instance_id = validate_instance_id(instance_id)?;
         self.ensure_profile(&instance_id)?;
@@ -412,6 +638,15 @@ fn validate_instance_id(value: &str) -> TunnelResult<String> {
         ));
     }
     Ok(value.to_owned())
+}
+
+fn authorized_key_install_command(public_key_base64: &str) -> String {
+    debug_assert!(public_key_base64
+        .bytes()
+        .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'+' | b'/' | b'=')));
+    format!(
+        "set -eu; umask 077; mkdir -p \"$HOME/.ssh\"; chmod 700 \"$HOME/.ssh\"; touch \"$HOME/.ssh/authorized_keys\"; key=$(printf '%s' '{public_key_base64}' | base64 -d); grep -qxF -- \"$key\" \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' \"$key\" >> \"$HOME/.ssh/authorized_keys\"; chmod 600 \"$HOME/.ssh/authorized_keys\""
+    )
 }
 
 fn read_slot_status(status: &Arc<RwLock<TunnelStatus>>) -> TunnelResult<TunnelStatus> {
@@ -700,6 +935,14 @@ mod tests {
         )
         .is_ok());
         assert!(normalize_fingerprint("ssh-ed25519 unknown".to_owned()).is_err());
+    }
+
+    #[test]
+    fn builds_authorized_key_command_from_shell_safe_base64() {
+        let command = authorized_key_install_command("c3NoLWVkMjU1MTkgQUJDRA==");
+        assert!(command.contains("base64 -d"));
+        assert!(command.contains("grep -qxF"));
+        assert!(!command.contains("ssh-ed25519"));
     }
 
     #[test]

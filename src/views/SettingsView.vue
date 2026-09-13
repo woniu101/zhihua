@@ -553,6 +553,31 @@ async function checkManagedWorker(item: ManagedComputeInstance) {
   }
 }
 
+async function provisionManagedWorkerConnection(item: ManagedComputeInstance) {
+  busy.value = true;
+  setComputeNotice(
+    `正在为“${item.name ?? item.instanceId}”配置安全连接；如实例已关机，只会无卡启动……`,
+    "neutral",
+  );
+  try {
+    const result = await serviceRepository.provisionWorkerConnection(item.instanceId);
+    if (!result) throw new Error("知画服务没有返回连接结果。");
+    if (item.instanceId === computeConfiguration.value?.boundInstanceId) probe.value = result;
+    await refreshCompute();
+    setComputeNotice(
+      result.comfyuiReady
+        ? `“${item.name ?? item.instanceId}”的安全连接已配置，GPU 生成服务可用。`
+        : `“${item.name ?? item.instanceId}”的安全连接已配置，实例保持无卡维护模式。`,
+      "success",
+    );
+  } catch (error) {
+    setComputeNotice(normalizeConnectionFailure(error).message, "error");
+    await refreshCompute();
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function prepareManagedWorker(item: ManagedComputeInstance) {
   busy.value = true;
   setComputeNotice(`正在启动“${item.name ?? item.instanceId}”并准备生成服务……`, "neutral");
@@ -770,7 +795,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
                   <div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ item.gpuType ? `RTX ${item.gpuType}` : 'GPU 规格待查询' }} · {{ managementLabel(item) }}　<em class="worker-readiness" :class="workerReadinessTone(item.instanceId)">● {{ workerReadinessLabel(item.instanceId) }}</em></small></div>
                   <strong>{{ managedModeLabel(item) }}</strong>
                 </div>
-                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.ownership === 'user_managed' && item.role === 'user_managed'" class="mini-btn create" type="button" :disabled="busy || Boolean(item.missingSince) || ['unknown', 'terminating', 'terminated', 'error'].includes(item.lifecycleState)" @click="setUserWorkerEnabled(item, true)">加入批量算力</button><button v-if="item.ownership === 'user_managed' && (item.role === 'elastic' || item.role === 'test')" class="mini-btn" type="button" :disabled="busy || item.runningMode !== 'stopped' || Boolean(item.currentJobId)" title="关机且没有任务时才能移出" @click="setUserWorkerEnabled(item, false)">移出批量算力</button><button v-if="item.role !== 'user_managed' && item.runningMode !== 'gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="prepareManagedWorker(item)">准备 GPU</button><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
+                <div class="instance-row-foot"><span>{{ formatReleaseTime(item.releaseTime) }}</span><span v-if="item.missingSince" class="danger-text">平台暂未返回，等待对账</span><div><button v-if="item.ownership === 'user_managed' && item.role === 'user_managed'" class="mini-btn create" type="button" :disabled="busy || Boolean(item.missingSince) || ['unknown', 'terminating', 'terminated', 'error'].includes(item.lifecycleState)" @click="setUserWorkerEnabled(item, true)">加入批量算力</button><button v-if="item.ownership === 'user_managed' && (item.role === 'elastic' || item.role === 'test')" class="mini-btn" type="button" :disabled="busy || item.runningMode !== 'stopped' || Boolean(item.currentJobId)" title="关机且没有任务时才能移出" @click="setUserWorkerEnabled(item, false)">移出批量算力</button><button v-if="item.role !== 'user_managed' && workerReadiness[item.instanceId]?.state !== 'ready'" class="mini-btn create" type="button" :disabled="busy || item.lifecycleState === 'unknown'" title="已关机时仅无卡启动，不产生 GPU 费用" @click="provisionManagedWorkerConnection(item)">配置连接</button><button v-if="item.role !== 'user_managed' && item.runningMode !== 'gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="prepareManagedWorker(item)">准备 GPU</button><button v-if="item.runningMode === 'gpu' || item.runningMode === 'no_gpu'" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="checkManagedWorker(item)">检查服务</button><button v-if="item.instanceId !== computeConfiguration?.boundInstanceId" class="mini-btn" type="button" :disabled="busy || item.lifecycleState === 'unknown'" @click="bindManagedInstance(item)">设为主实例</button><span v-else class="selected-label">当前主实例</span><button v-if="releaseEligibility[item.instanceId]?.allowed" class="mini-btn danger" type="button" :disabled="busy" @click="releaseManagedInstance(item)">释放</button></div></div>
               </article>
               <p v-if="!managedInstances.length" class="empty-instances">平台没有返回可用实例。创建弹性实例前会先检查地域库存和实时报价，并再次让你确认。</p>
             </div>

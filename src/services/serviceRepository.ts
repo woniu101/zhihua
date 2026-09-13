@@ -218,6 +218,8 @@ export const serviceRepository = {
   probe: () => invokeNative<ServiceProbe>("probe_service"),
   connectWorker: (instanceId: string) =>
     invokeNative<ServiceProbe>("connect_compute_worker", { instanceId }),
+  provisionWorkerConnection: (instanceId: string) =>
+    invokeNative<ServiceProbe>("provision_compute_worker_connection", { instanceId }),
   prepareWorker: (instanceId: string) =>
     invokeNative<ServiceProbe>("prepare_compute_worker", { instanceId }),
   prepareGeneration: () =>

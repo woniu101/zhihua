@@ -1036,6 +1036,156 @@ async fn connect_compute_worker(
 }
 
 #[tauri::command]
+async fn provision_compute_worker_connection(
+    manager: State<'_, SshTunnelManager>,
+    service: State<'_, ServiceClient>,
+    comp_share: State<'_, CompShareProvider>,
+    compute: State<'_, ComputeControlStore>,
+    lifecycle: State<'_, ComputeLifecycle>,
+    instance_id: String,
+) -> Result<ServiceProbe, String> {
+    lifecycle.invalidate_idle_shutdown();
+    let managed = compute
+        .get_instance(&instance_id)
+        .map_err(|error| error.message)?;
+    if managed.role == ComputeInstanceRole::UserManaged {
+        return Err("请先将该实例设为主实例或加入批量算力池".to_owned());
+    }
+    let locator = compute_instance_locator(&managed);
+    let mut started_without_gpu = false;
+    let result = async {
+        let mut instance = comp_share
+            .describe_instance(locator.clone())
+            .await
+            .map_err(|error| error.message)?;
+        if instance.state == CompSharePowerState::Stopping {
+            instance = wait_for_instance_state_for(
+                &comp_share,
+                &locator,
+                CompSharePowerState::Stopped,
+                None,
+                Duration::from_secs(180),
+            )
+            .await?;
+        } else if instance.state == CompSharePowerState::Starting {
+            instance = wait_for_instance_state_for(
+                &comp_share,
+                &locator,
+                CompSharePowerState::Running,
+                None,
+                Duration::from_secs(180),
+            )
+            .await?;
+        }
+        if instance.state == CompSharePowerState::Stopped {
+            if !instance.support_without_gpu_start {
+                return Err("该实例不支持无卡启动；为避免产生 GPU 费用，知画没有启动它".to_owned());
+            }
+            comp_share
+                .start_instance_for(locator.clone(), CompShareStartMode::NoGpu)
+                .await
+                .map_err(|error| error.message)?;
+            started_without_gpu = true;
+            if let Err(error) = comp_share
+                .update_stop_scheduler_for(
+                    locator.clone(),
+                    chrono::Utc::now().timestamp() + 30 * 60,
+                )
+                .await
+            {
+                let _ = comp_share.stop_instance_for(locator.clone()).await;
+                return Err(format!(
+                    "无卡实例已请求启动，但平台关机保障设置失败；知画已请求关机：{}",
+                    error.message
+                ));
+            }
+            instance = wait_for_instance_state_for(
+                &comp_share,
+                &locator,
+                CompSharePowerState::Running,
+                Some(CompShareRunningMode::NoGpu),
+                Duration::from_secs(180),
+            )
+            .await?;
+        }
+        if instance.state != CompSharePowerState::Running {
+            return Err(format!(
+                "实例当前状态无法配置安全连接：{}",
+                instance.raw_state
+            ));
+        }
+        compute
+            .refresh_platform_instance(&instance)
+            .map_err(|error| error.message)?;
+
+        let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        loop {
+            let access = match comp_share.ssh_access_for(locator.clone()).await {
+                Ok(access) => access,
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "SSH_ENDPOINT_UNAVAILABLE" | "SSH_PASSWORD_UNAVAILABLE"
+                    ) && tokio::time::Instant::now() < bootstrap_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.message),
+            };
+            match manager
+                .bootstrap_configuration(
+                    &instance_id,
+                    &access.host,
+                    access.port,
+                    &access.username,
+                    &access.password,
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "SSH_CONNECT_TIMEOUT" | "SSH_CONNECT_FAILED"
+                    ) && tokio::time::Instant::now() < bootstrap_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                Err(error) => return Err(error.message),
+            }
+        }
+
+        manager
+            .ensure_remote_service_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+
+        let service_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match connect_service_through_tunnel_impl(&manager, &service, &compute, &instance_id)
+                .await
+            {
+                Ok(probe) => return Ok(probe),
+                Err(error) if tokio::time::Instant::now() < service_deadline => {
+                    let _ = manager.stop_for(&instance_id).await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    .await;
+
+    if result.is_err() && started_without_gpu {
+        let _ = manager.stop_for(&instance_id).await;
+        let _ = comp_share.stop_instance_for(locator).await;
+    }
+    result
+}
+
+#[tauri::command]
 async fn prepare_generation_service(
     manager: State<'_, SshTunnelManager>,
     service: State<'_, ServiceClient>,
@@ -1265,20 +1415,19 @@ async fn wait_for_instance_state_for(
 ) -> Result<CompShareInstance, String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let instance = provider
-            .describe_instance(locator.clone())
-            .await
-            .map_err(|error| error.message)?;
-        if instance.state == expected_state
-            && expected_mode.map_or(true, |mode| instance.running_mode == mode)
-        {
-            return Ok(instance);
-        }
+        let platform_detail = match provider.describe_instance(locator.clone()).await {
+            Ok(instance) => {
+                if instance.state == expected_state
+                    && expected_mode.map_or(true, |mode| instance.running_mode == mode)
+                {
+                    return Ok(instance);
+                }
+                format!("平台当前返回 {}", instance.raw_state)
+            }
+            Err(error) => format!("平台查询失败：{}", error.message),
+        };
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "实例状态切换超时，平台当前返回 {}",
-                instance.raw_state
-            ));
+            return Err(format!("实例状态切换超时，{platform_detail}"));
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -3040,6 +3189,7 @@ pub fn run() {
             get_ssh_tunnel_status,
             connect_service_through_tunnel,
             connect_compute_worker,
+            provision_compute_worker_connection,
             prepare_compute_worker,
             prepare_generation_service,
         ])

@@ -1,9 +1,11 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use keyring::Entry;
 use reqwest::{Client, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{collections::BTreeMap, fs, path::PathBuf, sync::RwLock, time::Duration};
+use zeroize::Zeroizing;
 
 const API_BASE_URL: &str = "https://api.compshare.cn";
 const CREDENTIAL_SERVICE: &str = "cn.zhihua.desktop.compshare";
@@ -13,6 +15,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
 type CompShareResult<T> = Result<T, CompShareError>;
+
+pub(crate) struct CompShareSshAccess {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) username: String,
+    pub(crate) password: Zeroizing<String>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -686,6 +695,53 @@ impl CompShareProvider {
         .await
     }
 
+    pub(crate) async fn ssh_access_for(
+        &self,
+        locator: CompShareInstanceLocator,
+    ) -> CompShareResult<CompShareSshAccess> {
+        let locator = normalize_locator(locator)?;
+        let credentials = self.credentials()?;
+        let mut wire = self
+            .describe_wire_exact(
+                &credentials,
+                &locator.instance_id,
+                &locator.region,
+                &locator.zone,
+            )
+            .await?;
+        if !wire
+            .state
+            .as_deref()
+            .is_some_and(|state| state.eq_ignore_ascii_case("running"))
+        {
+            return Err(CompShareError::new(
+                "SSH_INSTANCE_NOT_RUNNING",
+                "实例运行后才能配置 SSH 安全连接",
+            ));
+        }
+        let command = wire.ssh_login_command.take().ok_or_else(|| {
+            CompShareError::new("SSH_ENDPOINT_UNAVAILABLE", "平台没有返回实例 SSH 地址")
+        })?;
+        let encoded_password = wire.password.take().ok_or_else(|| {
+            CompShareError::new("SSH_PASSWORD_UNAVAILABLE", "平台没有返回实例临时 SSH 密码")
+        })?;
+        let password = BASE64_STANDARD
+            .decode(encoded_password.trim())
+            .map_err(|_| {
+                CompShareError::new("SSH_PASSWORD_INVALID", "平台返回的 SSH 密码编码无效")
+            })?;
+        let password = String::from_utf8(password).map_err(|_| {
+            CompShareError::new("SSH_PASSWORD_INVALID", "平台返回的 SSH 密码格式无效")
+        })?;
+        let (host, port, username) = parse_ssh_login_command(&command)?;
+        Ok(CompShareSshAccess {
+            host,
+            port,
+            username,
+            password: Zeroizing::new(password),
+        })
+    }
+
     pub async fn terminate_instance(
         &self,
         locator: CompShareInstanceLocator,
@@ -1081,6 +1137,26 @@ impl CompShareProvider {
         region: &str,
         zone: &str,
     ) -> CompShareResult<CompShareInstance> {
+        let wire = self
+            .describe_wire_exact(credentials, instance_id, region, zone)
+            .await?;
+        let instance = CompShareInstance::from_wire(wire, Some(region), Some(zone));
+        if instance.region != region || instance.zone != zone {
+            return Err(CompShareError::new(
+                "INSTANCE_LOCATION_MISMATCH",
+                "实例返回的地域或可用区与绑定信息不一致",
+            ));
+        }
+        Ok(instance)
+    }
+
+    async fn describe_wire_exact(
+        &self,
+        credentials: &ApiCredentials,
+        instance_id: &str,
+        region: &str,
+        zone: &str,
+    ) -> CompShareResult<CompShareInstanceWire> {
         let mut parameters = BTreeMap::new();
         parameters.insert("Limit".to_string(), "100".to_string());
         parameters.insert("Offset".to_string(), "0".to_string());
@@ -1094,8 +1170,7 @@ impl CompShareProvider {
         let mut matches = response
             .instances
             .into_iter()
-            .map(|wire| CompShareInstance::from_wire(wire, Some(region), Some(zone)))
-            .filter(|instance| instance.instance_id == instance_id)
+            .filter(|wire| wire.instance_id.as_deref() == Some(instance_id))
             .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(CompShareError::new(
@@ -1103,14 +1178,7 @@ impl CompShareProvider {
                 "在指定地域和可用区中找不到绑定的实例",
             ));
         }
-        let instance = matches.remove(0);
-        if instance.region != region || instance.zone != zone {
-            return Err(CompShareError::new(
-                "INSTANCE_LOCATION_MISMATCH",
-                "实例返回的地域或可用区与绑定信息不一致",
-            ));
-        }
-        Ok(instance)
+        Ok(matches.remove(0))
     }
 
     fn credentials(&self) -> CompShareResult<ApiCredentials> {
@@ -1205,6 +1273,45 @@ fn required_value(value: String, label: &str) -> CompShareResult<String> {
         ));
     }
     Ok(value)
+}
+
+fn parse_ssh_login_command(command: &str) -> CompShareResult<(String, u16, String)> {
+    let parts = command.split_ascii_whitespace().collect::<Vec<_>>();
+    if parts.first().copied() != Some("ssh") {
+        return Err(CompShareError::new(
+            "SSH_ENDPOINT_INVALID",
+            "平台返回的 SSH 登录命令格式无效",
+        ));
+    }
+    let port_index = parts.iter().position(|part| *part == "-p").ok_or_else(|| {
+        CompShareError::new("SSH_ENDPOINT_INVALID", "平台返回的 SSH 登录命令缺少端口")
+    })?;
+    let port = parts
+        .get(port_index + 1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CompShareError::new("SSH_ENDPOINT_INVALID", "平台返回的 SSH 端口无效"))?;
+    let endpoint = parts.last().copied().unwrap_or_default();
+    let (username, host) = endpoint.split_once('@').ok_or_else(|| {
+        CompShareError::new("SSH_ENDPOINT_INVALID", "平台返回的 SSH 登录地址无效")
+    })?;
+    if username.is_empty()
+        || username.len() > 64
+        || !username
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
+        || host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-' | b':'))
+    {
+        return Err(CompShareError::new(
+            "SSH_ENDPOINT_INVALID",
+            "平台返回的 SSH 登录地址无效",
+        ));
+    }
+    Ok((host.to_owned(), port, username.to_owned()))
 }
 
 fn normalize_optional(value: Option<String>) -> Option<String> {
@@ -1632,6 +1739,8 @@ struct CompShareInstanceWire {
     support_without_gpu_start: Option<bool>,
     #[serde(rename = "SshLoginCommand")]
     ssh_login_command: Option<String>,
+    #[serde(rename = "Password")]
+    password: Option<String>,
     #[serde(rename = "StartTime")]
     start_time: Option<i64>,
     #[serde(rename = "StopTime")]
@@ -1846,6 +1955,7 @@ mod tests {
                 gpu_type: Some("5090".to_string()),
                 support_without_gpu_start: Some(true),
                 ssh_login_command: None,
+                password: None,
                 start_time: None,
                 stop_time: None,
                 release_time: None,
@@ -1864,6 +1974,17 @@ mod tests {
         assert_eq!(no_gpu.running_mode, CompShareRunningMode::NoGpu);
         assert_eq!(parse_power_state("Stopping"), CompSharePowerState::Stopping);
         assert_eq!(parse_power_state("surprise"), CompSharePowerState::Unknown);
+    }
+
+    #[test]
+    fn parses_platform_ssh_login_command_strictly() {
+        assert_eq!(
+            parse_ssh_login_command("ssh -p 31234 root@ssh.example.cn").expect("valid SSH command"),
+            ("ssh.example.cn".to_owned(), 31234, "root".to_owned())
+        );
+        assert!(parse_ssh_login_command("ssh root@ssh.example.cn").is_err());
+        assert!(parse_ssh_login_command("ssh -p 22 root@bad host").is_err());
+        assert!(parse_ssh_login_command("curl https://example.cn").is_err());
     }
 
     #[test]
