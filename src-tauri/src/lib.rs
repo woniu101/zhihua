@@ -1869,18 +1869,37 @@ fn reserve_service_worker(
     service: State<'_, ServiceClient>,
     client_request_id: String,
 ) -> Result<ComputeWorkerLease, ServiceConnectionError> {
-    let lease = compute
-        .acquire_ready_worker_lease(&client_request_id, 3_600)
-        .map_err(compute_service_error)?;
-    let connected = service.info_for(&lease.instance_id)?;
-    if !connected.configured || !connected.credential_stored {
-        let _ = compute.release_worker_lease(&client_request_id);
-        return Err(ServiceConnectionError {
-            code: "worker_connection_missing",
-            message: "已选 worker 尚未建立独立服务连接，请刷新实例状态后重试。".to_owned(),
-        });
+    let candidate_count = compute
+        .list_worker_readiness()
+        .map_err(compute_service_error)?
+        .len()
+        .max(1);
+    for _ in 0..candidate_count {
+        let lease = compute
+            .acquire_ready_worker_lease(&client_request_id, 3_600)
+            .map_err(compute_service_error)?;
+        match service.info_for(&lease.instance_id) {
+            Ok(connected) if connected.configured && connected.credential_stored => {
+                return Ok(lease);
+            }
+            Ok(_) | Err(_) => {
+                let _ = compute.release_worker_lease(&client_request_id);
+                let _ = compute.record_worker_readiness(
+                    &lease.instance_id,
+                    ComputeServiceState::Unreachable,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("实例服务连接尚未配置，已从本次 worker 候选中移除"),
+                );
+            }
+        }
     }
-    Ok(lease)
+    Err(ServiceConnectionError {
+        code: "worker_connection_missing",
+        message: "当前就绪 worker 都缺少独立服务连接，请刷新实例状态后重试。".to_owned(),
+    })
 }
 
 #[tauri::command]

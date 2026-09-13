@@ -743,14 +743,14 @@ impl ComputeControlStore {
                  FROM compute_instances instance
                  JOIN compute_worker_readiness readiness
                    ON readiness.instance_id=instance.instance_id AND readiness.state='ready'
+                 LEFT JOIN worker_leases lease
+                   ON lease.instance_id=instance.instance_id AND lease.lease_expires_at>?1
                  WHERE lower(instance.platform_state)='running'
                    AND instance.running_mode='gpu'
-                   AND instance.lifecycle_state IN ('idle','discovered','retained')
-                   AND NOT EXISTS (
-                     SELECT 1 FROM worker_leases lease
-                     WHERE lease.instance_id=instance.instance_id AND lease.lease_expires_at>?1
-                   )
-                 ORDER BY CASE instance.role WHEN 'primary' THEN 0 WHEN 'elastic' THEN 1 ELSE 2 END,
+                   AND instance.lifecycle_state IN ('idle','busy','discovered','retained')
+                 GROUP BY instance.instance_id
+                 ORDER BY COUNT(lease.job_id) ASC,
+                          CASE instance.role WHEN 'primary' THEN 0 WHEN 'elastic' THEN 1 ELSE 2 END,
                           instance.updated_at ASC
                  LIMIT 1",
                 [&now],
@@ -758,10 +758,7 @@ impl ComputeControlStore {
             )
             .optional()?;
         let instance_id = instance_id.ok_or_else(|| {
-            ComputeControlError::new(
-                "READY_WORKER_UNAVAILABLE",
-                "当前没有空闲且服务就绪的 GPU worker",
-            )
+            ComputeControlError::new("READY_WORKER_UNAVAILABLE", "当前没有服务就绪的 GPU worker")
         })?;
         let worker_id = format!("instance:{instance_id}:gpu:0");
         let expires = (Utc::now() + ChronoDuration::seconds(i64::from(lease_seconds)))
@@ -1726,9 +1723,9 @@ mod tests {
         assert_eq!(
             store
                 .acquire_ready_worker_lease("job-3", 300)
-                .unwrap_err()
-                .code,
-            "READY_WORKER_UNAVAILABLE"
+                .unwrap()
+                .instance_id,
+            "primary"
         );
     }
 
