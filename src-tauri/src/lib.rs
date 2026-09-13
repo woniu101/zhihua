@@ -2131,7 +2131,24 @@ async fn get_service_job(
     let instance_id = remote_job_instance_id(&queue, &job_id)?;
     let job = service.get_job_for(&instance_id, &job_id).await?;
     let local = queue.sync(&job).map_err(queue_service_error)?;
-    if is_terminal_service_job(&job) {
+    if job.status == "completed" {
+        if let Err(error) = compute.renew_worker_lease(&job.client_request_id, 900) {
+            if error.code != "WORKER_LEASE_NOT_FOUND" {
+                return Err(compute_service_error(error));
+            }
+            let worker_id = local
+                .worker_id
+                .as_deref()
+                .ok_or_else(|| ServiceConnectionError {
+                    code: "compute_control_error",
+                    message: "已完成的远端任务缺少 worker 分配记录".to_owned(),
+                })?;
+            let instance_id = worker_instance_id(worker_id)?;
+            compute
+                .acquire_worker_lease(worker_id, instance_id, &job.client_request_id, 900)
+                .map_err(compute_service_error)?;
+        }
+    } else if is_terminal_service_job(&job) {
         compute
             .release_worker_lease(&job.client_request_id)
             .map_err(compute_service_error)?;
@@ -2425,6 +2442,7 @@ async fn download_completed_job(
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
     queue: State<'_, JobQueueStorage>,
+    compute: State<'_, ComputeControlStore>,
     service: State<'_, ServiceClient>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: DownloadCompletedJobInput,
@@ -2557,6 +2575,9 @@ async fn download_completed_job(
                 .map_err(|error| error.message)?,
         );
     }
+    compute
+        .release_worker_lease(&job.client_request_id)
+        .map_err(|error| error.message)?;
     let revision = lifecycle.invalidate_idle_shutdown();
     schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
     queue
@@ -2595,6 +2616,7 @@ async fn download_completed_image_job(
     projects: State<'_, ProjectStorage>,
     assets: State<'_, AssetStorage>,
     queue: State<'_, JobQueueStorage>,
+    compute: State<'_, ComputeControlStore>,
     service: State<'_, ServiceClient>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: DownloadCompletedImageInput,
@@ -2666,6 +2688,9 @@ async fn download_completed_image_job(
         let _ = fs::remove_file(&downloaded.destination_path);
         imported.push(result?);
     }
+    compute
+        .release_worker_lease(&job.client_request_id)
+        .map_err(|error| error.message)?;
     queue
         .mark_local_complete(&job.id)
         .map_err(|error| error.message)?;
@@ -2681,6 +2706,7 @@ async fn download_completed_enhancement(
     storyboards: State<'_, StoryboardStorage>,
     generations: State<'_, GenerationStorage>,
     queue: State<'_, JobQueueStorage>,
+    compute: State<'_, ComputeControlStore>,
     service: State<'_, ServiceClient>,
     lifecycle: State<'_, ComputeLifecycle>,
     input: DownloadCompletedUpscaleInput,
@@ -2779,6 +2805,9 @@ async fn download_completed_enhancement(
                 .map_err(|error| error.message)?,
         );
     }
+    compute
+        .release_worker_lease(&job.client_request_id)
+        .map_err(|error| error.message)?;
     let revision = lifecycle.invalidate_idle_shutdown();
     schedule_idle_gpu_shutdown(app, lifecycle.inner().clone(), revision);
     queue
