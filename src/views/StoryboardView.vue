@@ -696,28 +696,51 @@ async function prepareBatchWorkerPool(taskCount: number) {
 
   let preparedWorkers = 1;
   let preparationFailures = 0;
+  const preparationFailureMessages: string[] = [];
   const workerLimit = Math.min(batchWorkerLimit.value, taskCount);
   if (workerLimit > 1) {
-    const [configuration, managed] = await Promise.all([
+    const [configuration, managed, readiness] = await Promise.all([
       compShareRepository.configuration(),
       compShareRepository.managedInstances(),
+      compShareRepository.workerReadiness(),
     ]);
+    const readinessByInstance = new Map(readiness.map((item) => [item.instanceId, item]));
     const elasticCandidates = managed
       .filter((item) =>
         item.instanceId !== configuration.boundInstanceId
         && (item.role === "elastic" || item.role === "test")
+        && !item.currentJobId
         && !["unknown", "terminating", "terminated", "error"].includes(item.lifecycleState)
       )
-      .slice(0, workerLimit - 1);
-    if (elasticCandidates.length) {
-      batchNotice.value = `主实例已就绪，正在并行准备 ${elasticCandidates.length} 个弹性 worker…`;
+      .sort((left, right) => {
+        const score = (item: typeof left) => {
+          if (item.runningMode === "gpu" && readinessByInstance.get(item.instanceId)?.state === "ready") return 0;
+          if (readinessByInstance.get(item.instanceId)?.state === "ready") return 1;
+          return 2;
+        };
+        return score(left) - score(right);
+      });
+    let candidateOffset = 0;
+    while (preparedWorkers < workerLimit && candidateOffset < elasticCandidates.length) {
+      const needed = workerLimit - preparedWorkers;
+      const candidates = elasticCandidates.slice(candidateOffset, candidateOffset + needed);
+      candidateOffset += candidates.length;
+      batchNotice.value = `主实例已就绪，正在并行准备 ${candidates.length} 个候选 worker…`;
       const results = await Promise.allSettled(
-        elasticCandidates.map((item) => serviceRepository.prepareWorker(item.instanceId)),
+        candidates.map((item) => serviceRepository.prepareWorker(item.instanceId)),
       );
-      preparedWorkers += results.filter(
-        (result) => result.status === "fulfilled" && Boolean(result.value?.comfyuiReady),
-      ).length;
-      preparationFailures = results.length - (preparedWorkers - 1);
+      results.forEach((result, index) => {
+        const candidate = candidates[index];
+        if (result.status === "fulfilled" && result.value?.comfyuiReady) {
+          preparedWorkers += 1;
+          return;
+        }
+        preparationFailures += 1;
+        const reason = result.status === "rejected"
+          ? normalizeConnectionFailure(result.reason).message
+          : result.value?.detail || "服务未就绪";
+        preparationFailureMessages.push(`${candidate.name ?? candidate.instanceId}：${reason}`);
+      });
     }
   }
 
@@ -735,7 +758,7 @@ async function prepareBatchWorkerPool(taskCount: number) {
     affordableNewInstances: 0,
     workersPerNewInstance: 1,
   });
-  return { plan, preparationFailures };
+  return { plan, preparationFailures, preparationFailureMessages };
 }
 
 async function generateIncompleteScenes() {
@@ -811,7 +834,7 @@ async function generateIncompleteScenes() {
     ? `${pool.plan.plannedWorkers} 路并行，${pool.plan.queuedTasks} 个进入后续轮次`
     : "单路串行";
   const preparationDetail = pool.preparationFailures
-    ? `；${pool.preparationFailures} 个弹性实例未就绪，已自动降级`
+    ? `；${pool.preparationFailures} 个候选未就绪，已尝试后备实例并自动降级：${pool.preparationFailureMessages[0]}`
     : "";
   batchNotice.value = failures.length
     ? `已排入 ${submittedCount} 个，${failures.length} 个未提交：${failures[0]}（${poolDetail}${preparationDetail}）`
