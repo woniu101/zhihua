@@ -47,7 +47,6 @@ const probe = ref<ServiceProbe>();
 const tunnelStatus = ref<TunnelStatus>({ configured: false, phase: "stopped" });
 const computeOpen = ref(false);
 const elasticCreateOpen = ref(false);
-const advancedOpen = ref(false);
 const busy = ref(false);
 const connectionError = ref("");
 const computeForm = reactive({ publicKey: "", privateKey: "" });
@@ -82,6 +81,7 @@ const llmForm = reactive({ providerId: "deepseek" as LlmProviderId, protocol: "o
 const llmNotice = ref("");
 const llmNoticeTone = ref<"success" | "error" | "neutral">("neutral");
 const activeSection = ref<"service" | "model" | "storage" | "overview" | "workers" | "connection">("service");
+const isAdvancedSection = computed(() => ["overview", "workers", "connection"].includes(activeSection.value));
 const storageInfo = ref<StorageInfo>();
 const storageNotice = ref("");
 const computePolicyOptions: Array<{ value: ComputeKeepAlivePolicy; label: string; description: string; limit: string }> = [
@@ -204,11 +204,13 @@ async function prepareGenerationService() {
 const checks = computed(() => [
   {
     name: "知画后端",
+    detail: "桌面端与远端 API 版本握手",
     state: connected.value ? `已连接 · v${probe.value?.serviceVersion}` : "等待连接",
     tone: connected.value ? "success" : "waiting",
   },
   {
     name: "ComfyUI",
+    detail: "图片和视频工作流执行引擎",
     state: probe.value?.comfyuiReady
       ? "可生成"
       : probe.value?.comfyuiConnected
@@ -218,6 +220,7 @@ const checks = computed(() => [
   },
   {
     name: "工作流清单",
+    detail: "H3、Qwen 与 SeedVR2 模板",
     state: connected.value
       ? `${probe.value?.availableWorkflows.length ?? 0} / ${probe.value?.workflows.length ?? 0} 个模板已安装`
       : "等待握手",
@@ -225,11 +228,13 @@ const checks = computed(() => [
   },
   {
     name: "模型清单",
+    detail: "公共模型文件与软链接状态",
     state: connected.value ? probe.value?.modelManifestVersion ?? "未知" : "等待握手",
     tone: connected.value ? "success" : "waiting",
   },
   {
     name: "任务队列",
+    detail: "远端执行任务和等待队列",
     state: connected.value
       ? `${probe.value?.queueActive ?? 0} 个执行中 · ${probe.value?.queueQueued ?? 0} 个等待`
       : "等待连接",
@@ -237,6 +242,7 @@ const checks = computed(() => [
   },
   {
     name: "本机安全入口",
+    detail: "仅本机可访问的 SSH 安全隧道",
     state: tunnelStatus.value.phase === "connected"
       ? `SSH 已连接 · ${tunnelStatus.value.localUrl ?? "本机随机端口"}`
       : tunnelStatus.value.lastError ?? (tunnelStatus.value.configured ? "等待建立 SSH 连接" : "尚未配置 SSH 连接"),
@@ -806,21 +812,20 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 </script>
 
 <template>
-  <section class="page settings-page">
+  <section class="page settings-page" :class="{ 'has-advanced-tabs': isAdvancedSection }">
     <header class="settings-head"><div class="page-title-line"><h1>设置</h1><span class="status-line"><span class="dot" :class="{ gray: !connected }"></span><strong>{{ serviceStatus }}</strong><span>|</span><span>本地项目自动保存</span></span></div></header>
     <nav class="settings-tabs">
       <button :class="{ active: activeSection === 'service' }" type="button" @click="activeSection='service'"><Server :size="20"/>生成服务</button>
       <button :class="{ active: activeSection === 'model' }" type="button" @click="activeSection='model'"><KeyRound :size="20"/>智能模型</button>
       <button :class="{ active: activeSection === 'storage' }" type="button" @click="activeSection='storage'"><Monitor :size="20"/>常规设置</button>
       <span class="settings-tabs-spacer"></span>
-      <div class="advanced-nav">
-        <button :class="{ active: ['overview','workers','connection'].includes(activeSection) }" type="button" @click="advancedOpen=!advancedOpen"><Wrench :size="20"/>高级管理</button>
-        <div v-if="advancedOpen" class="advanced-menu">
-          <button type="button" @click="activeSection='overview';advancedOpen=false"><Calculator :size="19"/><span><b>费用与关机保护</b><small>费用、保活和生命周期</small></span></button>
-          <button type="button" @click="activeSection='workers';advancedOpen=false"><Database :size="19"/><span><b>实例与并行</b><small>{{ managedInstances.length }} 台实例和多路生成</small></span></button>
-          <button type="button" @click="activeSection='connection';advancedOpen=false"><ShieldCheck :size="19"/><span><b>连接与环境诊断</b><small>SSH、服务版本和工作流</small></span></button>
-        </div>
-      </div>
+      <button :class="{ active: isAdvancedSection }" type="button" @click="activeSection='overview'"><Wrench :size="20"/>高级设置</button>
+    </nav>
+    <nav v-if="isAdvancedSection" class="advanced-tabs" aria-label="高级设置分类">
+      <span>高级设置</span>
+      <button :class="{ active: activeSection === 'overview' }" type="button" @click="activeSection='overview'"><Calculator :size="18"/>费用与保护</button>
+      <button :class="{ active: activeSection === 'workers' }" type="button" @click="activeSection='workers'"><Database :size="18"/>实例与并行 <i>{{ managedInstances.length }}</i></button>
+      <button :class="{ active: activeSection === 'connection' }" type="button" @click="activeSection='connection'"><ShieldCheck :size="18"/>连接诊断</button>
     </nav>
 
     <div v-if="activeSection === 'service'" class="service-page">
@@ -901,7 +906,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
 
       <section class="panel instance"><div class="panel-head"><h2>主实例</h2><span :class="computeInstance?.state === 'running' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: computeInstance?.state !== 'running' }"></span>{{ computeModeLabel }}</span></div><div class="instance-main"><div class="server-art">▤</div><div class="instance-identity"><h2 :title="computeInstance?.name">{{ computeInstance?.name ?? '尚未绑定实例' }}</h2><p>{{ computeInstance?.gpuType ? `RTX ${computeInstance.gpuType}` : '等待实例信息' }}</p><span class="muted"><span class="dot" :class="{ gray: !probe?.comfyuiReady }"></span>{{ probe?.comfyuiReady ? '生成服务可用' : '生成服务待启动' }}　·　{{ computeInstance ? `${computeInstance.cpu ?? '--'} 核 / ${computeInstance.memoryMb ? Math.round(computeInstance.memoryMb / 1024) : '--'} GB` : '等待配置' }}</span></div></div><div class="instance-metrics"><div><span>当前模式</span><b>{{ computeModeLabel }}</b></div><div><span>GPU 规格</span><b>{{ computeInstance?.gpuType ? `RTX ${computeInstance.gpuType}` : '--' }}</b></div><div><span>区域/可用区</span><b>{{ computeInstance?.zone ?? '--' }}</b></div></div><div class="instance-actions"><button class="btn primary" type="button" :disabled="busy || computeInstance?.state !== 'stopped'" @click="changeComputeMode('gpu')"><Power :size="18"/>启动 GPU</button><button class="btn" type="button" :disabled="busy || !computeInstance || (computeInstance.state !== 'stopped' && computeInstance.state !== 'running')" @click="computeInstance?.state === 'running' ? changeComputeMode('stop') : changeComputeMode('noGpu')"><Wrench :size="18"/>{{ computeInstance?.state === 'running' ? '关机' : '无卡启动' }}</button><button class="btn" type="button" @click="activeSection='workers'"><ExternalLink :size="17"/>实例池</button></div></section>
 
-      <section class="panel shutdown"><div class="panel-title"><h2>生成后多久关闭</h2><span class="policy-badge" :class="{ neutral: computeInstance?.runningMode !== 'gpu' || !computeInstance?.stopSchedulerTime }">{{ policyGuardLabel }}</span></div><div class="policy-options"><button v-for="option in computePolicyOptions" :key="option.value" type="button" :class="{ selected: computePolicy.policy === option.value }" :disabled="busy" @click="changeComputePolicy(option.value)"><span><b>{{ option.label }}</b><small>{{ option.limit }}</small></span><p>{{ option.description }}</p><i>{{ computePolicy.policy === option.value ? '✓' : '' }}</i></button></div><div class="policy-guard"><CalendarClock :size="21"/><span><b>平台硬保护</b><small>{{ stopSchedulerLabel }}</small></span><button type="button" :disabled="busy || computeInstance?.state !== 'running' || computeInstance?.runningMode !== 'gpu'" @click="toggleStopDeadline">刷新保障</button></div></section>
+      <section class="panel shutdown"><div class="panel-title"><h2>生成后多久关闭</h2><span class="policy-badge" :class="{ neutral: computeInstance?.runningMode !== 'gpu' || !computeInstance?.stopSchedulerTime }">{{ policyGuardLabel }}</span></div><div class="policy-options"><button v-for="option in computePolicyOptions" :key="option.value" type="button" :class="{ selected: computePolicy.policy === option.value }" :aria-pressed="computePolicy.policy === option.value" :disabled="busy" @click="changeComputePolicy(option.value)"><span><b>{{ option.label }}</b><small>{{ option.limit }}</small></span><p>{{ option.description }}</p><i aria-hidden="true"></i></button></div><div class="policy-guard"><CalendarClock :size="21"/><span><b>平台硬保护</b><small>{{ stopSchedulerLabel }}</small></span><button type="button" :disabled="busy || computeInstance?.state !== 'running' || computeInstance?.runningMode !== 'gpu'" @click="toggleStopDeadline">刷新保障</button></div></section>
 
       <section class="panel retention overview-retention">
         <div class="panel-title"><h2>费用与生命周期保障</h2><span class="policy-badge neutral">逐实例执行</span></div>
@@ -941,7 +946,17 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
     </div>
 
     <div v-else-if="activeSection === 'connection'" class="connection-page">
-      <section class="panel environment"><div class="panel-title"><h2>主实例环境检查</h2><button class="btn link" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="15"/>连接并检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="22"/><div><b>远端磁盘</b><span>服务就绪后读取系统盘与工作目录空间</span></div><strong>待检测</strong></div></section>
+      <section class="panel environment diagnostic-panel">
+        <div class="panel-head diagnostic-head"><div><h2>主实例环境检查</h2><p>逐项确认生成服务、模型和安全连接</p></div><button class="btn" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="17"/>重新检查</button></div>
+        <div class="diagnostic-grid">
+          <article v-for="(item,index) in checks" :key="item.name">
+            <span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>
+            <div><b>{{ item.name }}</b><small>{{ item.detail }}</small></div>
+            <strong :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</strong>
+          </article>
+          <article class="diagnostic-disk"><span class="service-icon"><HardDrive :size="23"/></span><div><b>远端磁盘</b><small>系统盘、工作目录和结果暂存空间</small></div><strong class="waiting-text"><span class="dot gray"></span>待检测</strong></article>
+        </div>
+      </section>
       <section class="panel worker-health-panel"><div class="panel-head"><div><h2>全部 worker 连接状态</h2><p>异常实例不会领取新任务，其他实例可以继续工作。</p></div><button class="btn" type="button" :disabled="busy" @click="refreshCompute"><RefreshCw :size="16"/>刷新状态</button></div><div class="worker-health-list"><article v-for="item in managedInstances" :key="item.instanceId"><span class="dot" :class="{ gray: workerReadiness[item.instanceId]?.state !== 'ready' }"></span><div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ managedModeLabel(item) }}</small></div><strong :class="workerReadinessTone(item.instanceId)">{{ workerReadinessLabel(item.instanceId) }}</strong><button class="mini-btn" type="button" :disabled="busy || item.runningMode === 'stopped'" @click="checkManagedWorker(item)">检查</button></article><p v-if="!managedInstances.length" class="empty-instances">配置算力账户后，这里会逐台显示连接和服务版本。</p></div></section>
       <section class="panel connection connection-full"><div class="panel-head"><h2>连接信息</h2><span :class="connected ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: !connected }"></span>{{ connectionLabel }}</span></div><div class="connection-cards"><article role="button" tabindex="0" @click="activeSection='model'" @keydown.enter="activeSection='model'"><KeyRound :size="31"/><div><b>大模型内容规划</b><span>{{ llmConfiguration?.credentialStored ? `${llmConfiguration.providerLabel} · ${llmConfiguration.model}` : '等待配置 API Key' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><KeyRound :size="31"/><div><b>自动安全连接</b><span>{{ tunnelStatus.configured ? 'SSH 私钥已保存到 Windows 凭据库' : '等待实例连接配置' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><Server :size="31"/><div><b>本机服务入口</b><span>{{ tunnelStatus.localUrl ?? connectionInfo?.baseUrl ?? '启动时自动分配' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><ShieldCheck :size="31"/><div><b>版本握手　<span :class="connected ? 'success-text' : 'waiting-text'">● {{ connectionLabel }}</span></b><span>{{ connected ? `API ${probe?.apiVersion} · 服务 ${probe?.serviceVersion}` : connectionError || '点击建立连接并检查兼容性' }}</span></div><strong>›</strong></article></div></section>
     </div>
@@ -1102,4 +1117,53 @@ export default { components: { FileTextIcon } };
 button:disabled,input:disabled,select:disabled{opacity:1;color:var(--text-disabled);cursor:not-allowed}.connection-backdrop{background:var(--overlay)}.connection-dialog>header,.connection-dialog>footer{background:var(--surface)}
 :global(:root[data-theme="dark"]) .model-notice.success{color:#66d9a7}:global(:root[data-theme="dark"]) .model-notice.error{color:#ff9a91}:global(:root[data-theme="dark"]) .instance-role{color:#c0cee0;background:var(--surface-muted)}:global(:root[data-theme="dark"]) .instance-role.managed{color:#66d9a7;background:var(--success-soft)}
 @media(max-width:1380px){.model-page{grid-template-columns:320px minmax(0,1fr)}.model-config-body{padding:14px 17px}.capability-card>div{grid-template-columns:1fr 1fr}.advanced-menu{right:-4px}}
+
+/* Persistent advanced navigation keeps the three operational tools discoverable. */
+.settings-page.has-advanced-tabs{grid-template-rows:78px 61px 52px minmax(0,1fr)}
+.advanced-tabs{height:52px;padding:6px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;background:var(--surface-soft)}
+.advanced-tabs>span{margin-right:4px;color:var(--muted);font-size:14px;font-weight:750;white-space:nowrap}
+.advanced-tabs button{height:38px;padding:0 15px;border:1px solid transparent;border-radius:9px;display:flex;align-items:center;gap:8px;color:var(--text-secondary);background:transparent;font-size:15px;font-weight:750}
+.advanced-tabs button:hover{color:var(--text);background:var(--control-hover)}
+.advanced-tabs button.active{color:var(--blue);border-color:var(--blue);background:var(--selected);box-shadow:0 0 0 1px var(--blue) inset}
+.advanced-tabs button i{min-width:22px;height:22px;padding:0 6px;border-radius:11px;display:grid;place-items:center;color:var(--blue);background:var(--blue-soft);font-size:13px;font-style:normal}
+
+/* Use a full radio target instead of a clipped check mark. */
+.policy-options i,.settings-overview .shutdown .policy-options i{right:12px;top:50%;width:22px;height:22px;border:2px solid var(--text-disabled);background:var(--surface);color:transparent;transform:translateY(-50%);display:grid;place-items:center}
+.policy-options>button.selected i{border-color:var(--blue);background:var(--surface)}
+.policy-options>button.selected i:after{content:"";width:10px;height:10px;border-radius:50%;background:var(--blue)}
+
+/* Diagnostics use the available space as scannable cards. */
+.connection-page{grid-template-columns:minmax(610px,1.15fr) minmax(430px,.85fr);grid-template-rows:minmax(0,1fr) 158px}
+.diagnostic-panel{display:flex;flex-direction:column}
+.diagnostic-head{min-height:72px;padding-block:10px}
+.diagnostic-head p{margin-top:5px;color:var(--muted);font-size:14px}
+.diagnostic-grid{flex:1;min-height:0;padding:13px 16px 16px;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:minmax(86px,auto);gap:10px;overflow:auto}
+.diagnostic-grid article{min-width:0;padding:12px 13px;border:1px solid var(--line);border-radius:10px;display:grid;grid-template-columns:44px minmax(0,1fr);grid-template-rows:auto auto;align-items:center;gap:5px 11px;background:var(--surface-soft)}
+.diagnostic-grid article>div{min-width:0;align-self:center}
+.diagnostic-grid b,.diagnostic-grid small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.diagnostic-grid b{color:var(--text);font-size:16px}
+.diagnostic-grid small{margin-top:5px;color:var(--muted);font-size:14px}
+.diagnostic-grid article>strong{grid-column:2;display:flex;align-items:center;gap:6px;font-size:14px;font-weight:700}
+.diagnostic-grid .service-icon{grid-row:1/3;width:42px;height:42px;border-radius:11px;display:grid;place-items:center;color:var(--blue);background:var(--blue-soft);font-size:18px;font-weight:800}
+.diagnostic-grid .diagnostic-disk{grid-column:1/3;grid-template-columns:44px minmax(0,1fr) auto;grid-template-rows:1fr}
+.diagnostic-grid .diagnostic-disk .service-icon{grid-row:1}
+.diagnostic-grid .diagnostic-disk>strong{grid-column:3}
+.worker-health-panel>.panel-head{min-height:72px}
+.worker-health-list{padding:8px 16px}
+.worker-health-list article{min-height:78px;padding:10px 12px;grid-template-columns:12px minmax(0,1fr) 116px 66px;gap:12px}
+.worker-health-list article b{color:var(--text);font-size:16px}
+.worker-health-list article small{color:var(--muted);font-size:14px}
+.worker-health-list article strong{font-size:14px}
+.connection-full>.panel-head{min-height:50px}
+.connection-cards article b{font-size:16px}.connection-cards article span{font-size:14px}
+
+@media(max-width:1380px){
+  .advanced-tabs{padding-inline:14px}
+  .advanced-tabs button{padding-inline:11px;font-size:14px}
+  .connection-page{grid-template-columns:1.08fr .92fr}
+  .diagnostic-grid{padding:10px 12px 13px;gap:8px}
+  .diagnostic-grid article{padding:9px 10px;grid-template-columns:38px minmax(0,1fr)}
+  .diagnostic-grid .service-icon{width:37px;height:37px}
+  .diagnostic-grid .diagnostic-disk{grid-template-columns:38px minmax(0,1fr) auto}
+}
 </style>
