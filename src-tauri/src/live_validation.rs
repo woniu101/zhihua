@@ -15,9 +15,17 @@ fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("set {name}"))
 }
 
-async fn wait_for_job(service: &ServiceClient, id: &str, max_minutes: u64) -> ServiceJob {
+async fn wait_for_job(
+    service: &ServiceClient,
+    instance_id: &str,
+    id: &str,
+    max_minutes: u64,
+) -> ServiceJob {
     for _ in 0..(max_minutes * 20) {
-        let job = service.get_job(id).await.expect("poll remote job");
+        let job = service
+            .get_job_for(instance_id, id)
+            .await
+            .expect("poll remote job");
         if job.status == "completed" {
             return job;
         }
@@ -241,20 +249,34 @@ async fn provision_desktop_worker_connection_without_gpu() {
             ));
         }
 
-        let access = provider
-            .ssh_access_for(locator.clone())
-            .await
-            .map_err(|error| error.message)?;
-        tunnel
-            .bootstrap_configuration(
-                &instance_id,
-                &access.host,
-                access.port,
-                &access.username,
-                &access.password,
-            )
-            .await
-            .map_err(|error| error.message)?;
+        let bootstrap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let access = provider
+                .ssh_access_for(locator.clone())
+                .await
+                .map_err(|error| error.message)?;
+            match tunnel
+                .bootstrap_configuration(
+                    &instance_id,
+                    &access.host,
+                    access.port,
+                    &access.username,
+                    &access.password,
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "SSH_CONNECT_TIMEOUT" | "SSH_CONNECT_FAILED"
+                    ) && tokio::time::Instant::now() < bootstrap_deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+                Err(error) => return Err(error.message),
+            }
+        }
         tunnel
             .ensure_remote_service_for(&instance_id)
             .await
@@ -299,7 +321,12 @@ async fn provision_desktop_worker_connection_without_gpu() {
             std::time::Duration::from_secs(180),
         )
         .await
-        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+        provider
+            .delete_stop_scheduler_for(locator.clone())
+            .await
+            .map_err(|error| error.message)?;
+        Ok::<_, String>(())
     }
     .await;
     if let Err(error) = cleanup {
@@ -506,30 +533,39 @@ async fn generate_image_then_video_through_desktop_service_client() {
         .expect("start SSH tunnel");
     let service = ServiceClient::new(app_data_dir).expect("initialize service client");
     service
-        .retarget(tunnel_status.local_url.expect("local tunnel URL"))
+        .retarget_for(
+            &instance_id,
+            tunnel_status.local_url.expect("local tunnel URL"),
+        )
         .expect("retarget service to validation tunnel");
-    let probe = service.probe().await.expect("probe generation service");
+    let probe = service
+        .probe_for(&instance_id)
+        .await
+        .expect("probe generation service");
     assert!(probe.comfyui_ready);
 
     let request_suffix = uuid::Uuid::new_v4();
     let image_job = service
-        .submit_job(SubmitServiceJobInput {
-            client_request_id: format!("live-image-{request_suffix}"),
-            project_id: "live-e2e-validation".to_owned(),
-            scene_id: "lightning-scene".to_owned(),
-            kind: "image_generation".to_owned(),
-            workflow_id: "qwen-image-generate-v1".to_owned(),
-            parameters: json!({
-                "prompt": "儿童科普插画，深蓝色雷云覆盖远山，一道明亮闪电连接云层与地面，画面清晰，主体居中，电影感光线，无文字，无水印",
-                "negativePrompt": "模糊，畸形，文字，水印，低清晰度",
-                "width": 1344,
-                "height": 768,
-                "seed": 20260912
-            }),
-        })
+        .submit_job_for(
+            &instance_id,
+            SubmitServiceJobInput {
+                client_request_id: format!("live-image-{request_suffix}"),
+                project_id: "live-e2e-validation".to_owned(),
+                scene_id: "lightning-scene".to_owned(),
+                kind: "image_generation".to_owned(),
+                workflow_id: "qwen-image-generate-v1".to_owned(),
+                parameters: json!({
+                    "prompt": "儿童科普插画，深蓝色雷云覆盖远山，一道明亮闪电连接云层与地面，画面清晰，主体居中，电影感光线，无文字，无水印",
+                    "negativePrompt": "模糊，畸形，文字，水印，低清晰度",
+                    "width": 1344,
+                    "height": 768,
+                    "seed": 20260912
+                }),
+            },
+        )
         .await
         .expect("submit image generation job");
-    let image_job = wait_for_job(&service, &image_job.id, 10).await;
+    let image_job = wait_for_job(&service, &instance_id, &image_job.id, 10).await;
     let image_artifact = image_job
         .result_manifest
         .expect("image result manifest")
@@ -539,44 +575,50 @@ async fn generate_image_then_video_through_desktop_service_client() {
         .expect("image artifact");
     let image_path = output_dir.join("qwen-lightning-1344x768.png");
     service
-        .download_artifact(DownloadServiceArtifactInput {
-            job_id: image_job.id,
-            artifact_id: image_artifact.artifact_id,
-            destination_path: image_path.to_string_lossy().into_owned(),
-            expected_size_bytes: image_artifact.size_bytes,
-            expected_sha256: image_artifact.sha256,
-        })
+        .download_artifact_for(
+            &instance_id,
+            DownloadServiceArtifactInput {
+                job_id: image_job.id,
+                artifact_id: image_artifact.artifact_id,
+                destination_path: image_path.to_string_lossy().into_owned(),
+                expected_size_bytes: image_artifact.size_bytes,
+                expected_sha256: image_artifact.sha256,
+            },
+        )
         .await
         .expect("download generated image");
 
     let uploaded = service
-        .upload_input(&image_path.to_string_lossy())
+        .upload_input_for(&instance_id, &image_path.to_string_lossy())
         .await
         .expect("upload generated image as first frame");
     let video_job = service
-        .submit_job(SubmitServiceJobInput {
-            client_request_id: format!("live-video-{request_suffix}"),
-            project_id: "live-e2e-validation".to_owned(),
-            scene_id: "lightning-scene".to_owned(),
-            kind: "video_candidate".to_owned(),
-            workflow_id: "h3-i2v-turbo-v1".to_owned(),
-            parameters: json!({
-                "prompt": "镜头缓慢向雷云推进，云层自然翻涌，闪电由云层向地面迅速延伸并短暂照亮群山，科普动画风格，画面稳定，无字幕",
-                "seed": 20260912,
-                "firstFrameFile": uploaded.remote_file,
-                "width": 1344,
-                "height": 768,
-                "visibleWidth": 1344,
-                "visibleHeight": 756,
-                "cropX": 0,
-                "cropY": 6,
-                "length": 124,
-                "discardH3Audio": true
-            }),
-        })
+        .submit_job_for(
+            &instance_id,
+            SubmitServiceJobInput {
+                client_request_id: format!("live-video-{request_suffix}"),
+                project_id: "live-e2e-validation".to_owned(),
+                scene_id: "lightning-scene".to_owned(),
+                kind: "video_candidate".to_owned(),
+                workflow_id: "h3-i2v-turbo-v1".to_owned(),
+                parameters: json!({
+                    "prompt": "镜头缓慢向雷云推进，云层自然翻涌，闪电由云层向地面迅速延伸并短暂照亮群山，科普动画风格，画面稳定，无字幕",
+                    "seed": 20260912,
+                    "firstFrameFile": uploaded.remote_file,
+                    "width": 1344,
+                    "height": 768,
+                    "visibleWidth": 1344,
+                    "visibleHeight": 756,
+                    "cropX": 0,
+                    "cropY": 6,
+                    "length": 124,
+                    "discardH3Audio": true
+                }),
+            },
+        )
         .await
         .expect("submit H3 I2V job");
-    let video_job = wait_for_job(&service, &video_job.id, 12).await;
+    let video_job = wait_for_job(&service, &instance_id, &video_job.id, 12).await;
     let video_artifact = video_job
         .result_manifest
         .expect("video result manifest")
@@ -586,17 +628,20 @@ async fn generate_image_then_video_through_desktop_service_client() {
         .expect("video artifact");
     let video_path = output_dir.join("h3-lightning-i2v-1344x756.mp4");
     service
-        .download_artifact(DownloadServiceArtifactInput {
-            job_id: video_job.id,
-            artifact_id: video_artifact.artifact_id,
-            destination_path: video_path.to_string_lossy().into_owned(),
-            expected_size_bytes: video_artifact.size_bytes,
-            expected_sha256: video_artifact.sha256,
-        })
+        .download_artifact_for(
+            &instance_id,
+            DownloadServiceArtifactInput {
+                job_id: video_job.id,
+                artifact_id: video_artifact.artifact_id,
+                destination_path: video_path.to_string_lossy().into_owned(),
+                expected_size_bytes: video_artifact.size_bytes,
+                expected_sha256: video_artifact.sha256,
+            },
+        )
         .await
         .expect("download generated video");
     service
-        .delete_input(&uploaded.input_id)
+        .delete_input_for(&instance_id, &uploaded.input_id)
         .await
         .expect("delete uploaded first frame");
     tunnel
@@ -625,9 +670,15 @@ async fn generate_h3_native_audio_comparison() {
         .expect("start SSH tunnel");
     let service = ServiceClient::new(app_data_dir).expect("initialize service client");
     service
-        .retarget(tunnel_status.local_url.expect("local tunnel URL"))
+        .retarget_for(
+            &instance_id,
+            tunnel_status.local_url.expect("local tunnel URL"),
+        )
         .expect("retarget service to validation tunnel");
-    let probe = service.probe().await.expect("probe generation service");
+    let probe = service
+        .probe_for(&instance_id)
+        .await
+        .expect("probe generation service");
     assert!(probe.comfyui_ready);
 
     let suffix = uuid::Uuid::new_v4();
@@ -649,33 +700,36 @@ async fn generate_h3_native_audio_comparison() {
             continue;
         }
         let uploaded = service
-            .upload_input(&image_path.to_string_lossy())
+            .upload_input_for(&instance_id, &image_path.to_string_lossy())
             .await
             .unwrap_or_else(|error| panic!("upload first frame for H3 {label}: {error:?}"));
         let job = service
-            .submit_job(SubmitServiceJobInput {
-                client_request_id: format!("live-h3-audio-{label}-{suffix}"),
-                project_id: "live-audio-validation".to_owned(),
-                scene_id: format!("lightning-{label}"),
-                kind: "video_candidate".to_owned(),
-                workflow_id: "h3-i2v-turbo-v1".to_owned(),
-                parameters: json!({
-                    "prompt": prompt,
-                    "seed": seed,
-                    "firstFrameFile": uploaded.remote_file,
-                    "width": 1344,
-                    "height": 768,
-                    "visibleWidth": 1344,
-                    "visibleHeight": 756,
-                    "cropX": 0,
-                    "cropY": 6,
-                    "length": 124,
-                    "discardH3Audio": false
-                }),
-            })
+            .submit_job_for(
+                &instance_id,
+                SubmitServiceJobInput {
+                    client_request_id: format!("live-h3-audio-{label}-{suffix}"),
+                    project_id: "live-audio-validation".to_owned(),
+                    scene_id: format!("lightning-{label}"),
+                    kind: "video_candidate".to_owned(),
+                    workflow_id: "h3-i2v-turbo-v1".to_owned(),
+                    parameters: json!({
+                        "prompt": prompt,
+                        "seed": seed,
+                        "firstFrameFile": uploaded.remote_file,
+                        "width": 1344,
+                        "height": 768,
+                        "visibleWidth": 1344,
+                        "visibleHeight": 756,
+                        "cropX": 0,
+                        "cropY": 6,
+                        "length": 124,
+                        "discardH3Audio": false
+                    }),
+                },
+            )
             .await
             .unwrap_or_else(|error| panic!("submit H3 {label} job: {error:?}"));
-        let job = wait_for_job(&service, &job.id, 12).await;
+        let job = wait_for_job(&service, &instance_id, &job.id, 12).await;
         let artifact = job
             .result_manifest
             .unwrap_or_else(|| panic!("{label} result manifest"))
@@ -684,16 +738,21 @@ async fn generate_h3_native_audio_comparison() {
             .find(|artifact| artifact.kind == "video")
             .unwrap_or_else(|| panic!("{label} video artifact"));
         service
-            .download_artifact(DownloadServiceArtifactInput {
-                job_id: job.id,
-                artifact_id: artifact.artifact_id,
-                destination_path: destination.to_string_lossy().into_owned(),
-                expected_size_bytes: artifact.size_bytes,
-                expected_sha256: artifact.sha256,
-            })
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: job.id,
+                    artifact_id: artifact.artifact_id,
+                    destination_path: destination.to_string_lossy().into_owned(),
+                    expected_size_bytes: artifact.size_bytes,
+                    expected_sha256: artifact.sha256,
+                },
+            )
             .await
             .unwrap_or_else(|error| panic!("download H3 {label}: {error:?}"));
-        let _ = service.delete_input(&uploaded.input_id).await;
+        let _ = service
+            .delete_input_for(&instance_id, &uploaded.input_id)
+            .await;
     }
     tunnel
         .stop_for(&instance_id)
