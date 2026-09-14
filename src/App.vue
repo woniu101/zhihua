@@ -70,7 +70,7 @@ const nav = [
   <div class="app-frame">
     <header class="appbar">
       <RouterLink class="app-brand" to="/projects" aria-label="知画首页">
-        <BrandLogo :size="40" />
+        <BrandLogo :size="46" />
         <span><strong>知画</strong></span>
       </RouterLink>
       <nav class="global-nav" aria-label="全局导航">
