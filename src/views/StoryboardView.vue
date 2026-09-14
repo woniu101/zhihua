@@ -520,7 +520,6 @@ async function refreshTask(sceneId: string, jobId: string) {
         const downloaded = await generationRepository.downloadCompletedJob(
           scene.projectId,
           jobId,
-          frameProfile(settings.value.aspectRatio),
         );
         if (selectedSceneId.value === sceneId) {
           candidateVersions.value = await generationRepository.list(scene.projectId, sceneId);

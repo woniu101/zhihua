@@ -1,6 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { invokeNative } from "./nativeBridge";
-import type { FrameProfile } from "../domain/frameProfiles";
 
 export interface CandidateVersion {
   id: string;
@@ -93,20 +92,13 @@ export const generationRepository = {
     return result?.map(fromNative) ?? [];
   },
 
-  async downloadCompletedJob(projectId: string, jobId: string, profile: FrameProfile): Promise<CandidateVersion[]> {
+  async downloadCompletedJob(projectId: string, jobId: string): Promise<CandidateVersion[]> {
     const result = await invokeNative<NativeCandidateVersion[]>(
       "download_completed_job",
       {
         input: {
           projectId,
           jobId,
-          aspectRatio: profile.aspectRatio,
-          workWidth: profile.workWidth,
-          workHeight: profile.workHeight,
-          visibleWidth: profile.visibleWidth,
-          visibleHeight: profile.visibleHeight,
-          cropX: profile.cropX,
-          cropY: profile.cropY,
         },
       },
     );

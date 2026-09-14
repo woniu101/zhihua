@@ -126,7 +126,6 @@ export interface VideoProvider {
   submit(request: VideoGenerationRequest): Promise<GenerationJob>;
   getStatus(jobId: string): Promise<GenerationJob>;
   cancel(jobId: string): Promise<void>;
-  downloadResult(jobId: string, destination: string): Promise<string>;
 }
 
 export interface ImageProvider {

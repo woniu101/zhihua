@@ -44,6 +44,7 @@ use frame_composition::{
     FrameComposition, FrameCompositionError, FrameCompositionStorage, GetFrameCompositionInput,
     PrepareFrameDerivativeInput, SaveFrameCompositionInput,
 };
+use frame_profile::{FrameAspectRatio, FrameProfile};
 use generation::{
     CandidateVersion, EnhancedVersion, GenerationError, GenerationStorage, RecordCandidateInput,
     RecordEnhancedInput,
@@ -90,13 +91,6 @@ use tts::{
 struct DownloadCompletedJobInput {
     project_id: String,
     job_id: String,
-    aspect_ratio: String,
-    work_width: u32,
-    work_height: u32,
-    visible_width: u32,
-    visible_height: u32,
-    crop_x: u32,
-    crop_y: u32,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1924,6 +1918,28 @@ mod live_flow_tests {
     use super::*;
 
     #[test]
+    fn candidate_frame_profile_comes_from_the_submitted_job_contract() {
+        let parameters = serde_json::json!({
+            "aspectRatio": "16:9",
+            "width": 1344,
+            "height": 768,
+            "visibleWidth": 1344,
+            "visibleHeight": 756,
+            "cropX": 0,
+            "cropY": 6,
+        });
+        let profile = generation_frame_profile(&parameters).expect("valid submitted profile");
+        assert_eq!(profile.aspect_ratio.label(), "16:9");
+        assert_eq!(profile.visible.width, 1344);
+        assert_eq!(profile.visible.height, 756);
+
+        let mut tampered = parameters;
+        tampered["visibleHeight"] = serde_json::json!(768);
+        let error = generation_frame_profile(&tampered).expect_err("mismatch must fail");
+        assert!(error.contains("画幅参数"));
+    }
+
+    #[test]
     fn compute_policy_persists_and_exposes_bounded_safety_windows() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("compute-policy.json");
@@ -2633,6 +2649,7 @@ async fn download_completed_job(
     let generation_parameters = queue
         .request_parameters(&job.id)
         .unwrap_or(serde_json::Value::Null);
+    let frame_profile = generation_frame_profile(&generation_parameters)?;
     let prompt_compiler_version = generation_parameters
         .get("promptCompilerVersion")
         .and_then(serde_json::Value::as_str)
@@ -2701,13 +2718,13 @@ async fn download_completed_job(
                     local_path: downloaded.destination_path.into(),
                     size_bytes: downloaded.size_bytes,
                     sha256: downloaded.sha256,
-                    aspect_ratio: input.aspect_ratio.clone(),
-                    work_width: input.work_width,
-                    work_height: input.work_height,
-                    visible_width: input.visible_width,
-                    visible_height: input.visible_height,
-                    crop_x: input.crop_x,
-                    crop_y: input.crop_y,
+                    aspect_ratio: frame_profile.aspect_ratio.label().to_owned(),
+                    work_width: frame_profile.work.width,
+                    work_height: frame_profile.work.height,
+                    visible_width: frame_profile.visible.width,
+                    visible_height: frame_profile.visible.height,
+                    crop_x: frame_profile.crop_x,
+                    crop_y: frame_profile.crop_y,
                 })
                 .map_err(|error| error.message)?,
         );
@@ -3085,6 +3102,33 @@ fn safe_artifact_filename(artifact_id: &str, original_filename: &str) -> Result<
     }
     let stem = safe_path_component(artifact_id)?;
     Ok(format!("{stem}.{extension}"))
+}
+
+fn generation_frame_profile(parameters: &serde_json::Value) -> Result<FrameProfile, String> {
+    let aspect_ratio = parameters
+        .get("aspectRatio")
+        .and_then(serde_json::Value::as_str)
+        .and_then(FrameAspectRatio::from_label)
+        .ok_or_else(|| "生成任务没有保存有效的项目画幅，已停止保存候选。".to_owned())?;
+    let profile = aspect_ratio.profile();
+    let dimensions = [
+        ("width", profile.work.width),
+        ("height", profile.work.height),
+        ("visibleWidth", profile.visible.width),
+        ("visibleHeight", profile.visible.height),
+        ("cropX", profile.crop_x),
+        ("cropY", profile.crop_y),
+    ];
+    let matches_contract = dimensions.iter().all(|(key, expected)| {
+        parameters.get(key).and_then(serde_json::Value::as_u64) == Some(u64::from(*expected))
+    });
+    if !matches_contract {
+        return Err(format!(
+            "生成任务保存的画幅参数与 {} 契约不一致，已停止保存候选。",
+            profile.aspect_ratio.label()
+        ));
+    }
+    Ok(profile)
 }
 
 fn safe_path_component(value: &str) -> Result<String, String> {

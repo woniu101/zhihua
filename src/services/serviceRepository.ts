@@ -545,9 +545,6 @@ export class ComfyUiH3Provider implements VideoProvider {
     await invokeNative("cancel_service_job", { jobId });
   }
 
-  async downloadResult(): Promise<string> {
-    throw new Error("结果下载将在工作流执行器完成后开放");
-  }
 }
 
 export class ComfyUiQwenImageProvider implements ImageProvider {
