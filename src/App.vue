@@ -71,7 +71,7 @@ const nav = [
     <header class="appbar">
       <RouterLink class="app-brand" to="/projects" aria-label="知画首页">
         <BrandLogo :size="46" />
-        <span><strong>知画</strong><small>智能影像创作</small></span>
+        <span><strong>知画</strong></span>
       </RouterLink>
       <nav class="global-nav" aria-label="全局导航">
         <RouterLink v-for="item in nav" :key="item.path" :to="item.path">
@@ -99,7 +99,7 @@ const nav = [
     <div v-if="helpOpen" class="help-backdrop" role="presentation" @click.self="helpOpen = false">
       <section class="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
         <header>
-          <div><BrandLogo :size="40" /><div><h2 id="help-title">开始使用知画</h2><p>选择完整视频或快速素材，知画会提示下一步。</p></div></div>
+          <div><BrandLogo :size="40" /><div><h2 id="help-title">从内容到成片</h2><p>把资料或想法，变成能直接修改的分镜视频。</p></div></div>
           <button type="button" aria-label="关闭帮助" @click="helpOpen = false"><X :size="20" /></button>
         </header>
         <ol>

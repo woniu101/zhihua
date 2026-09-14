@@ -70,5 +70,5 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.compute-status{height:42px;padding:0 13px;border:1px solid var(--line);border-radius:9px;background:var(--surface);display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px;white-space:nowrap}.compute-status strong{color:var(--text)}.compute-status b{color:var(--muted)}.compute-status-dot{width:9px;height:9px;border-radius:50%;background:#98a8bd}.compute-status.online .compute-status-dot{background:#3686e8}.compute-status.ready .compute-status-dot{background:#13a36e}.compute-status.ready b{color:#087b53}.compute-status-divider{color:var(--line)}
+.compute-status{height:42px;padding:0 13px;border:1px solid var(--line);border-radius:9px;background:var(--surface);display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px;white-space:nowrap}.compute-status strong{color:var(--text)}.compute-status b{color:var(--muted)}.compute-status-dot{width:9px;height:9px;border-radius:50%;background:#98a8bd}.compute-status.online .compute-status-dot{background:#3686e8}.compute-status.ready .compute-status-dot{background:#13a36e}.compute-status.ready b{color:#087b53}.compute-status-divider{color:var(--line)}
 </style>
