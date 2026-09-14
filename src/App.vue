@@ -70,8 +70,8 @@ const nav = [
   <div class="app-frame">
     <header class="appbar">
       <RouterLink class="app-brand" to="/projects" aria-label="知画首页">
-        <BrandLogo :size="42" />
-        <span><strong>知画</strong><small>AI 视频工作台</small></span>
+        <BrandLogo :size="46" />
+        <span><strong>知画</strong><small>智能影像创作</small></span>
       </RouterLink>
       <nav class="global-nav" aria-label="全局导航">
         <RouterLink v-for="item in nav" :key="item.path" :to="item.path">

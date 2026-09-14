@@ -1,14 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="bg" x1="112" y1="78" x2="914" y2="942" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#1687FF"/>
-      <stop offset="1" stop-color="#7257E8"/>
+    <linearGradient id="bg" x1="98" y1="62" x2="930" y2="954" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#075FEA"/>
+      <stop offset=".55" stop-color="#278AFF"/>
+      <stop offset="1" stop-color="#7055E9"/>
+    </linearGradient>
+    <linearGradient id="brush" x1="196" y1="780" x2="816" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A9FFE8"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
     </linearGradient>
   </defs>
   <rect x="42" y="42" width="940" height="940" rx="278" fill="url(#bg)"/>
-  <rect x="246" y="252" width="508" height="394" rx="82" fill="#fff" fill-opacity=".16" stroke="#fff" stroke-width="52"/>
-  <path d="M355 459l90 89 132-145 165 176" fill="none" stroke="#fff" stroke-width="55" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="619" cy="386" r="45" fill="#9CF2DF"/>
-  <path d="M319 763c137-77 286-70 427 0" fill="none" stroke="#9CF2DF" stroke-width="66" stroke-linecap="round"/>
-  <path d="M796 170l21 51 51 21-51 21-21 51-21-51-51-21 51-21 21-51z" fill="#fff"/>
+  <rect x="62" y="62" width="900" height="900" rx="258" fill="none" stroke="#fff" stroke-opacity=".2" stroke-width="22"/>
+  <rect x="216" y="295" width="158" height="414" rx="59" fill="#fff" fill-opacity=".26" stroke="#fff" stroke-opacity=".84" stroke-width="38"/>
+  <rect x="433" y="236" width="158" height="492" rx="59" fill="#fff" fill-opacity=".38" stroke="#fff" stroke-width="38"/>
+  <rect x="650" y="335" width="158" height="354" rx="59" fill="#fff" fill-opacity=".25" stroke="#fff" stroke-opacity=".86" stroke-width="38"/>
+  <path d="M206 768C329 685 400 602 476 658C585 737 622 525 817 453" fill="none" stroke="url(#brush)" stroke-width="86" stroke-linecap="round"/>
+  <path d="M778 177L801 234L858 257L801 280L778 337L755 280L698 257L755 234L778 177Z" fill="#fff"/>
 </svg>
