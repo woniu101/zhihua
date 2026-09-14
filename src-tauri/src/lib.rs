@@ -1969,6 +1969,7 @@ mod live_flow_tests {
         provider
             .save_configuration(SaveLlmConfigurationInput {
                 provider_id: "deepseek".to_owned(),
+                protocol: "openai_chat".to_owned(),
                 base_url: "https://api.deepseek.com".to_owned(),
                 model: "deepseek-chat".to_owned(),
                 api_key,

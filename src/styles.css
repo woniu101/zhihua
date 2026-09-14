@@ -9,6 +9,12 @@
   --navy: #07183d;
   --text: #102347;
   --muted: #64779d;
+  --text-strong: #07183d;
+  --text-secondary: #52698e;
+  --text-disabled: #8b9bb5;
+  --border-control: #cbd9ec;
+  --focus-ring: #cfe2ff;
+  --overlay: rgba(6,20,46,.32);
   --line: #dce6f5;
   --soft: #f3f7fd;
   --panel: rgba(255, 255, 255, 0.94);
@@ -64,7 +70,7 @@ button { cursor: pointer; }
   gap: 12px;
   box-shadow: 0 3px 16px rgba(38,76,128,.045);
 }
-.app-brand { position:relative; width:210px; height:60px; margin-left:-12px; padding:0 22px 0 16px; display:flex; align-items:center; gap:13px; color:var(--navy); text-decoration:none; border-right:1px solid var(--line); background:linear-gradient(120deg,rgba(255,255,255,.96),rgba(241,247,255,.82)); }
+.app-brand { position:relative; width:188px; height:60px; margin-left:-12px; padding:0 18px 0 16px; display:flex; align-items:center; gap:12px; color:var(--navy); text-decoration:none; border-right:1px solid var(--line); background:linear-gradient(120deg,rgba(255,255,255,.96),rgba(241,247,255,.82)); }
 .app-brand:after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:linear-gradient(90deg,var(--blue),#7257e8 68%,transparent)}
 .app-brand>span { display:flex; align-items:center; line-height:1; }
 .app-brand strong { font-size:26px; letter-spacing:3px; }
@@ -132,7 +138,7 @@ button { cursor: pointer; }
 .project-progress-note { min-width:0; display:flex; align-items:center; justify-content:flex-end; gap:7px; color:#607596; font-size:14px; }
 .project-progress-note i { width:8px; height:8px; flex:0 0 auto; border-radius:50%; background:var(--green); }
 .project-progress-note span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-@media(max-width:1380px){.appbar{gap:6px;padding-left:8px}.app-brand{width:190px;margin-left:-8px;padding-left:13px;padding-right:14px}.app-brand strong{font-size:24px}.global-nav{padding-left:2px}.topbar-compute .compute-status{padding-inline:8px}.window-actions button{width:38px}.project-workspace-bar{grid-template-columns:90px 180px minmax(500px,1fr) 155px;padding-inline:10px;gap:7px}.project-stage-nav a{padding:0 6px}.project-progress-note{font-size:14px}}
+@media(max-width:1380px){.appbar{gap:6px;padding-left:8px}.app-brand{width:176px;margin-left:-8px;padding-left:13px;padding-right:12px}.app-brand strong{font-size:24px}.global-nav{padding-left:2px}.topbar-compute .compute-status{padding-inline:8px}.window-actions button{width:38px}.project-workspace-bar{grid-template-columns:90px 180px minmax(500px,1fr) 155px;padding-inline:10px;gap:7px}.project-stage-nav a{padding:0 6px}.project-progress-note{font-size:14px}}
 .page { width: 100%; height: 100%; padding: 22px 18px 16px; overflow: hidden; }
 .with-project-bar .breadcrumb { display: none; }
 .page-head { min-height: 64px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 0 4px; }
@@ -381,6 +387,12 @@ p { margin: 0; }
   --navy: #edf3fc;
   --text: #e2eaf6;
   --muted: #9cafc9;
+  --text-strong: #f2f6fc;
+  --text-secondary: #b8c7db;
+  --text-disabled: #788aa4;
+  --border-control: #405572;
+  --focus-ring: #315d93;
+  --overlay: rgba(2,8,18,.66);
   --line: #2b3c54;
   --soft: #172438;
   --panel: rgba(18, 29, 46, 0.96);

@@ -28,9 +28,11 @@ import {
 import {
   llmRepository,
   llmProviderPresets,
+  llmProtocolLabels,
   normalizeLlmError,
   type LlmConfiguration,
   type LlmProviderId,
+  type LlmProtocol,
 } from "../services/llmRepository";
 import {
   effectiveTheme,
@@ -45,7 +47,7 @@ const probe = ref<ServiceProbe>();
 const tunnelStatus = ref<TunnelStatus>({ configured: false, phase: "stopped" });
 const computeOpen = ref(false);
 const elasticCreateOpen = ref(false);
-const llmOpen = ref(false);
+const advancedOpen = ref(false);
 const busy = ref(false);
 const connectionError = ref("");
 const computeForm = reactive({ publicKey: "", privateKey: "" });
@@ -76,10 +78,10 @@ const elasticForm = reactive({
   projectId: "",
 });
 const llmConfiguration = ref<LlmConfiguration>();
-const llmForm = reactive({ providerId: "deepseek" as LlmProviderId, baseUrl: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "" });
+const llmForm = reactive({ providerId: "deepseek" as LlmProviderId, protocol: "openai_chat" as LlmProtocol, baseUrl: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "" });
 const llmNotice = ref("");
 const llmNoticeTone = ref<"success" | "error" | "neutral">("neutral");
-const activeSection = ref<"service" | "overview" | "workers" | "connection" | "storage">("service");
+const activeSection = ref<"service" | "model" | "storage" | "overview" | "workers" | "connection">("service");
 const storageInfo = ref<StorageInfo>();
 const storageNotice = ref("");
 const computePolicyOptions: Array<{ value: ComputeKeepAlivePolicy; label: string; description: string; limit: string }> = [
@@ -108,6 +110,10 @@ const selectedLlmPreset = computed(
   () => llmProviderPresets.find((item) => item.id === llmForm.providerId)
     ?? llmProviderPresets.find((item) => item.id === "custom")!,
 );
+const providerGroups = computed(() => ["国内服务", "国际服务", "自定义"].map((label) => ({
+  label,
+  items: llmProviderPresets.filter((item) => item.group === label),
+})));
 const computeModeLabel = computed(() => {
   const mode = computeInstance.value?.runningMode;
   if (mode === "gpu") return "GPU 运行中";
@@ -699,6 +705,7 @@ async function refreshLlm() {
   try {
     llmConfiguration.value = await llmRepository.configuration();
     llmForm.providerId = llmConfiguration.value.providerId;
+    llmForm.protocol = llmConfiguration.value.protocol;
     llmForm.baseUrl = llmConfiguration.value.baseUrl;
     llmForm.model = llmConfiguration.value.model;
   } catch (error) {
@@ -714,6 +721,7 @@ async function saveOrTestLlm() {
   try {
     llmConfiguration.value = await llmRepository.save(
       llmForm.providerId,
+      llmForm.protocol,
       llmForm.baseUrl,
       llmForm.model,
       llmForm.apiKey.trim(),
@@ -729,15 +737,16 @@ async function saveOrTestLlm() {
   }
 }
 
-function selectLlmProvider(event: Event) {
-  const providerId = (event.target as HTMLSelectElement).value as LlmProviderId;
+function selectLlmProvider(value: Event | LlmProviderId) {
+  const providerId = typeof value === "string" ? value : (value.target as HTMLSelectElement).value as LlmProviderId;
   const preset = llmProviderPresets.find((item) => item.id === providerId);
   if (!preset) return;
   llmForm.providerId = providerId;
+  llmForm.protocol = preset.protocol;
   llmForm.baseUrl = preset.baseUrl;
   llmForm.model = preset.model;
   llmForm.apiKey = "";
-  llmNotice.value = providerId === "doubao" ? "豆包的模型字段填写方舟控制台中的推理接入点 ID。" : "";
+  llmNotice.value = preset.help;
   llmNoticeTone.value = "neutral";
 }
 
@@ -801,13 +810,17 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
     <header class="settings-head"><div class="page-title-line"><h1>设置</h1><span class="status-line"><span class="dot" :class="{ gray: !connected }"></span><strong>{{ serviceStatus }}</strong><span>|</span><span>本地项目自动保存</span></span></div></header>
     <nav class="settings-tabs">
       <button :class="{ active: activeSection === 'service' }" type="button" @click="activeSection='service'"><Server :size="20"/>生成服务</button>
-      <button :class="{ active: activeSection === 'storage' }" type="button" @click="activeSection='storage'"><Monitor :size="20"/>存储与外观</button>
-      <button type="button" @click="llmOpen=true"><KeyRound :size="20"/>大模型设置</button>
+      <button :class="{ active: activeSection === 'model' }" type="button" @click="activeSection='model'"><KeyRound :size="20"/>智能模型</button>
+      <button :class="{ active: activeSection === 'storage' }" type="button" @click="activeSection='storage'"><Monitor :size="20"/>常规设置</button>
       <span class="settings-tabs-spacer"></span>
-      <span class="advanced-label">高级管理</span>
-      <button :class="{ active: activeSection === 'overview' }" type="button" @click="activeSection='overview'"><Calculator :size="20"/>费用与保护</button>
-      <button :class="{ active: activeSection === 'workers' }" type="button" @click="activeSection='workers'"><Database :size="20"/>实例与并行 <i v-if="managedInstances.length">{{ managedInstances.length }}</i></button>
-      <button :class="{ active: activeSection === 'connection' }" type="button" @click="activeSection='connection'"><ShieldCheck :size="20"/>连接诊断</button>
+      <div class="advanced-nav">
+        <button :class="{ active: ['overview','workers','connection'].includes(activeSection) }" type="button" @click="advancedOpen=!advancedOpen"><Wrench :size="20"/>高级管理</button>
+        <div v-if="advancedOpen" class="advanced-menu">
+          <button type="button" @click="activeSection='overview';advancedOpen=false"><Calculator :size="19"/><span><b>费用与关机保护</b><small>费用、保活和生命周期</small></span></button>
+          <button type="button" @click="activeSection='workers';advancedOpen=false"><Database :size="19"/><span><b>实例与并行</b><small>{{ managedInstances.length }} 台实例和多路生成</small></span></button>
+          <button type="button" @click="activeSection='connection';advancedOpen=false"><ShieldCheck :size="19"/><span><b>连接与环境诊断</b><small>SSH、服务版本和工作流</small></span></button>
+        </div>
+      </div>
     </nav>
 
     <div v-if="activeSection === 'service'" class="service-page">
@@ -823,6 +836,38 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
         <article class="panel service-card"><div class="service-card-icon"><ShieldCheck :size="25"/></div><div><small>连接与环境</small><h3>{{ connected ? '检查通过' : '需要检查' }}</h3><p>知画会自动处理安全连接，详细诊断只在异常时需要。</p></div><button class="btn" type="button" @click="activeSection='connection'">诊断</button></article>
       </section>
       <section class="panel simple-explainer"><div><h2>平时不需要管理实例</h2><p>在分镜页提交生成时，知画会检查服务、启动 GPU、保存任务，并按你选择的策略自动关闭。高级管理保留实例、并行、连接和生命周期的完整控制。</p></div><button class="btn" type="button" @click="activeSection='workers'">进入高级管理</button></section>
+    </div>
+
+    <div v-else-if="activeSection === 'model'" class="model-page">
+      <aside class="panel provider-panel">
+        <div class="panel-head"><div><h2>模型提供商</h2><p>选择常用服务后只需填写密钥</p></div><span class="policy-badge" :class="{ neutral: !llmConfigured }">{{ llmConfigured ? '已连接' : '待配置' }}</span></div>
+        <div class="provider-list">
+          <section v-for="group in providerGroups" :key="group.label">
+            <h3>{{ group.label }}</h3>
+            <button v-for="preset in group.items" :key="preset.id" type="button" :class="{ selected: llmForm.providerId === preset.id }" @click="selectLlmProvider(preset.id)">
+              <span class="provider-mark">{{ preset.label.slice(0, 1) }}</span><span><b>{{ preset.label }}</b><small>{{ llmProtocolLabels[preset.protocol] }}</small></span><i>{{ llmForm.providerId === preset.id ? '✓' : '›' }}</i>
+            </button>
+          </section>
+        </div>
+      </aside>
+      <section class="panel model-config-panel">
+        <div class="panel-head"><div><h2>{{ selectedLlmPreset.label }}</h2><p>{{ selectedLlmPreset.help }}</p></div><span class="model-security"><ShieldCheck :size="18"/>密钥保存在 Windows 凭据管理器</span></div>
+        <div class="model-config-body">
+          <div class="model-state-card">
+            <span class="provider-mark large">{{ selectedLlmPreset.label.slice(0, 1) }}</span>
+            <div><small>当前内容规划模型</small><h3>{{ llmConfiguration?.credentialStored && llmConfiguration.providerId === llmForm.providerId ? `${llmConfiguration.providerLabel} · ${llmConfiguration.model}` : '保存并验证后启用' }}</h3><p>资料只会在你点击提取、生成分镜或 AI 修订时发送。</p></div>
+          </div>
+          <div class="model-form-grid">
+            <label><span>API 协议</span><select v-model="llmForm.protocol" :disabled="selectedLlmPreset.protocolLocked"><option v-for="(label, value) in llmProtocolLabels" :key="value" :value="value">{{ label }}</option></select><small>{{ selectedLlmPreset.protocolLocked ? '已根据提供商自动选择' : '请选择服务文档声明支持的协议' }}</small></label>
+            <label><span>模型 / 接入点</span><input v-model="llmForm.model" autocomplete="off" :placeholder="selectedLlmPreset.modelHint"/><small>可以填写提供商控制台中的模型 ID</small></label>
+            <label class="wide"><span>API 地址</span><input v-model="llmForm.baseUrl" autocomplete="off"/><small>填写版本根地址，知画会按协议补全请求路径</small></label>
+            <label class="wide"><span>API Key</span><input v-model="llmForm.apiKey" type="password" autocomplete="new-password" :placeholder="llmConfigured ? '已保存；留空可重新测试' : `输入 ${selectedLlmPreset.label} API Key`"/><small>不同提供商的密钥相互独立，不写入项目文件</small></label>
+          </div>
+          <div class="capability-card"><h3>保存前自动验证</h3><div><span><i>1</i>鉴权与模型</span><span><i>2</i>系统指令</span><span><i>3</i>结构化 JSON</span><span><i>4</i>分镜输出能力</span></div></div>
+          <p v-if="llmNotice" class="model-notice" :class="llmNoticeTone">{{ llmNotice }}</p>
+        </div>
+        <footer class="model-actions"><button v-if="llmConfigured" class="btn link danger" type="button" :disabled="busy" @click="clearLlm">移除当前密钥</button><span></span><button class="btn" type="button" :disabled="busy" @click="refreshLlm">恢复已保存配置</button><button class="btn primary" type="button" :disabled="busy || !llmForm.baseUrl || !llmForm.model" @click="saveOrTestLlm"><RefreshCw v-if="busy" class="spin" :size="17"/>{{ llmConfigured && !llmForm.apiKey ? '重新测试连接' : '保存并验证' }}</button></footer>
+      </section>
     </div>
 
     <div v-else-if="activeSection === 'overview'" class="settings-grid settings-overview">
@@ -898,7 +943,7 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
     <div v-else-if="activeSection === 'connection'" class="connection-page">
       <section class="panel environment"><div class="panel-title"><h2>主实例环境检查</h2><button class="btn link" type="button" :disabled="busy || (!connectionInfo?.configured && !tunnelStatus.configured)" @click="refreshConnection"><RefreshCw :size="15"/>连接并检查</button></div><div class="check-list"><p v-for="(item,index) in checks" :key="item.name"><span class="service-icon">{{ ['知','⌘','◇','▧','≋','⊞'][index] }}</span>{{ item.name }}<span :class="item.tone === 'success' ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: item.tone !== 'success' }"></span>{{ item.state }}</span></p></div><div class="disk"><HardDrive :size="22"/><div><b>远端磁盘</b><span>服务就绪后读取系统盘与工作目录空间</span></div><strong>待检测</strong></div></section>
       <section class="panel worker-health-panel"><div class="panel-head"><div><h2>全部 worker 连接状态</h2><p>异常实例不会领取新任务，其他实例可以继续工作。</p></div><button class="btn" type="button" :disabled="busy" @click="refreshCompute"><RefreshCw :size="16"/>刷新状态</button></div><div class="worker-health-list"><article v-for="item in managedInstances" :key="item.instanceId"><span class="dot" :class="{ gray: workerReadiness[item.instanceId]?.state !== 'ready' }"></span><div><b>{{ item.name ?? item.instanceId }}</b><small>{{ item.zone }} · {{ managedModeLabel(item) }}</small></div><strong :class="workerReadinessTone(item.instanceId)">{{ workerReadinessLabel(item.instanceId) }}</strong><button class="mini-btn" type="button" :disabled="busy || item.runningMode === 'stopped'" @click="checkManagedWorker(item)">检查</button></article><p v-if="!managedInstances.length" class="empty-instances">配置算力账户后，这里会逐台显示连接和服务版本。</p></div></section>
-      <section class="panel connection connection-full"><div class="panel-head"><h2>连接信息</h2><span :class="connected ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: !connected }"></span>{{ connectionLabel }}</span></div><div class="connection-cards"><article role="button" tabindex="0" @click="llmOpen=true" @keydown.enter="llmOpen=true"><KeyRound :size="31"/><div><b>大模型内容规划</b><span>{{ llmConfiguration?.credentialStored ? `${llmConfiguration.providerLabel} · ${llmConfiguration.model}` : '等待配置 API Key' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><KeyRound :size="31"/><div><b>自动安全连接</b><span>{{ tunnelStatus.configured ? 'SSH 私钥已保存到 Windows 凭据库' : '等待实例连接配置' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><Server :size="31"/><div><b>本机服务入口</b><span>{{ tunnelStatus.localUrl ?? connectionInfo?.baseUrl ?? '启动时自动分配' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><ShieldCheck :size="31"/><div><b>版本握手　<span :class="connected ? 'success-text' : 'waiting-text'">● {{ connectionLabel }}</span></b><span>{{ connected ? `API ${probe?.apiVersion} · 服务 ${probe?.serviceVersion}` : connectionError || '点击建立连接并检查兼容性' }}</span></div><strong>›</strong></article></div></section>
+      <section class="panel connection connection-full"><div class="panel-head"><h2>连接信息</h2><span :class="connected ? 'success-text' : 'waiting-text'"><span class="dot" :class="{ gray: !connected }"></span>{{ connectionLabel }}</span></div><div class="connection-cards"><article role="button" tabindex="0" @click="activeSection='model'" @keydown.enter="activeSection='model'"><KeyRound :size="31"/><div><b>大模型内容规划</b><span>{{ llmConfiguration?.credentialStored ? `${llmConfiguration.providerLabel} · ${llmConfiguration.model}` : '等待配置 API Key' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><KeyRound :size="31"/><div><b>自动安全连接</b><span>{{ tunnelStatus.configured ? 'SSH 私钥已保存到 Windows 凭据库' : '等待实例连接配置' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><Server :size="31"/><div><b>本机服务入口</b><span>{{ tunnelStatus.localUrl ?? connectionInfo?.baseUrl ?? '启动时自动分配' }}</span></div><strong>›</strong></article><article role="button" tabindex="0" @click="refreshConnection" @keydown.enter="refreshConnection"><ShieldCheck :size="31"/><div><b>版本握手　<span :class="connected ? 'success-text' : 'waiting-text'">● {{ connectionLabel }}</span></b><span>{{ connected ? `API ${probe?.apiVersion} · 服务 ${probe?.serviceVersion}` : connectionError || '点击建立连接并检查兼容性' }}</span></div><strong>›</strong></article></div></section>
     </div>
 
     <div v-else class="appearance-grid">
@@ -969,20 +1014,6 @@ onMounted(() => Promise.allSettled([refreshConnection(), refreshCompute(), refre
           <p v-if="elasticCreateNotice" class="connection-notice elastic-notice" :class="elasticCreateNoticeTone">{{ elasticCreateNotice }}</p>
         </div>
         <footer><span></span><span></span><button class="btn" type="button" :disabled="elasticCreateBusy" @click="closeElasticCreate">取消</button><button v-if="!elasticPreflight?.capacityAvailable" class="btn primary" type="button" :disabled="elasticCreateBusy || !elasticForm.name || !elasticForm.imageId || elasticCreateCount < 1" @click="preflightElasticCreate"><RefreshCw :size="16"/>{{ elasticCreateBusy ? '正在查询' : '查询库存与报价' }}</button><button v-else class="btn primary" type="button" :disabled="elasticCreateBusy" @click="confirmElasticCreate"><Plus :size="16"/>{{ elasticCreateBusy ? '正在创建' : `确认创建 ${elasticCreateCount} 台并开始计费` }}</button></footer>
-      </section>
-    </div>
-
-    <div v-if="llmOpen" class="connection-backdrop" role="presentation" @click.self="llmOpen=false">
-      <section class="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="llm-title">
-        <header><div><h2 id="llm-title">大模型内容规划</h2><p>资料只会在你点击提取或修订时发送；每个提供商的 API Key 分开保存在 Windows 凭据管理器。</p></div><button type="button" aria-label="关闭" @click="llmOpen=false"><X :size="20"/></button></header>
-        <div class="connection-form">
-          <label><span>提供商</span><select :value="llmForm.providerId" @change="selectLlmProvider"><option v-for="preset in llmProviderPresets" :key="preset.id" :value="preset.id">{{ preset.label }}</option></select></label>
-          <label><span>API 地址</span><input v-model="llmForm.baseUrl" autocomplete="off"/></label>
-          <label><span>模型 / 接入点</span><input v-model="llmForm.model" autocomplete="off" :placeholder="selectedLlmPreset.modelHint"/></label>
-          <label><span>API Key</span><input v-model="llmForm.apiKey" type="password" autocomplete="new-password" :placeholder="llmConfigured ? '已保存；留空可只测试连接' : `输入 ${selectedLlmPreset.label} API Key`"/></label>
-          <p v-if="llmNotice" class="connection-notice" :class="llmNoticeTone">{{ llmNotice }}</p>
-        </div>
-        <footer><button v-if="llmConfigured" class="btn link danger" type="button" :disabled="busy" @click="clearLlm">移除密钥</button><span></span><button class="btn" type="button" @click="llmOpen=false">取消</button><button class="btn primary" type="button" :disabled="busy" @click="saveOrTestLlm">{{ llmConfigured && !llmForm.apiKey ? '保存并测试' : '保存并验证' }}</button></footer>
       </section>
     </div>
 
@@ -1057,4 +1088,18 @@ export default { components: { FileTextIcon } };
 .simple-explainer{padding:24px 28px;display:flex;align-items:center;justify-content:space-between;gap:30px}.simple-explainer>div{max-width:850px}.simple-explainer h2{font-size:21px}.simple-explainer p{margin-top:8px;color:var(--muted);font-size:15px;line-height:1.6}.simple-explainer>.btn{min-width:150px}
 :global(:root[data-theme="dark"]) .service-cost b{color:var(--text)}
 @media(max-width:1380px){.advanced-label{display:none}.service-hero{grid-template-columns:62px minmax(280px,1fr) 210px auto;padding:20px;gap:15px}.service-symbol{width:58px;height:58px}.service-copy h2{font-size:24px}.service-copy p{font-size:14px}.service-cost{padding-left:16px}.service-cost b{font-size:19px}.service-cards{gap:10px}.service-card{padding:15px}.service-page{grid-template-rows:170px 180px minmax(120px,1fr)}}
+
+/* Settings information architecture and model provider page. */
+.settings-tabs{position:relative;gap:18px}.settings-tabs>button,.advanced-nav>button{color:var(--text-secondary)}
+.advanced-nav{position:relative;margin-left:4px}.advanced-menu{position:absolute;z-index:30;right:0;top:55px;width:310px;padding:8px;border:1px solid var(--line);border-radius:12px;background:var(--surface);box-shadow:0 20px 55px rgba(12,35,69,.22)}
+.advanced-menu>button{width:100%;height:66px;padding:8px 12px;border:0;border-radius:8px;display:grid;grid-template-columns:30px 1fr;align-items:center;gap:8px;text-align:left;color:var(--text);background:transparent}.advanced-menu>button:hover{background:var(--control-hover)}.advanced-menu>button:after{display:none}.advanced-menu>button>svg{color:var(--blue)}.advanced-menu>button>span{display:flex;flex-direction:column;gap:4px}.advanced-menu b{font-size:15px}.advanced-menu small{color:var(--muted);font-size:14px;font-weight:400}
+.model-page{min-height:0;padding-top:14px;display:grid;grid-template-columns:370px minmax(0,1fr);gap:14px}.provider-panel,.model-config-panel{min-height:0;overflow:hidden}.provider-panel{display:flex;flex-direction:column}.provider-panel .panel-head p,.model-config-panel .panel-head p{margin-top:5px;color:var(--muted);font-size:14px}.provider-list{flex:1;min-height:0;padding:10px 12px 16px;overflow:auto}.provider-list section+section{margin-top:14px}.provider-list h3{margin:0 8px 7px;color:var(--muted);font-size:14px}.provider-list button{width:100%;min-height:57px;margin:4px 0;padding:7px 10px;border:1px solid transparent;border-radius:9px;display:grid;grid-template-columns:38px minmax(0,1fr) 18px;align-items:center;gap:9px;text-align:left;color:var(--text);background:transparent}.provider-list button:hover{background:var(--control-hover)}.provider-list button.selected{border-color:var(--blue);background:var(--selected);box-shadow:0 0 0 1px var(--blue) inset}.provider-list button>span:nth-child(2){min-width:0}.provider-list b,.provider-list small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.provider-list b{font-size:15px}.provider-list small{margin-top:4px;color:var(--muted);font-size:13px}.provider-list i{color:var(--blue);font-style:normal;font-weight:800}
+.provider-mark{width:35px;height:35px;border-radius:9px;display:grid;place-items:center;color:var(--blue);background:var(--blue-soft);font-size:17px;font-weight:800}.provider-mark.large{width:54px;height:54px;border-radius:14px;font-size:23px}.model-config-panel{display:flex;flex-direction:column}.model-security{color:var(--text-secondary);font-weight:650}.model-security svg{color:var(--green)}.model-config-body{flex:1;min-height:0;padding:18px 22px;overflow:auto}.model-state-card{min-height:92px;padding:16px;border:1px solid var(--line);border-radius:11px;display:grid;grid-template-columns:54px minmax(0,1fr);align-items:center;gap:14px;background:var(--surface-soft)}.model-state-card small,.model-state-card p{color:var(--muted)}.model-state-card h3{margin:5px 0;font-size:19px}.model-state-card p{font-size:14px}.model-form-grid{margin-top:18px;display:grid;grid-template-columns:1fr 1fr;gap:16px}.model-form-grid label{display:flex;flex-direction:column;gap:7px}.model-form-grid label.wide{grid-column:1/3}.model-form-grid label>span{color:var(--text);font-size:15px;font-weight:750}.model-form-grid input,.model-form-grid select{width:100%;height:46px;padding:0 13px;border:1px solid var(--border-control);border-radius:8px;color:var(--text);background:var(--control);user-select:text}.model-form-grid input:focus,.model-form-grid select:focus{outline:2px solid var(--focus-ring);border-color:var(--blue)}.model-form-grid select:disabled{color:var(--text-secondary);border-color:var(--line);background:var(--surface-muted);cursor:default}.model-form-grid small{color:var(--muted);font-size:14px}.capability-card{margin-top:18px;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--surface-soft)}.capability-card h3{font-size:15px}.capability-card>div{margin-top:12px;display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.capability-card span{display:flex;align-items:center;gap:7px;color:var(--text-secondary);font-size:14px}.capability-card i{width:23px;height:23px;border-radius:50%;display:grid;place-items:center;color:var(--blue);background:var(--blue-soft);font-style:normal;font-weight:800}.model-notice{margin-top:15px;padding:12px 14px;border-radius:8px;color:var(--text-secondary);background:var(--surface-muted)}.model-notice.success{color:#087d51;background:var(--success-soft)}.model-notice.error{color:#b33b35;background:var(--danger-soft)}.model-actions{min-height:72px;padding:12px 22px;border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:10px;background:var(--surface)}
+
+/* Controls use semantic colors in both themes; disabled text remains readable. */
+.policy-options>button,.managed-picker>article,.mini-btn,.policy-guard button,.setting-row button,.connection-dialog,.connection-dialog>header,.connection-dialog>footer,.connection-form input,.connection-form select{color:var(--text);border-color:var(--line);background:var(--surface)}
+.policy-options>button.selected,.managed-picker>article.selected{border-color:var(--blue);background:var(--selected)}.policy-options p,.policy-guard small,.instance-row-main small,.instance-row-foot,.connection-form small,.connection-dialog>header p{color:var(--muted)}.instance-row-main b,.instance-row-main strong,.instance-center-head,.connection-form label>span{color:var(--text)}.policy-guard>svg,.setting-row svg,.service-icon{color:var(--blue)}
+button:disabled,input:disabled,select:disabled{opacity:1;color:var(--text-disabled);cursor:not-allowed}.connection-backdrop{background:var(--overlay)}.connection-dialog>header,.connection-dialog>footer{background:var(--surface)}
+:global(:root[data-theme="dark"]) .model-notice.success{color:#66d9a7}:global(:root[data-theme="dark"]) .model-notice.error{color:#ff9a91}:global(:root[data-theme="dark"]) .instance-role{color:#c0cee0;background:var(--surface-muted)}:global(:root[data-theme="dark"]) .instance-role.managed{color:#66d9a7;background:var(--success-soft)}
+@media(max-width:1380px){.model-page{grid-template-columns:320px minmax(0,1fr)}.model-config-body{padding:14px 17px}.capability-card>div{grid-template-columns:1fr 1fr}.advanced-menu{right:-4px}}
 </style>

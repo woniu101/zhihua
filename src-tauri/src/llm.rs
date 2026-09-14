@@ -57,6 +57,8 @@ type LlmResult<T> = Result<T, LlmError>;
 struct LlmMetadata {
     #[serde(default = "default_provider_id")]
     provider_id: String,
+    #[serde(default = "default_protocol")]
+    protocol: String,
     base_url: String,
     model: String,
 }
@@ -65,6 +67,7 @@ impl Default for LlmMetadata {
     fn default() -> Self {
         Self {
             provider_id: DEFAULT_PROVIDER_ID.to_owned(),
+            protocol: default_protocol(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             model: DEFAULT_MODEL.to_owned(),
         }
@@ -76,6 +79,8 @@ impl Default for LlmMetadata {
 pub struct LlmConfiguration {
     pub provider_id: String,
     pub provider_label: String,
+    pub protocol: String,
+    pub protocol_label: String,
     pub base_url: String,
     pub model: String,
     pub credential_stored: bool,
@@ -85,6 +90,7 @@ pub struct LlmConfiguration {
 #[serde(rename_all = "camelCase")]
 pub struct SaveLlmConfigurationInput {
     pub provider_id: String,
+    pub protocol: String,
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -96,7 +102,12 @@ pub struct LlmConnectionTest {
     pub connected: bool,
     pub provider_id: String,
     pub provider_label: String,
+    pub protocol: String,
+    pub protocol_label: String,
     pub model: String,
+    pub structured_output: bool,
+    pub system_instructions: bool,
+    pub verified_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +249,36 @@ struct ChatMessageWire {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ResponsesWire {
+    #[serde(default)]
+    output: Vec<ResponseOutputWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseOutputWire {
+    #[serde(default)]
+    content: Vec<ResponseContentWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseContentWire {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicWire {
+    #[serde(default)]
+    content: Vec<AnthropicContentWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentWire {
+    #[serde(default)]
+    text: String,
+}
+
 #[derive(Clone)]
 pub struct LlmProvider {
     metadata_path: PathBuf,
@@ -267,11 +308,17 @@ impl LlmProvider {
         };
         let metadata = normalize_configuration(
             &loaded_metadata.provider_id,
+            &loaded_metadata.protocol,
             &loaded_metadata.base_url,
             &loaded_metadata.model,
         )
         .or_else(|_| {
-            normalize_configuration("custom", &loaded_metadata.base_url, &loaded_metadata.model)
+            normalize_configuration(
+                "custom",
+                &loaded_metadata.protocol,
+                &loaded_metadata.base_url,
+                &loaded_metadata.model,
+            )
         })
         .unwrap_or_default();
         let provider = Self {
@@ -339,7 +386,9 @@ impl LlmProvider {
         };
         Ok(LlmConfiguration {
             provider_label: provider_label(&metadata.provider_id).to_owned(),
+            protocol_label: protocol_label(&metadata.protocol).to_owned(),
             provider_id: metadata.provider_id,
+            protocol: metadata.protocol,
             base_url: metadata.base_url,
             model: metadata.model.clone(),
             credential_stored,
@@ -351,7 +400,12 @@ impl LlmProvider {
         &self,
         input: SaveLlmConfigurationInput,
     ) -> LlmResult<LlmConfiguration> {
-        let metadata = normalize_configuration(&input.provider_id, &input.base_url, &input.model)?;
+        let metadata = normalize_configuration(
+            &input.provider_id,
+            &input.protocol,
+            &input.base_url,
+            &input.model,
+        )?;
         let api_key = input.api_key.trim();
         if api_key.len() > 4096 {
             return Err(LlmError::new(
@@ -378,7 +432,12 @@ impl LlmProvider {
         &self,
         input: SaveLlmConfigurationInput,
     ) -> LlmResult<LlmConfiguration> {
-        let metadata = normalize_configuration(&input.provider_id, &input.base_url, &input.model)?;
+        let metadata = normalize_configuration(
+            &input.provider_id,
+            &input.protocol,
+            &input.base_url,
+            &input.model,
+        )?;
         let candidate_key = if input.api_key.trim().is_empty() {
             stored_api_key(&metadata.provider_id)?
         } else if input.api_key.len() <= 4096 {
@@ -419,42 +478,17 @@ impl LlmProvider {
         metadata: &LlmMetadata,
         api_key: &str,
     ) -> LlmResult<LlmConnectionTest> {
-        let body = with_json_response_format(
-            json!({
-                "model": metadata.model,
-                "temperature": 0,
-                "max_tokens": 32,
-                "messages": [
-                    {"role": "system", "content": "只返回严格 JSON，不要 Markdown。"},
-                    {"role": "user", "content": "返回 {\"ok\":true}"}
-                ]
-            }),
-            metadata,
-        );
-        let response = self
-            .client
-            .post(endpoint(&metadata.base_url, "chat/completions")?)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
-        let status = response.status();
-        let text = response.text().await.map_err(http_error)?;
-        ensure_success(status, text.clone())?;
-        let completion: ChatCompletionWire = serde_json::from_str(&text)
-            .map_err(|_| LlmError::new("INVALID_RESPONSE", "服务未返回兼容的模型响应"))?;
-        let content = completion
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| {
-                LlmError::new(
-                    "EMPTY_RESPONSE",
-                    "模型未返回内容，请检查模型名称或推理接入点",
-                )
-            })?;
-        let value: Value = parse_json_content(content, "连接测试结果")?;
+        let content = self
+            .complete_json(
+                metadata,
+                api_key,
+                "只返回严格 JSON，不要 Markdown。",
+                "返回 {\"ok\":true}",
+                0.0,
+                64,
+            )
+            .await?;
+        let value: Value = parse_json_content(&content, "连接测试结果")?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(LlmError::new(
                 "INVALID_RESPONSE",
@@ -465,8 +499,149 @@ impl LlmProvider {
             connected: true,
             provider_id: metadata.provider_id.clone(),
             provider_label: provider_label(&metadata.provider_id).to_owned(),
+            protocol: metadata.protocol.clone(),
+            protocol_label: protocol_label(&metadata.protocol).to_owned(),
             model: metadata.model.clone(),
+            structured_output: true,
+            system_instructions: true,
+            verified_at: now_iso(),
         })
+    }
+
+    async fn complete_json(
+        &self,
+        metadata: &LlmMetadata,
+        api_key: &str,
+        system: &str,
+        user: &str,
+        temperature: f64,
+        max_tokens: u32,
+    ) -> LlmResult<String> {
+        let (path, body) = match metadata.protocol.as_str() {
+            "openai_responses" => (
+                "responses",
+                json!({
+                    "model": metadata.model,
+                    "max_output_tokens": max_tokens,
+                    "store": false,
+                    "instructions": system,
+                    "input": user,
+                    "text": { "format": { "type": "json_object" } }
+                }),
+            ),
+            "anthropic_messages" => (
+                "v1/messages",
+                json!({
+                    "model": metadata.model,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}]
+                }),
+            ),
+            _ => (
+                "chat/completions",
+                with_json_response_format(
+                    json!({
+                        "model": metadata.model,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user}
+                        ]
+                    }),
+                    metadata,
+                ),
+            ),
+        };
+        let mut request = self
+            .client
+            .post(endpoint(&metadata.base_url, path)?)
+            .json(&body);
+        request = if metadata.protocol == "anthropic_messages" {
+            request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            request.bearer_auth(api_key)
+        };
+        let response = request.send().await.map_err(http_error)?;
+        let status = response.status();
+        let text = response.text().await.map_err(http_error)?;
+        ensure_success(status, text.clone())?;
+        match metadata.protocol.as_str() {
+            "openai_responses" => {
+                let response: ResponsesWire = serde_json::from_str(&text).map_err(|_| {
+                    LlmError::new("INVALID_RESPONSE", "服务未返回可识别的 Responses API 响应")
+                })?;
+                response
+                    .output
+                    .into_iter()
+                    .flat_map(|item| item.content)
+                    .map(|item| item.text)
+                    .find(|item| !item.trim().is_empty())
+                    .ok_or_else(|| {
+                        LlmError::new("EMPTY_RESPONSE", "Responses API 没有返回文字内容")
+                    })
+            }
+            "anthropic_messages" => {
+                let response: AnthropicWire = serde_json::from_str(&text).map_err(|_| {
+                    LlmError::new(
+                        "INVALID_RESPONSE",
+                        "服务未返回可识别的 Anthropic Messages 响应",
+                    )
+                })?;
+                response
+                    .content
+                    .into_iter()
+                    .map(|item| item.text)
+                    .find(|item| !item.trim().is_empty())
+                    .ok_or_else(|| LlmError::new("EMPTY_RESPONSE", "Claude 没有返回文字内容"))
+            }
+            _ => {
+                let response: ChatCompletionWire = serde_json::from_str(&text).map_err(|_| {
+                    LlmError::new("INVALID_RESPONSE", "服务未返回兼容的 Chat Completions 响应")
+                })?;
+                response
+                    .choices
+                    .into_iter()
+                    .map(|choice| choice.message.content)
+                    .find(|item| !item.trim().is_empty())
+                    .ok_or_else(|| {
+                        LlmError::new(
+                            "EMPTY_RESPONSE",
+                            "模型未返回内容，请检查模型名称或推理接入点",
+                        )
+                    })
+            }
+        }
+    }
+
+    async fn complete_from_chat_body(
+        &self,
+        metadata: &LlmMetadata,
+        api_key: &str,
+        body: &Value,
+    ) -> LlmResult<String> {
+        let system = body
+            .pointer("/messages/0/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LlmError::new("INVALID_REQUEST", "模型请求缺少系统指令"))?;
+        let user = body
+            .pointer("/messages/1/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LlmError::new("INVALID_REQUEST", "模型请求缺少用户内容"))?;
+        let temperature = body
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.2);
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096) as u32;
+        self.complete_json(metadata, api_key, system, user, temperature, max_tokens)
+            .await
     }
 
     pub fn list_knowledge_points(&self, project_id: &str) -> LlmResult<Vec<KnowledgePoint>> {
@@ -587,25 +762,10 @@ impl LlmProvider {
             }),
             &metadata,
         );
-        let response = self
-            .client
-            .post(endpoint(&metadata.base_url, "chat/completions")?)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
-        let status = response.status();
-        let text = response.text().await.map_err(http_error)?;
-        ensure_success(status, text.clone())?;
-        let completion: ChatCompletionWire = serde_json::from_str(&text)
-            .map_err(|_| LlmError::new("INVALID_RESPONSE", "大模型返回了无法识别的响应"))?;
-        let content = completion
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| LlmError::new("EMPTY_RESPONSE", "大模型没有返回内容"))?;
-        let plan = parse_content_plan(content)?;
+        let content = self
+            .complete_from_chat_body(&metadata, &api_key, &body)
+            .await?;
+        let plan = parse_content_plan(&content)?;
         let points = build_points(plan, &source_catalog)?;
         self.replace_knowledge_points(&input.project_id, &points)
     }
@@ -670,25 +830,10 @@ impl LlmProvider {
             }),
             &metadata,
         );
-        let response = self
-            .client
-            .post(endpoint(&metadata.base_url, "chat/completions")?)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
-        let status = response.status();
-        let text = response.text().await.map_err(http_error)?;
-        ensure_success(status, text.clone())?;
-        let completion: ChatCompletionWire = serde_json::from_str(&text)
-            .map_err(|_| LlmError::new("INVALID_RESPONSE", "大模型返回了无法识别的响应"))?;
-        let content = completion
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| LlmError::new("EMPTY_RESPONSE", "大模型没有返回分镜"))?;
-        let plan: StoryboardPlanWire = parse_json_content(content, "分镜规划")?;
+        let content = self
+            .complete_from_chat_body(&metadata, &api_key, &body)
+            .await?;
+        let plan: StoryboardPlanWire = parse_json_content(&content, "分镜规划")?;
         validate_storyboard_plan(&plan, &points)?;
         Ok(plan.scenes)
     }
@@ -749,25 +894,10 @@ impl LlmProvider {
             }),
             &metadata,
         );
-        let response = self
-            .client
-            .post(endpoint(&metadata.base_url, "chat/completions")?)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
-        let status = response.status();
-        let text = response.text().await.map_err(http_error)?;
-        ensure_success(status, text.clone())?;
-        let completion: ChatCompletionWire = serde_json::from_str(&text)
-            .map_err(|_| LlmError::new("INVALID_RESPONSE", "大模型返回了无法识别的修订响应"))?;
-        let content = completion
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| LlmError::new("EMPTY_RESPONSE", "大模型没有返回修订提案"))?;
-        let proposal: SceneRevisionWire = parse_json_content(content, "分镜修订提案")?;
+        let content = self
+            .complete_from_chat_body(&metadata, &api_key, &body)
+            .await?;
+        let proposal: SceneRevisionWire = parse_json_content(&content, "分镜修订提案")?;
         validate_scene_revision(&proposal)?;
         Ok(SceneRevisionProposal {
             title: proposal.title,
@@ -984,17 +1114,49 @@ fn validate_point(point: &KnowledgePoint) -> LlmResult<()> {
 
 fn normalize_configuration(
     provider_id: &str,
+    protocol: &str,
     base_url: &str,
     model: &str,
 ) -> LlmResult<LlmMetadata> {
     let provider_id = provider_id.trim().to_ascii_lowercase();
     if !matches!(
         provider_id.as_str(),
-        "deepseek" | "qwen" | "doubao" | "custom"
+        "deepseek"
+            | "qwen"
+            | "doubao"
+            | "zhipu"
+            | "moonshot"
+            | "minimax"
+            | "openai"
+            | "anthropic"
+            | "gemini"
+            | "custom"
     ) {
         return Err(LlmError::new(
             "INVALID_PROVIDER",
             "请选择受支持的大模型提供商",
+        ));
+    }
+    let protocol = protocol.trim().to_ascii_lowercase();
+    if !matches!(
+        protocol.as_str(),
+        "openai_chat" | "openai_responses" | "anthropic_messages"
+    ) {
+        return Err(LlmError::new(
+            "INVALID_PROTOCOL",
+            "请选择受支持的大模型 API 协议",
+        ));
+    }
+    let required_protocol = match provider_id.as_str() {
+        "openai" => Some("openai_responses"),
+        "anthropic" => Some("anthropic_messages"),
+        "custom" => None,
+        _ => Some("openai_chat"),
+    };
+    if required_protocol.is_some_and(|required| required != protocol) {
+        return Err(LlmError::new(
+            "INVALID_PROTOCOL",
+            "所选提供商与 API 协议不匹配",
         ));
     }
     let base_url = base_url.trim().trim_end_matches('/');
@@ -1028,6 +1190,7 @@ fn normalize_configuration(
     }
     Ok(LlmMetadata {
         provider_id,
+        protocol,
         base_url: base_url.to_owned(),
         model: model.to_owned(),
     })
@@ -1039,7 +1202,7 @@ fn endpoint(base_url: &str, path: &str) -> LlmResult<Url> {
 }
 
 fn with_json_response_format(mut body: Value, metadata: &LlmMetadata) -> Value {
-    if metadata.provider_id != "custom" {
+    if metadata.protocol == "openai_chat" {
         body["response_format"] = json!({ "type": "json_object" });
     }
     body
@@ -1149,13 +1312,32 @@ fn default_provider_id() -> String {
     DEFAULT_PROVIDER_ID.to_owned()
 }
 
+fn default_protocol() -> String {
+    "openai_chat".to_owned()
+}
+
 fn provider_label(provider_id: &str) -> &'static str {
     match provider_id {
         "deepseek" => "DeepSeek",
         "qwen" => "通义千问",
         "doubao" => "豆包",
-        "custom" => "自定义兼容服务",
+        "zhipu" => "智谱 GLM",
+        "moonshot" => "Moonshot / Kimi",
+        "minimax" => "MiniMax",
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic Claude",
+        "gemini" => "Google Gemini",
+        "custom" => "自定义服务",
         _ => "大模型",
+    }
+}
+
+fn protocol_label(protocol: &str) -> &'static str {
+    match protocol {
+        "openai_chat" => "OpenAI 对话格式",
+        "openai_responses" => "OpenAI Responses 格式",
+        "anthropic_messages" => "Anthropic Messages 格式",
+        _ => "未知协议",
     }
 }
 
@@ -1187,10 +1369,21 @@ mod tests {
 
     #[test]
     fn rejects_non_local_plain_http_configuration() {
-        let error = normalize_configuration("deepseek", "http://api.example.com", "deepseek-chat")
-            .expect_err("plain HTTP must fail");
+        let error = normalize_configuration(
+            "deepseek",
+            "openai_chat",
+            "http://api.example.com",
+            "deepseek-chat",
+        )
+        .expect_err("plain HTTP must fail");
         assert_eq!(error.code, "INSECURE_BASE_URL");
-        assert!(normalize_configuration("custom", "http://127.0.0.1:8080", "test-model").is_ok());
+        assert!(normalize_configuration(
+            "custom",
+            "openai_chat",
+            "http://127.0.0.1:8080",
+            "test-model"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1338,6 +1531,7 @@ mod tests {
         let configuration = provider
             .save_configuration(SaveLlmConfigurationInput {
                 provider_id: DEFAULT_PROVIDER_ID.to_owned(),
+                protocol: default_protocol(),
                 base_url: DEFAULT_BASE_URL.to_owned(),
                 model: DEFAULT_MODEL.to_owned(),
                 api_key,
