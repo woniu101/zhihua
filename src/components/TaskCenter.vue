@@ -80,6 +80,27 @@ function statusMeta(status: string): { label: string; tone: string; icon: typeof
   return { label: "生成中", tone: "running", icon: LoaderCircle };
 }
 
+function progressPercent(job: LocalGenerationJob): number {
+  return Math.max(0, Math.min(100, Math.round(job.progress * 100)));
+}
+
+function hasMeasuredProgress(job: LocalGenerationJob): boolean {
+  if (!activeStatuses.has(job.status)) return false;
+  if (job.status === "running" && progressPercent(job) <= 15) return false;
+  return progressPercent(job) > 0;
+}
+
+function stageLabel(job: LocalGenerationJob): string {
+  const detail = job.statusDetail?.toLowerCase() ?? "";
+  if (job.status === "running" && detail.includes("accepted")) return "模型已接收，等待开始推理";
+  if (job.status === "running" && detail.includes("execut")) return "模型推理中，耗时取决于时长和画面复杂度";
+  if (job.status === "uploading") return "正在上传参考素材";
+  if (job.status === "downloading") return "正在校验并保存生成结果";
+  if (job.status === "waiting_for_compute") return "等待可用 GPU";
+  if (["pending_submit", "leased", "queued", "preparing"].includes(job.status)) return "正在准备生成环境并排队";
+  return job.statusDetail || statusMeta(job.status).label;
+}
+
 function timeLabel(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.valueOf())) return "";
@@ -190,8 +211,12 @@ onBeforeUnmount(() => {
                 </span>
               </div>
               <p>{{ projectName(job) }} · {{ timeLabel(job.updatedAt) }}</p>
-              <div v-if="activeStatuses.has(job.status)" class="task-progress">
-                <i :style="{ width: `${Math.max(4, Math.round(job.progress * 100))}%` }" />
+              <div v-if="activeStatuses.has(job.status)" class="task-stage">
+                <span>{{ stageLabel(job) }}</span>
+                <b>{{ hasMeasuredProgress(job) ? `${progressPercent(job)}%` : "进行中" }}</b>
+              </div>
+              <div v-if="activeStatuses.has(job.status)" class="task-progress" :class="{ indeterminate: !hasMeasuredProgress(job) }">
+                <i :style="hasMeasuredProgress(job) ? { width: `${Math.max(4, progressPercent(job))}%` } : undefined" />
               </div>
               <p v-if="job.errorMessage" class="task-error-detail">{{ job.errorMessage }}</p>
               <div class="task-item-actions">

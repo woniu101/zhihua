@@ -270,6 +270,12 @@ struct JobWire {
     result_manifest: Option<ServiceResultManifest>,
 }
 
+#[cfg(test)]
+#[derive(Deserialize)]
+struct JobListWire {
+    jobs: Vec<JobWire>,
+}
+
 #[derive(Deserialize)]
 struct InputUploadWire {
     input_id: String,
@@ -612,6 +618,23 @@ impl ServiceClient {
     pub async fn get_job_for(&self, instance_id: &str, job_id: &str) -> ServiceResult<ServiceJob> {
         let connection = self.connection_for(instance_id)?;
         self.get_job_with(connection, job_id).await
+    }
+
+    #[cfg(test)]
+    pub async fn list_jobs_for(
+        &self,
+        instance_id: &str,
+        limit: u8,
+    ) -> ServiceResult<Vec<ServiceJob>> {
+        let connection = self.connection_for(instance_id)?;
+        let response = self
+            .authenticated(&connection, Method::GET, "/api/v1/jobs")
+            .query(&[("limit", limit.clamp(1, 100))])
+            .send()
+            .await
+            .map_err(connection_error)?;
+        let jobs: JobListWire = decode_response(response).await?;
+        Ok(jobs.jobs.into_iter().map(ServiceJob::from).collect())
     }
 
     async fn get_job_with(

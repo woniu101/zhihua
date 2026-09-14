@@ -101,6 +101,7 @@ export interface LocalGenerationJob {
   attempt: number;
   errorCode?: string;
   errorMessage?: string;
+  statusDetail?: string;
   createdAt: string;
   updatedAt: string;
 }

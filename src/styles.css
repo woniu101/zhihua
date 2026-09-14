@@ -186,6 +186,8 @@ p { margin: 0; }
 .tab-btn.active { color: white; background: linear-gradient(135deg,#2b83ff,#0c69f7); border-color: var(--blue); box-shadow: 0 4px 10px rgba(15,111,255,.16); }
 .progress { height: 9px; border-radius: 99px; overflow: hidden; background: #dfe7f2; }
 .progress > i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#0870ff,#328cff); }
+.progress.indeterminate > i { width:36%; animation:progress-sweep 1.4s ease-in-out infinite; }
+@keyframes progress-sweep { from { transform:translateX(-110%); } to { transform:translateX(310%); } }
 
 .lightning-image { background: #193a5e url("./assets/lightning-preview.jpg") center/cover no-repeat; }
 .cover-lightning { background-image: url("./assets/cover-lightning.jpg"); }
@@ -328,6 +330,9 @@ p { margin: 0; }
 .task-item-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .task-item-title strong { color: #102347; font-size: 15px; }
 .task-item-main > p { margin-top: 5px; color: var(--muted); font-size:14px; }
+.task-stage { margin-top: 9px; display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; }
+.task-stage span { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.task-stage b { flex:0 0 auto; color:var(--blue); font-size:13px; }
 .task-status {
   display: inline-flex;
   align-items: center;
@@ -343,6 +348,8 @@ p { margin: 0; }
 .task-status.muted { color: #7b8ca8; }
 .task-progress { height: 6px; margin-top: 10px; border-radius: 99px; overflow: hidden; background: #e2e9f4; }
 .task-progress i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #0f6fff, #49a0ff); transition: width .25s ease; }
+.task-progress.indeterminate i { width:36%; animation:task-progress-sweep 1.4s ease-in-out infinite; }
+@keyframes task-progress-sweep { from { transform:translateX(-110%); } to { transform:translateX(310%); } }
 .task-item-main .task-error-detail { color: #c73d34; line-height: 1.4; }
 .task-item-actions { margin-top: 9px; display: flex; justify-content: flex-end; gap: 8px; }
 .task-item-actions button {

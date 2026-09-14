@@ -5,16 +5,15 @@
       <stop offset="1" stop-color="#594DE8"/>
     </linearGradient>
     <linearGradient id="flow" x1="255" y1="675" x2="793" y2="460" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#B8FFE9"/>
+      <stop stop-color="#A7F3FF"/>
       <stop offset="1" stop-color="#FFFFFF"/>
     </linearGradient>
   </defs>
   <rect x="42" y="42" width="940" height="940" rx="255" fill="url(#mark)"/>
   <rect x="62" y="62" width="900" height="900" rx="235" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="22"/>
-  <path d="M216 266C216 227 247 196 286 196H492V748H286C247 748 216 717 216 678V266Z" fill="#fff" fill-opacity=".18" stroke="#fff" stroke-width="38"/>
-  <path d="M294 314H414M294 412H414M294 510H372" fill="none" stroke="#fff" stroke-width="43" stroke-linecap="round"/>
-  <rect x="541" y="236" width="265" height="147" rx="43" fill="#fff" fill-opacity=".9"/>
-  <rect x="541" y="437" width="265" height="147" rx="43" fill="#fff" fill-opacity=".68"/>
-  <rect x="541" y="638" width="265" height="147" rx="43" fill="#fff" fill-opacity=".44"/>
-  <path d="M404 658C473 609 496 531 571 511C632 495 669 535 777 462" fill="none" stroke="url(#flow)" stroke-width="63" stroke-linecap="round"/>
+  <rect x="177" y="236" width="670" height="552" rx="138" fill="#fff" fill-opacity=".14" stroke="#fff" stroke-width="44"/>
+  <path d="M276 236V788M748 236V788" fill="none" stroke="#fff" stroke-opacity=".74" stroke-width="40"/>
+  <path d="M276 354H196M276 492H196M276 630H196M828 354H748M828 492H748M828 630H748" fill="none" stroke="#fff" stroke-width="40" stroke-linecap="round"/>
+  <path d="M345 640C414 478 493 384 566 438C627 483 595 571 699 364" fill="none" stroke="url(#flow)" stroke-width="69" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M640 280L662 329L713 350L662 372L640 421L618 372L567 350L618 329L640 280Z" fill="#fff"/>
 </svg>

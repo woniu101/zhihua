@@ -48,6 +48,7 @@ pub struct LocalJob {
     pub attempt: u32,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub status_detail: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -83,6 +84,7 @@ impl JobQueueStorage {
                 error_message     TEXT,
                 created_at        TEXT NOT NULL,
                 updated_at        TEXT NOT NULL,
+                status_detail     TEXT,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_generation_jobs_project_updated
@@ -92,6 +94,26 @@ impl JobQueueStorage {
             ",
             )
             .map_err(database_error)?;
+        let has_status_detail = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(generation_jobs)")
+                .map_err(database_error)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(database_error)?;
+            let found = rows
+                .filter_map(Result::ok)
+                .any(|column| column == "status_detail");
+            found
+        };
+        if !has_status_detail {
+            connection
+                .execute(
+                    "ALTER TABLE generation_jobs ADD COLUMN status_detail TEXT",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
         let has_scene_foreign_key = {
             let mut statement = connection
                 .prepare("PRAGMA foreign_key_list(generation_jobs)")
@@ -129,6 +151,7 @@ impl JobQueueStorage {
                         error_message     TEXT,
                         created_at        TEXT NOT NULL,
                         updated_at        TEXT NOT NULL,
+                        status_detail     TEXT,
                         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                     );
                     INSERT INTO generation_jobs
@@ -200,14 +223,15 @@ impl JobQueueStorage {
             .execute(
                 "INSERT INTO generation_jobs
                  (client_request_id, remote_job_id, project_id, scene_id, kind, workflow_id,
-                  request_json, status, progress, attempt, error_code, error_message, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, ?11)
+                  request_json, status, progress, attempt, error_code, error_message, status_detail, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12)
                  ON CONFLICT(client_request_id) DO UPDATE SET
                    remote_job_id=excluded.remote_job_id,
                    status=excluded.status,
                    progress=excluded.progress,
                    error_code=excluded.error_code,
                    error_message=excluded.error_message,
+                   status_detail=excluded.status_detail,
                    attempt=CASE WHEN generation_jobs.remote_job_id IS NULL
                      THEN generation_jobs.attempt + 1 ELSE generation_jobs.attempt END,
                    updated_at=excluded.updated_at",
@@ -222,6 +246,7 @@ impl JobQueueStorage {
                     job.progress,
                     job.error_code,
                     job.error_message,
+                    job.status_detail,
                     now
                 ],
             )
@@ -251,15 +276,16 @@ impl JobQueueStorage {
             .connection()?
             .execute(
                 "UPDATE generation_jobs SET status=?2, progress=?3, error_code=?4,
-             error_message=?5,
+             error_message=?5, status_detail=?6,
              lease_expires_at=CASE WHEN ?2 IN ('completed','failed','cancelled','interrupted') THEN NULL ELSE lease_expires_at END,
-             updated_at=?6 WHERE remote_job_id=?1",
+             updated_at=?7 WHERE remote_job_id=?1",
                 params![
                     job.id,
                     job.status,
                     job.progress,
                     job.error_code,
                     job.error_message,
+                    job.status_detail,
                     now_iso()
                 ],
             )
@@ -334,7 +360,7 @@ impl JobQueueStorage {
         let connection = self.connection()?;
         let sql = "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
                           workflow_id, status, progress, worker_id, lease_expires_at,
-                          attempt, error_code, error_message, created_at, updated_at
+                          attempt, error_code, error_message, status_detail, created_at, updated_at
                    FROM generation_jobs";
         let mut statement = if project_id.is_some() {
             connection
@@ -393,7 +419,7 @@ impl JobQueueStorage {
             .query_row(
                 "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
                     workflow_id, status, progress, worker_id, lease_expires_at,
-                    attempt, error_code, error_message, created_at, updated_at
+                    attempt, error_code, error_message, status_detail, created_at, updated_at
              FROM generation_jobs WHERE remote_job_id=?1",
                 [remote_job_id],
                 local_job_from_row,
@@ -406,7 +432,7 @@ impl JobQueueStorage {
             .query_row(
                 "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
                     workflow_id, status, progress, worker_id, lease_expires_at,
-                    attempt, error_code, error_message, created_at, updated_at
+                    attempt, error_code, error_message, status_detail, created_at, updated_at
              FROM generation_jobs WHERE client_request_id=?1",
                 [request_id],
                 local_job_from_row,
@@ -430,8 +456,9 @@ fn local_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalJob> {
         attempt: row.get(10)?,
         error_code: row.get(11)?,
         error_message: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        status_detail: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
@@ -530,13 +557,17 @@ mod tests {
             progress: 0.4,
             error_code: None,
             error_message: None,
-            status_detail: None,
+            status_detail: Some("ComfyUI is executing the prompt".into()),
             created_at: now_iso(),
             updated_at: now_iso(),
             result_manifest: None,
         };
         let stored = queue.record_remote(&job).expect("remote");
         assert_eq!(stored.remote_job_id.as_deref(), Some("remote-1"));
+        assert_eq!(
+            stored.status_detail.as_deref(),
+            Some("ComfyUI is executing the prompt")
+        );
         assert_eq!(stored.attempt, 1);
         assert_eq!(
             stored.worker_id.as_deref(),
@@ -571,6 +602,33 @@ mod tests {
             local.worker_id.as_deref(),
             Some("instance:worker-one:gpu:0")
         );
+    }
+
+    #[test]
+    fn reopens_a_pending_job_after_an_abrupt_desktop_exit() {
+        let (directory, queue, project_id, scene_id) = setup();
+        let input = SubmitServiceJobInput {
+            client_request_id: "request-after-exit".into(),
+            project_id,
+            scene_id,
+            kind: "video_candidate".into(),
+            workflow_id: "h3-t2v-turbo-v1".into(),
+            parameters: json!({"seed": 19}),
+        };
+        queue.stage(&input).expect("persist pending job");
+        drop(queue);
+
+        let projects = ProjectStorage::initialize(
+            directory.path().join("db.sqlite3"),
+            directory.path().join("projects"),
+        )
+        .expect("reopen projects after process exit");
+        let reopened = JobQueueStorage::initialize(projects).expect("reopen durable queue");
+        let recovered = reopened
+            .find_by_request("request-after-exit")
+            .expect("recover pending job");
+        assert_eq!(recovered.status, "pending_submit");
+        assert_eq!(recovered.workflow_id, "h3-t2v-turbo-v1");
     }
 
     #[test]

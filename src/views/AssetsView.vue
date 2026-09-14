@@ -66,6 +66,8 @@ let imagePollTimer: number | undefined;
 let imageRecoveryDelay = 2500;
 
 const imageProgress = computed(() => Math.round((imageJob.value?.progress ?? 0) * 100));
+const imageProgressMeasured = computed(() => Boolean(imageJob.value) && !(imageJob.value?.status === "running" && imageProgress.value <= 15));
+const imageProgressLabel = computed(() => imageJob.value ? (imageProgressMeasured.value ? `${imageProgress.value}%` : "进行中") : "0%");
 const styleConfigured = computed(() => Boolean(projectStylePrompt(workspace.project.value?.styleProfile)));
 
 function openStylePanel() {
@@ -505,7 +507,7 @@ onBeforeUnmount(() => {
         <div class="image-mode-tabs"><button :class="{active:imageMode==='generate'}" :disabled="imageBusy" @click="imageMode='generate'">从描述生成</button><button :class="{active:imageMode==='edit'}" :disabled="imageBusy || selected?.mediaType!=='image'" @click="imageMode='edit'">编辑所选图片</button></div>
         <label><span>{{ imageMode==='generate' ? '画面描述' : '编辑要求' }}</span><textarea v-model="imagePrompt" :disabled="imageBusy" :placeholder="imageMode==='generate' ? '例如：深蓝雷云覆盖群山，一道闪电连接云层与地面，科普插画，清晰轮廓，无文字' : '例如：保持主体和构图不变，把夜空调整为雨后的蓝紫色，并增强闪电亮度'"/></label>
         <div v-if="imageMode==='edit'" class="edit-source"><div class="edit-source-thumb" :style="selected ? previewStyle(selected) : undefined"></div><div><b>{{ selected?.name }}</b><span>使用已确认的 {{ activeProfile.aspectRatio }} 构图作为编辑输入</span></div></div>
-        <div class="image-task"><div class="field-head"><b>{{ imageJob ? `任务 ${imageJob.id.slice(0,8)}` : '提交前保持无卡模式' }}</b><span>{{ imageJob ? `${imageProgress}%` : '0%' }}</span></div><div class="progress"><i :style="{width:`${imageProgress}%`}"></i></div><p>{{ imageNotice }}</p></div>
+        <div class="image-task"><div class="field-head"><b>{{ imageJob ? `任务 ${imageJob.id.slice(0,8)}` : '提交前保持无卡模式' }}</b><span>{{ imageProgressLabel }}</span></div><div class="progress" :class="{ indeterminate: imageJob && !imageProgressMeasured }"><i :style="imageProgressMeasured ? {width:`${imageProgress}%`} : undefined"></i></div><p>{{ imageNotice }}</p></div>
         <footer><button v-if="imageBusy && imageJob" class="btn danger" @click="cancelImage">取消任务</button><button class="btn" :disabled="imageBusy" @click="imagePanelOpen=false">关闭</button><button class="btn primary" :disabled="imageBusy || !imagePrompt.trim()" @click="submitImage"><LoaderCircle v-if="imageBusy" class="spin" :size="17"/><Sparkles v-else :size="17"/>{{ imageBusy ? '生成中' : imageMode==='generate' ? '生成图片' : '生成编辑版本' }}</button></footer>
       </section>
     </div>
