@@ -20,6 +20,7 @@ use crate::storyboard::{
     SceneStatus, StoryboardStorage, VisualIntent,
 };
 use crate::tts::{SynthesizeNarrationInput, SystemTtsProvider};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -39,6 +40,51 @@ async fn wait_for_job(
             .await
             .expect("poll remote job");
         if job.status == "completed" {
+            return job;
+        }
+        assert!(
+            !matches!(job.status.as_str(), "failed" | "cancelled"),
+            "remote job ended with {}: {:?}",
+            job.status,
+            job.error_message
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    panic!("remote job did not finish within {max_minutes} minutes");
+}
+
+async fn wait_for_job_with_measured_progress(
+    service: &ServiceClient,
+    instance_id: &str,
+    id: &str,
+    max_minutes: u64,
+) -> ServiceJob {
+    let mut saw_live_measurement = false;
+    for _ in 0..(max_minutes * 20) {
+        let job = service
+            .get_job_for(instance_id, id)
+            .await
+            .expect("poll measured remote job");
+        if job.progress_measured
+            && job.progress_stage == "model_inference"
+            && job.progress_current.is_some()
+            && job.progress_total.is_some()
+            && job.progress_current < job.progress_total
+        {
+            saw_live_measurement = true;
+            eprintln!(
+                "measured progress: {:.1}% ({:?}/{:?}), eta={:?}s",
+                job.progress * 100.0,
+                job.progress_current,
+                job.progress_total,
+                job.eta_seconds
+            );
+        }
+        if job.status == "completed" {
+            assert!(
+                saw_live_measurement,
+                "job completed without exposing a live measured inference step"
+            );
             return job;
         }
         assert!(
@@ -114,6 +160,158 @@ async fn stop_saved_instance_after_live_validation() {
     .await
     .expect("wait for stopped instance");
     assert_eq!(stopped.state, CompSharePowerState::Stopped);
+}
+
+#[tokio::test]
+#[ignore = "starts the saved primary worker in paid GPU mode, deploys current service main, and leaves a one-hour platform stop guard"]
+async fn start_saved_gpu_worker_and_deploy_current_service() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+    let provider = CompShareProvider::new(app_data_dir.clone()).expect("initialize CompShare");
+    let platform = provider
+        .list_instances(ListCompShareInstancesInput {
+            region: None,
+            zone: None,
+        })
+        .await
+        .expect("list instances")
+        .into_iter()
+        .find(|instance| instance.instance_id == instance_id)
+        .expect("saved instance exists");
+    let locator = CompShareInstanceLocator {
+        instance_id: instance_id.clone(),
+        region: platform.region,
+        zone: platform.zone,
+        project_id: platform.project_id,
+    };
+
+    let validation = async {
+        let current = provider
+            .describe_instance(locator.clone())
+            .await
+            .map_err(|error| error.message)?;
+        if current.state != CompSharePowerState::Running
+            || current.running_mode != CompShareRunningMode::Gpu
+        {
+            if matches!(
+                current.state,
+                CompSharePowerState::Running | CompSharePowerState::Starting
+            ) {
+                provider
+                    .stop_instance_for(locator.clone())
+                    .await
+                    .map_err(|error| error.message)?;
+                crate::wait_for_instance_state_for(
+                    &provider,
+                    &locator,
+                    CompSharePowerState::Stopped,
+                    None,
+                    std::time::Duration::from_secs(180),
+                )
+                .await?;
+            }
+            provider
+                .start_instance_for(locator.clone(), CompShareStartMode::Gpu)
+                .await
+                .map_err(|error| error.message)?;
+        }
+        provider
+            .update_stop_scheduler_for(locator.clone(), chrono::Utc::now().timestamp() + 60 * 60)
+            .await
+            .map_err(|error| error.message)?;
+        let running = crate::wait_for_instance_state_for(
+            &provider,
+            &locator,
+            CompSharePowerState::Running,
+            Some(CompShareRunningMode::Gpu),
+            std::time::Duration::from_secs(240),
+        )
+        .await?;
+        if running.gpu_count.unwrap_or(0) == 0 {
+            return Err("instance entered running state without a GPU".to_owned());
+        }
+
+        let tunnel = SshTunnelManager::new(app_data_dir.clone()).map_err(|error| error.message)?;
+        start_saved_tunnel_with_retry(&tunnel, &instance_id).await;
+        let script = include_str!("../../scripts/deploy_remote_dev.sh");
+        let encoded = BASE64_STANDARD.encode(script.as_bytes());
+        let output = tunnel
+            .run_remote_validation_command_for(
+                &instance_id,
+                &format!("printf '%s' '{encoded}' | base64 -d | bash"),
+            )
+            .await
+            .map_err(|error| error.message)?;
+        if !output.contains("deployment-complete") {
+            return Err(format!("remote deployment did not complete: {output}"));
+        }
+        tunnel
+            .ensure_remote_service_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+        let status = tunnel
+            .status_for(&instance_id)
+            .map_err(|error| error.message)?;
+        let service = ServiceClient::new(app_data_dir)?;
+        service
+            .retarget_for(
+                &instance_id,
+                status
+                    .local_url
+                    .ok_or_else(|| "missing tunnel URL".to_owned())?,
+            )
+            .map_err(|error| error.message)?;
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            match service.probe_for(&instance_id).await {
+                Ok(probe) => {
+                    if probe.service_version != "0.5.0" {
+                        return Err(format!(
+                            "unexpected deployed service version: {}",
+                            probe.service_version
+                        ));
+                    }
+                    if probe.comfyui_ready {
+                        break;
+                    }
+                }
+                Err(error) if tokio::time::Instant::now() < ready_deadline => {
+                    eprintln!("waiting for restarted service: {}", error.message);
+                }
+                Err(error) => return Err(error.message),
+            }
+            if tokio::time::Instant::now() >= ready_deadline {
+                return Err("ComfyUI did not become ready within five minutes".to_owned());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        tunnel
+            .stop_for(&instance_id)
+            .await
+            .map_err(|error| error.message)?;
+        Ok::<_, String>(())
+    }
+    .await;
+
+    if let Err(error) = validation {
+        if let Ok(current) = provider.describe_instance(locator.clone()).await {
+            if matches!(
+                current.state,
+                CompSharePowerState::Running | CompSharePowerState::Starting
+            ) {
+                let _ = provider.stop_instance_for(locator.clone()).await;
+                let _ = crate::wait_for_instance_state_for(
+                    &provider,
+                    &locator,
+                    CompSharePowerState::Stopped,
+                    None,
+                    std::time::Duration::from_secs(180),
+                )
+                .await;
+            }
+        }
+        panic!("GPU worker deployment failed and the instance was stopped: {error}");
+    }
 }
 
 #[tokio::test]
@@ -758,6 +956,19 @@ async fn prepare_desktop_worker_pool_and_cleanup() {
     let policy_dir = tempfile::tempdir().expect("temporary policy directory");
     let lifecycle = crate::ComputeLifecycle::load(policy_dir.path().join("compute-policy.json"));
 
+    let mut temporarily_enabled = Vec::new();
+    for instance_id in &instance_ids {
+        let managed = compute
+            .get_instance(instance_id)
+            .expect("read configured worker before validation");
+        if managed.role == crate::compute_control::ComputeInstanceRole::UserManaged {
+            compute
+                .set_user_instance_worker_enabled(instance_id, true)
+                .expect("temporarily authorize user instance for pool validation");
+            temporarily_enabled.push(instance_id.clone());
+        }
+    }
+
     let first = crate::prepare_compute_worker_impl(
         &tunnel,
         &service,
@@ -880,6 +1091,11 @@ async fn prepare_desktop_worker_pool_and_cleanup() {
             }
         }
     }
+    for instance_id in temporarily_enabled {
+        if let Err(error) = compute.set_user_instance_worker_enabled(&instance_id, false) {
+            cleanup_errors.push(format!("{instance_id}: {}", error.message));
+        }
+    }
     assert!(
         cleanup_errors.is_empty(),
         "worker cleanup failed: {cleanup_errors:?}"
@@ -959,7 +1175,8 @@ async fn generate_image_then_video_through_desktop_service_client() {
         )
         .await
         .expect("submit image generation job");
-    let image_job = wait_for_job(&service, &instance_id, &image_job.id, 10).await;
+    let image_job =
+        wait_for_job_with_measured_progress(&service, &instance_id, &image_job.id, 10).await;
     let image_artifact = image_job
         .result_manifest
         .expect("image result manifest")
@@ -1012,7 +1229,8 @@ async fn generate_image_then_video_through_desktop_service_client() {
         )
         .await
         .expect("submit H3 I2V job");
-    let video_job = wait_for_job(&service, &instance_id, &video_job.id, 12).await;
+    let video_job =
+        wait_for_job_with_measured_progress(&service, &instance_id, &video_job.id, 12).await;
     let video_artifact = video_job
         .result_manifest
         .expect("video result manifest")

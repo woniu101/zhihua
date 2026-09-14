@@ -515,6 +515,79 @@ impl SshTunnelManager {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn run_remote_validation_command_for(
+        &self,
+        instance_id: &str,
+        command: &str,
+    ) -> TunnelResult<String> {
+        if command.is_empty() || command.len() > 256 * 1024 {
+            return Err(TunnelError::new(
+                "SSH_COMMAND_INVALID",
+                "远端验收命令为空或过长",
+            ));
+        }
+        let instance_id = validate_instance_id(instance_id)?;
+        self.ensure_profile(&instance_id)?;
+        let configuration = self.read_configuration_for(&instance_id)?.ok_or_else(|| {
+            TunnelError::new("TUNNEL_NOT_CONFIGURED", "目标实例尚未配置 SSH 隧道")
+        })?;
+        let private_key = self.private_key_for(&instance_id)?.ok_or_else(|| {
+            TunnelError::new(
+                "SSH_PRIVATE_KEY_MISSING",
+                "Windows 凭据管理器中没有目标实例的 SSH 私钥",
+            )
+        })?;
+        let session = connect_session(&configuration, &private_key).await?;
+        let mut channel = session.channel_open_session().await.map_err(|error| {
+            TunnelError::new(
+                "SSH_COMMAND_FAILED",
+                format!("无法打开远端验收命令通道：{error}"),
+            )
+        })?;
+        channel.exec(true, command).await.map_err(|error| {
+            TunnelError::new(
+                "SSH_COMMAND_FAILED",
+                format!("无法执行远端验收命令：{error}"),
+            )
+        })?;
+        let mut output = Vec::new();
+        let mut error_output = Vec::new();
+        let mut exit_status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => {
+                    if output.len() + data.len() <= 1024 * 1024 {
+                        output.extend_from_slice(&data);
+                    }
+                }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    if error_output.len() + data.len() <= 1024 * 1024 {
+                        error_output.extend_from_slice(&data);
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status: value } => exit_status = Some(value),
+                _ => {}
+            }
+        }
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "validation complete", "en")
+            .await;
+        if exit_status != Some(0) {
+            let detail = String::from_utf8_lossy(&error_output).trim().to_owned();
+            return Err(TunnelError::new(
+                "SSH_COMMAND_FAILED",
+                if detail.is_empty() {
+                    format!("远端验收命令退出状态为 {exit_status:?}")
+                } else {
+                    format!("远端验收命令失败：{detail}")
+                },
+            ));
+        }
+        String::from_utf8(output)
+            .map_err(|_| TunnelError::new("SSH_COMMAND_FAILED", "远端验收命令输出不是 UTF-8"))
+    }
+
     pub fn status_for(&self, instance_id: &str) -> TunnelResult<TunnelStatus> {
         let instance_id = validate_instance_id(instance_id)?;
         self.ensure_profile(&instance_id)?;
