@@ -1,13 +1,25 @@
+use crate::asset::AssetStorage;
 use crate::comp_share::{
     BindCompShareInstanceInput, CompShareInstanceLocator, CompSharePowerState, CompShareProvider,
     CompShareRunningMode, CompShareStartMode, ListCompShareInstancesInput,
     SaveCompShareCredentialsInput,
 };
+use crate::export::{
+    EnvironmentAudioPolicy, ExportProjectInput, FfmpegExporter, OutputRendition, SubtitleMode,
+};
+use crate::frame_profile::FrameAspectRatio;
+use crate::generation::{GenerationStorage, RecordCandidateInput, RecordEnhancedInput};
 use crate::service::{
     DownloadServiceArtifactInput, SaveServiceConnectionInput, ServiceClient, ServiceJob,
     SubmitServiceJobInput,
 };
 use crate::ssh_tunnel::{SaveTunnelConfigurationInput, SshTunnelManager};
+use crate::storage::{CreateProjectInput, ProjectStorage};
+use crate::storyboard::{
+    AudioIntent, CandidateQuality, GenerationMode, NarrationMode, PromptMode, SceneDraft,
+    SceneStatus, StoryboardStorage, VisualIntent,
+};
+use crate::tts::{SynthesizeNarrationInput, SystemTtsProvider};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -648,6 +660,560 @@ async fn generate_image_then_video_through_desktop_service_client() {
         .stop_for(&instance_id)
         .await
         .expect("stop validation tunnel");
+}
+
+#[tokio::test]
+#[ignore = "requires the configured paid GPU instance and exports a real 30-second project"]
+async fn generate_and_export_real_multiscene_project() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let artifact_root = PathBuf::from(required("ZHIHUA_TEST_OUTPUT_DIR"))
+        .join(format!("full-flow-{}", uuid::Uuid::new_v4()));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+    let database_path = artifact_root.join("acceptance.sqlite3");
+    let projects_root = artifact_root.join("projects");
+    let exports_root = artifact_root.join("exports");
+    std::fs::create_dir_all(&exports_root).expect("create full-flow artifact directory");
+
+    let projects = ProjectStorage::initialize(&database_path, &projects_root)
+        .expect("initialize isolated project storage");
+    let project = projects
+        .create_project(CreateProjectInput {
+            title: "雷电是怎样形成的（真实闭环验收）".to_owned(),
+            audience: Some("8 至 14 岁科普学习者".to_owned()),
+            target_duration_sec: Some(30),
+        })
+        .expect("create acceptance project");
+    let storyboards =
+        StoryboardStorage::initialize(projects.clone()).expect("initialize storyboard storage");
+    let generations =
+        GenerationStorage::initialize(projects.clone()).expect("initialize generation storage");
+    let assets = AssetStorage::initialize(projects.clone()).expect("initialize asset storage");
+    let tts = SystemTtsProvider::initialize(projects.clone()).expect("initialize system TTS");
+    let exporter = FfmpegExporter::new(projects.clone());
+    assert!(exporter.capability().available, "FFmpeg must be available");
+
+    let scene_specs = [
+        (
+            "云层中的电荷",
+            "雷雨云里，冰晶和水滴不断碰撞，使正负电荷逐渐分离。",
+            "雷雨云内部的冰晶与水滴碰撞，蓝紫色云层中正负电荷粒子清晰分层，远处群山，儿童科普插画，电影感光线，画面清晰，无文字，无水印",
+            "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\nintegrated_multimodal_description: [Shot 1] Preserve the educational illustration, cloud structure, mountains, colors, and composition from <Picture 1>. The camera slowly moves through the storm cloud while small ice crystals and droplets circulate naturally. Positive and negative charge particles separate into two layers. Smooth stable motion, no text, no people, no human voices, no dialogue, no singing.\n\noverall_soundscape: Soft high-altitude wind and subtle ice particle impacts continue naturally. No speech or human vocal sounds.\n\nnon_diegetic_music: N/A.",
+            "高空风声与细小冰晶碰撞声",
+            "电荷在云层中逐渐分离",
+        ),
+        (
+            "空气被击穿",
+            "当电势差足够大，空气会被击穿，形成一条导电通道。",
+            "深蓝雷雨云与地面之间形成弯曲的发光先导通道，电荷沿通道向下延伸，远山夜景，儿童科普插画，电影感光线，无文字，无水印",
+            "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\nintegrated_multimodal_description: [Shot 1] Preserve the storm cloud, landscape, palette, and composition from <Picture 1>. The camera holds a wide view as a branching luminous leader gradually extends from the cloud toward the ground, revealing a conductive path through the air. Stable educational animation, no text, no people, no human voices, no dialogue, no singing.\n\noverall_soundscape: Steady rain and low wind, with a faint rising electrical crackle synchronized with the growing channel. No speech or human vocal sounds.\n\nnon_diegetic_music: N/A.",
+            "雨声、低风声与逐渐增强的电流噼啪声",
+            "强电场击穿空气",
+        ),
+        (
+            "闪电与雷声",
+            "导电通道接通后，强电流瞬间通过，耀眼的闪电和雷声随之出现。",
+            "一道明亮闪电从厚重雷云连接地面并照亮群山，雨幕和云层细节丰富，儿童科普插画，电影感构图，无文字，无水印",
+            "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\nintegrated_multimodal_description: [Shot 1] Preserve the storm clouds, mountains, rain, colors, and composition from <Picture 1>. The camera slowly pushes forward. At 00:04.000 a brilliant lightning discharge races through the established channel to the ground and briefly illuminates the entire landscape. Stable cinematic educational animation, no text, no people, no human voices, no dialogue, no singing.\n\noverall_soundscape: Rain and wind continue. A sharp thunder crack occurs exactly with the flash at 00:04.000, followed by a natural low rumble that fades into the rain. No speech or human vocal sounds.\n\nnon_diegetic_music: N/A.",
+            "持续雨声、闪电同步的雷击声与低沉回响",
+            "强电流产生闪电和雷声",
+        ),
+    ];
+
+    let mut scenes = Vec::new();
+    for (order, (title, narration, _, _, ambient, caption)) in scene_specs.iter().enumerate() {
+        scenes.push(
+            storyboards
+                .upsert(SceneDraft {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    project_id: project.id.clone(),
+                    order: order as u32,
+                    title: (*title).to_owned(),
+                    purpose: "用一个十秒镜头说明雷电形成过程".to_owned(),
+                    source_refs: vec![],
+                    narration: (*narration).to_owned(),
+                    narration_mode: NarrationMode::Tts,
+                    ambient_sound: (*ambient).to_owned(),
+                    on_screen_text: vec![(*caption).to_owned()],
+                    visual_plan: scene_specs[order].2.to_owned(),
+                    visual_intent: VisualIntent {
+                        subject: (*title).to_owned(),
+                        action: "自然、连续地展示物理过程".to_owned(),
+                        scene: "雷雨云与远山".to_owned(),
+                        composition: "16:9 科普电影画面".to_owned(),
+                        camera: "缓慢推进或稳定广角".to_owned(),
+                        lighting: "深蓝环境光与闪电高光".to_owned(),
+                        timeline: "十秒内完成一个清晰变化".to_owned(),
+                        negative: "文字，水印，人物，人声，抖动，畸变".to_owned(),
+                    },
+                    prompt_mode: PromptMode::Advanced,
+                    audio_intent: AudioIntent::Environment,
+                    locked: false,
+                    generation_mode: GenerationMode::I2v,
+                    target_duration_ms: 10_000,
+                    asset_ids: vec![],
+                    selected_version_id: None,
+                    last_job_id: None,
+                    last_upscale_job_id: None,
+                    pending_request_id: None,
+                    generation_stage: None,
+                    status: SceneStatus::Ready,
+                    quality: CandidateQuality::Fast,
+                    updated_at: String::new(),
+                })
+                .expect("persist acceptance scene"),
+        );
+    }
+
+    let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
+    let tunnel_status = tunnel
+        .start_for(&instance_id)
+        .await
+        .expect("start full-flow SSH tunnel");
+    let service = ServiceClient::new(app_data_dir).expect("initialize service client");
+    service
+        .retarget_for(
+            &instance_id,
+            tunnel_status.local_url.expect("full-flow local tunnel URL"),
+        )
+        .expect("retarget service to full-flow tunnel");
+    let probe = service
+        .probe_for(&instance_id)
+        .await
+        .expect("probe full-flow generation service");
+    assert!(probe.comfyui_ready);
+
+    for (index, scene) in scenes.iter().enumerate() {
+        let (_, _, image_prompt, video_prompt, _, _) = scene_specs[index];
+        let suffix = uuid::Uuid::new_v4();
+        let image_job = service
+            .submit_job_for(
+                &instance_id,
+                SubmitServiceJobInput {
+                    client_request_id: format!("full-flow-image-{suffix}"),
+                    project_id: project.id.clone(),
+                    scene_id: scene.id.clone(),
+                    kind: "image_generation".to_owned(),
+                    workflow_id: "qwen-image-generate-v1".to_owned(),
+                    parameters: json!({
+                        "prompt": image_prompt,
+                        "negativePrompt": "模糊，畸形，文字，水印，低清晰度，人物",
+                        "width": 1344,
+                        "height": 768,
+                        "seed": 2026091401_u64 + index as u64
+                    }),
+                },
+            )
+            .await
+            .expect("submit scene image job");
+        let image_job = wait_for_job(&service, &instance_id, &image_job.id, 12).await;
+        let image_artifact = image_job
+            .result_manifest
+            .expect("scene image result manifest")
+            .artifacts
+            .into_iter()
+            .find(|artifact| artifact.kind == "image")
+            .expect("scene image artifact");
+        let image_path = project
+            .project_dir
+            .join("assets")
+            .join(format!("scene-{}-first-frame.png", index + 1));
+        service
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: image_job.id,
+                    artifact_id: image_artifact.artifact_id,
+                    destination_path: image_path.to_string_lossy().into_owned(),
+                    expected_size_bytes: image_artifact.size_bytes,
+                    expected_sha256: image_artifact.sha256,
+                },
+            )
+            .await
+            .expect("download scene image");
+
+        let uploaded = service
+            .upload_input_for(&instance_id, &image_path.to_string_lossy())
+            .await
+            .expect("upload scene first frame");
+        let video_job = service
+            .submit_job_for(
+                &instance_id,
+                SubmitServiceJobInput {
+                    client_request_id: format!("full-flow-video-{suffix}"),
+                    project_id: project.id.clone(),
+                    scene_id: scene.id.clone(),
+                    kind: "video_candidate".to_owned(),
+                    workflow_id: "h3-i2v-turbo-v1".to_owned(),
+                    parameters: json!({
+                        "prompt": video_prompt,
+                        "seed": 2026091411_u64 + index as u64,
+                        "firstFrameFile": uploaded.remote_file,
+                        "width": 1344,
+                        "height": 768,
+                        "visibleWidth": 1344,
+                        "visibleHeight": 756,
+                        "cropX": 0,
+                        "cropY": 6,
+                        "length": 243,
+                        "discardH3Audio": false
+                    }),
+                },
+            )
+            .await
+            .expect("submit scene H3 job");
+
+        if index == 0 {
+            tunnel
+                .stop_for(&instance_id)
+                .await
+                .expect("simulate client tunnel loss");
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let resumed = tunnel
+                .start_for(&instance_id)
+                .await
+                .expect("restore tunnel after simulated loss");
+            service
+                .retarget_for(
+                    &instance_id,
+                    resumed.local_url.expect("restored tunnel URL"),
+                )
+                .expect("retarget after tunnel recovery");
+            assert!(
+                service
+                    .probe_for(&instance_id)
+                    .await
+                    .expect("probe after tunnel recovery")
+                    .compatible
+            );
+        }
+
+        let video_job = wait_for_job(&service, &instance_id, &video_job.id, 15).await;
+        let prompt_id = video_job.prompt_id.clone();
+        let video_artifact = video_job
+            .result_manifest
+            .expect("scene video result manifest")
+            .artifacts
+            .into_iter()
+            .find(|artifact| artifact.kind == "video")
+            .expect("scene video artifact");
+        let video_path = project
+            .project_dir
+            .join("cache")
+            .join("drafts")
+            .join(format!("scene-{}-candidate.mp4", index + 1));
+        let downloaded = service
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: video_job.id.clone(),
+                    artifact_id: video_artifact.artifact_id.clone(),
+                    destination_path: video_path.to_string_lossy().into_owned(),
+                    expected_size_bytes: video_artifact.size_bytes,
+                    expected_sha256: video_artifact.sha256.clone(),
+                },
+            )
+            .await
+            .expect("download scene video");
+        service
+            .delete_input_for(&instance_id, &uploaded.input_id)
+            .await
+            .expect("delete uploaded scene first frame");
+        let candidate = generations
+            .record(RecordCandidateInput {
+                project_id: project.id.clone(),
+                scene_id: scene.id.clone(),
+                job_id: video_job.id,
+                workflow_id: "h3-i2v-turbo-v1".to_owned(),
+                prompt_id,
+                prompt_compiler_version: Some("h3-prompt-v2".to_owned()),
+                h3_audio_policy: Some("smart".to_owned()),
+                prompt_text: Some(video_prompt.to_owned()),
+                seed: Some(2026091411_u32 + index as u32),
+                audio_intent: Some("environment".to_owned()),
+                target_duration_sec: Some(10),
+                artifact_id: video_artifact.artifact_id,
+                filename: video_artifact.filename,
+                media_type: video_artifact.media_type,
+                local_path: video_path,
+                size_bytes: downloaded.size_bytes,
+                sha256: downloaded.sha256,
+                aspect_ratio: "16:9".to_owned(),
+                work_width: 1344,
+                work_height: 768,
+                visible_width: 1344,
+                visible_height: 756,
+                crop_x: 0,
+                crop_y: 6,
+            })
+            .expect("record generated candidate");
+        generations
+            .select(&project.id, &scene.id, &candidate.id)
+            .expect("select official candidate");
+    }
+
+    tunnel
+        .stop_for(&instance_id)
+        .await
+        .expect("stop full-flow validation tunnel");
+
+    let voice = tts
+        .list_voices()
+        .expect("list system voices")
+        .into_iter()
+        .find(|voice| voice.locale.starts_with("zh"))
+        .expect("Chinese system voice is required for acceptance");
+    for scene in &scenes {
+        let narration = tts
+            .synthesize(
+                &storyboards,
+                SynthesizeNarrationInput {
+                    project_id: project.id.clone(),
+                    scene_id: scene.id.clone(),
+                    voice_id: voice.id.clone(),
+                    rate: 0,
+                    volume: 100,
+                },
+            )
+            .expect("synthesize scene narration");
+        assert!(
+            narration.duration_ms < 10_000,
+            "narration must fit its scene"
+        );
+    }
+
+    let export = exporter
+        .export(
+            &storyboards,
+            &generations,
+            &assets,
+            &tts,
+            ExportProjectInput {
+                project_id: project.id.clone(),
+                output_directory: exports_root,
+                frame_rate: 24,
+                subtitle_mode: SubtitleMode::BurnAndSrt,
+                aspect_ratio: FrameAspectRatio::Landscape,
+                rendition: OutputRendition::Candidate,
+                narration_volume: 82,
+                music_asset_id: None,
+                music_volume: 0,
+                music_fade: false,
+                environment_audio_policy: EnvironmentAudioPolicy::Smart,
+                environment_volume: 32,
+            },
+        )
+        .expect("export complete acceptance video");
+    assert_eq!((export.width, export.height), (1344, 756));
+    assert!((29_000..=31_000).contains(&export.duration_ms));
+    assert!(export.output_path.is_file());
+    assert!(export
+        .subtitle_path
+        .as_ref()
+        .is_some_and(|path| path.is_file()));
+    std::fs::write(
+        artifact_root.join("acceptance-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "projectId": project.id,
+            "projectDirectory": project.project_dir,
+            "outputPath": export.output_path,
+            "subtitlePath": export.subtitle_path,
+            "durationMs": export.duration_ms,
+            "width": export.width,
+            "height": export.height,
+            "sizeBytes": export.size_bytes,
+            "sha256": export.sha256,
+            "faultInjection": "first H3 job survived an SSH tunnel stop and reconnect"
+        }))
+        .expect("serialize acceptance result"),
+    )
+    .expect("write acceptance result");
+}
+
+#[tokio::test]
+#[ignore = "requires the configured paid GPU instance and enhances a completed acceptance project to 1080p"]
+async fn enhance_and_export_real_multiscene_project_to_1080p() {
+    let app_data_dir = PathBuf::from(required("ZHIHUA_TEST_APP_DATA_DIR"));
+    let run_dir = PathBuf::from(required("ZHIHUA_TEST_FULL_FLOW_RUN_DIR"));
+    let instance_id = required("ZHIHUA_TEST_COMPSHARE_INSTANCE_ID");
+    let acceptance: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run_dir.join("acceptance-result.json"))
+            .expect("read candidate acceptance result"),
+    )
+    .expect("parse candidate acceptance result");
+    let project_id = acceptance["projectId"]
+        .as_str()
+        .expect("acceptance project ID")
+        .to_owned();
+
+    let projects =
+        ProjectStorage::initialize(run_dir.join("acceptance.sqlite3"), run_dir.join("projects"))
+            .expect("open acceptance project storage");
+    let project = projects
+        .get_project(&project_id)
+        .expect("open acceptance project");
+    let storyboards = StoryboardStorage::initialize(projects.clone())
+        .expect("open acceptance storyboard storage");
+    let generations = GenerationStorage::initialize(projects.clone())
+        .expect("open acceptance generation storage");
+    let assets = AssetStorage::initialize(projects.clone()).expect("open acceptance asset storage");
+    let tts = SystemTtsProvider::initialize(projects.clone()).expect("open acceptance TTS");
+    let scenes = storyboards
+        .list(&project_id)
+        .expect("list acceptance scenes");
+    assert_eq!(scenes.len(), 3, "acceptance project must have three scenes");
+
+    let tunnel = SshTunnelManager::new(app_data_dir.clone()).expect("initialize SSH tunnel");
+    let tunnel_status = tunnel
+        .start_for(&instance_id)
+        .await
+        .expect("start enhancement SSH tunnel");
+    let service = ServiceClient::new(app_data_dir).expect("initialize service client");
+    service
+        .retarget_for(
+            &instance_id,
+            tunnel_status
+                .local_url
+                .expect("enhancement local tunnel URL"),
+        )
+        .expect("retarget enhancement service");
+    let probe = service
+        .probe_for(&instance_id)
+        .await
+        .expect("probe enhancement service");
+    assert!(
+        probe
+            .available_workflows
+            .iter()
+            .any(|workflow| workflow == "seedvr2-1080p-v1"),
+        "SeedVR2 1080p workflow must be available"
+    );
+
+    for (index, scene) in scenes.iter().enumerate() {
+        let candidate = generations
+            .list(&project_id, &scene.id)
+            .expect("list scene candidates")
+            .into_iter()
+            .find(|candidate| candidate.selected)
+            .expect("selected scene candidate");
+        let uploaded = service
+            .upload_input_for(&instance_id, &candidate.local_path.to_string_lossy())
+            .await
+            .expect("upload selected candidate for enhancement");
+        let suffix = uuid::Uuid::new_v4();
+        let job = service
+            .submit_job_for(
+                &instance_id,
+                SubmitServiceJobInput {
+                    client_request_id: format!("full-flow-upscale-{suffix}"),
+                    project_id: project_id.clone(),
+                    scene_id: scene.id.clone(),
+                    kind: "video_upscale".to_owned(),
+                    workflow_id: "seedvr2-1080p-v1".to_owned(),
+                    parameters: json!({
+                        "sourceVideoFile": uploaded.remote_file,
+                        "seed": 2026091451_u64 + index as u64
+                    }),
+                },
+            )
+            .await
+            .expect("submit SeedVR2 enhancement");
+        let job = wait_for_job(&service, &instance_id, &job.id, 20).await;
+        let prompt_id = job.prompt_id.clone();
+        let artifact = job
+            .result_manifest
+            .expect("enhancement result manifest")
+            .artifacts
+            .into_iter()
+            .find(|artifact| artifact.kind == "video")
+            .expect("enhanced video artifact");
+        let destination = project
+            .project_dir
+            .join("generated")
+            .join("videos")
+            .join(&scene.id)
+            .join("1080p")
+            .join(format!("scene-{}-1080p.mp4", index + 1));
+        let downloaded = service
+            .download_artifact_for(
+                &instance_id,
+                DownloadServiceArtifactInput {
+                    job_id: job.id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                    destination_path: destination.to_string_lossy().into_owned(),
+                    expected_size_bytes: artifact.size_bytes,
+                    expected_sha256: artifact.sha256,
+                },
+            )
+            .await
+            .expect("download enhanced video");
+        generations
+            .record_enhanced(RecordEnhancedInput {
+                project_id: project_id.clone(),
+                scene_id: scene.id.clone(),
+                source_candidate_id: candidate.id,
+                job_id: job.id,
+                workflow_id: "seedvr2-1080p-v1".to_owned(),
+                prompt_id,
+                artifact_id: artifact.artifact_id,
+                filename: artifact.filename,
+                media_type: artifact.media_type,
+                local_path: downloaded.destination_path.into(),
+                size_bytes: downloaded.size_bytes,
+                sha256: downloaded.sha256,
+            })
+            .expect("record enhanced scene version");
+        service
+            .delete_input_for(&instance_id, &uploaded.input_id)
+            .await
+            .expect("delete uploaded enhancement input");
+    }
+
+    tunnel
+        .stop_for(&instance_id)
+        .await
+        .expect("stop enhancement tunnel");
+    let export = FfmpegExporter::new(projects)
+        .export(
+            &storyboards,
+            &generations,
+            &assets,
+            &tts,
+            ExportProjectInput {
+                project_id,
+                output_directory: run_dir.join("exports-1080p"),
+                frame_rate: 24,
+                subtitle_mode: SubtitleMode::BurnAndSrt,
+                aspect_ratio: FrameAspectRatio::Landscape,
+                rendition: OutputRendition::Enhanced1080p,
+                narration_volume: 82,
+                music_asset_id: None,
+                music_volume: 0,
+                music_fade: false,
+                environment_audio_policy: EnvironmentAudioPolicy::Smart,
+                environment_volume: 32,
+            },
+        )
+        .expect("export enhanced acceptance video");
+    assert_eq!((export.width, export.height), (1920, 1080));
+    assert_eq!(export.enhanced_scene_count, 3);
+    assert_eq!(export.scaled_scene_count, 0);
+    assert!((29_000..=31_000).contains(&export.duration_ms));
+    std::fs::write(
+        run_dir.join("enhancement-result.json"),
+        serde_json::to_vec_pretty(&json!({
+            "outputPath": export.output_path,
+            "subtitlePath": export.subtitle_path,
+            "durationMs": export.duration_ms,
+            "width": export.width,
+            "height": export.height,
+            "enhancedSceneCount": export.enhanced_scene_count,
+            "scaledSceneCount": export.scaled_scene_count,
+            "sizeBytes": export.size_bytes,
+            "sha256": export.sha256
+        }))
+        .expect("serialize enhancement result"),
+    )
+    .expect("write enhancement result");
 }
 
 #[tokio::test]
