@@ -4,15 +4,26 @@ set -euo pipefail
 repo_dir="/root/zhihua-service"
 repo_url="https://github.com/woniu101/zhihua-service.git"
 
+retry_network() {
+  local attempt=1
+  while ! "$@"; do
+    if (( attempt >= 5 )); then
+      return 1
+    fi
+    sleep $((attempt * 3))
+    attempt=$((attempt + 1))
+  done
+}
+
 if [[ -d "$repo_dir/.git" ]]; then
-  git -C "$repo_dir" fetch --depth 1 origin main
+  retry_network git -C "$repo_dir" fetch --depth 1 origin main
   git -C "$repo_dir" reset --hard origin/main
 else
   if [[ -e "$repo_dir" ]]; then
     echo "Refusing to replace an existing non-Git directory: $repo_dir" >&2
     exit 1
   fi
-  git clone --depth 1 --branch main "$repo_url" "$repo_dir"
+  retry_network git clone --depth 1 --branch main "$repo_url" "$repo_dir"
 fi
 
 cd "$repo_dir"
