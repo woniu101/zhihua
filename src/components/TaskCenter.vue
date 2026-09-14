@@ -85,20 +85,29 @@ function progressPercent(job: LocalGenerationJob): number {
 }
 
 function hasMeasuredProgress(job: LocalGenerationJob): boolean {
-  if (!activeStatuses.has(job.status)) return false;
-  if (job.status === "running" && progressPercent(job) <= 15) return false;
-  return progressPercent(job) > 0;
+  return activeStatuses.has(job.status) && job.progressMeasured;
 }
 
 function stageLabel(job: LocalGenerationJob): string {
   const detail = job.statusDetail?.toLowerCase() ?? "";
+  if (job.progressStage === "model_loading") return "正在加载模型并准备生成";
   if (job.status === "running" && detail.includes("accepted")) return "模型已接收，等待开始推理";
+  if (job.progressStage === "model_inference") return "模型推理中，显示的是 ComfyUI 实际采样步数";
+  if (job.progressStage === "finalizing") return "正在整理并校验生成结果";
   if (job.status === "running" && detail.includes("execut")) return "模型推理中，耗时取决于时长和画面复杂度";
   if (job.status === "uploading") return "正在上传参考素材";
   if (job.status === "downloading") return "正在校验并保存生成结果";
   if (job.status === "waiting_for_compute") return "等待可用 GPU";
   if (["pending_submit", "leased", "queued", "preparing"].includes(job.status)) return "正在准备生成环境并排队";
   return job.statusDetail || statusMeta(job.status).label;
+}
+
+function progressValue(job: LocalGenerationJob): string {
+  if (!hasMeasuredProgress(job)) return "进行中";
+  if (job.progressCurrent !== undefined && job.progressTotal !== undefined) {
+    return `${progressPercent(job)}% · ${job.progressCurrent}/${job.progressTotal}`;
+  }
+  return `${progressPercent(job)}%`;
 }
 
 function timeLabel(value: string): string {
@@ -213,7 +222,7 @@ onBeforeUnmount(() => {
               <p>{{ projectName(job) }} · {{ timeLabel(job.updatedAt) }}</p>
               <div v-if="activeStatuses.has(job.status)" class="task-stage">
                 <span>{{ stageLabel(job) }}</span>
-                <b>{{ hasMeasuredProgress(job) ? `${progressPercent(job)}%` : "进行中" }}</b>
+                <b>{{ progressValue(job) }}</b>
               </div>
               <div v-if="activeStatuses.has(job.status)" class="task-progress" :class="{ indeterminate: !hasMeasuredProgress(job) }">
                 <i :style="hasMeasuredProgress(job) ? { width: `${Math.max(4, progressPercent(job))}%` } : undefined" />

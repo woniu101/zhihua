@@ -136,6 +136,13 @@ pub struct ServiceJob {
     pub status: String,
     pub prompt_id: Option<String>,
     pub progress: f64,
+    #[serde(default)]
+    pub progress_stage: String,
+    #[serde(default)]
+    pub progress_measured: bool,
+    pub progress_current: Option<u64>,
+    pub progress_total: Option<u64>,
+    pub eta_seconds: Option<u64>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub status_detail: Option<String>,
@@ -262,6 +269,13 @@ struct JobWire {
     status: String,
     prompt_id: Option<String>,
     progress: f64,
+    #[serde(default)]
+    progress_stage: String,
+    #[serde(default)]
+    progress_measured: bool,
+    progress_current: Option<u64>,
+    progress_total: Option<u64>,
+    eta_seconds: Option<u64>,
     error_code: Option<String>,
     error_message: Option<String>,
     status_detail: Option<String>,
@@ -298,6 +312,11 @@ impl From<JobWire> for ServiceJob {
             status: job.status,
             prompt_id: job.prompt_id,
             progress: job.progress,
+            progress_stage: job.progress_stage,
+            progress_measured: job.progress_measured,
+            progress_current: job.progress_current,
+            progress_total: job.progress_total,
+            eta_seconds: job.eta_seconds,
             error_code: job.error_code,
             error_message: job.error_message,
             status_detail: job.status_detail,
@@ -782,7 +801,8 @@ impl ServiceClient {
         input: DownloadServiceArtifactInput,
     ) -> ServiceResult<ServiceArtifactDownload> {
         let connection = self.connection()?;
-        self.download_artifact_with(connection, input).await
+        self.download_artifact_with(connection, input, |_, _| {})
+            .await
     }
 
     pub async fn download_artifact_for(
@@ -791,14 +811,33 @@ impl ServiceClient {
         input: DownloadServiceArtifactInput,
     ) -> ServiceResult<ServiceArtifactDownload> {
         let connection = self.connection_for(instance_id)?;
-        self.download_artifact_with(connection, input).await
+        self.download_artifact_with(connection, input, |_, _| {})
+            .await
     }
 
-    async fn download_artifact_with(
+    pub async fn download_artifact_for_with_progress<F>(
+        &self,
+        instance_id: &str,
+        input: DownloadServiceArtifactInput,
+        progress: F,
+    ) -> ServiceResult<ServiceArtifactDownload>
+    where
+        F: FnMut(u64, u64),
+    {
+        let connection = self.connection_for(instance_id)?;
+        self.download_artifact_with(connection, input, progress)
+            .await
+    }
+
+    async fn download_artifact_with<F>(
         &self,
         connection: ActiveConnection,
         input: DownloadServiceArtifactInput,
-    ) -> ServiceResult<ServiceArtifactDownload> {
+        mut progress: F,
+    ) -> ServiceResult<ServiceArtifactDownload>
+    where
+        F: FnMut(u64, u64),
+    {
         let job_id = validate_identifier(&input.job_id, "任务 ID")?;
         let artifact_id = validate_identifier(&input.artifact_id, "成品 ID")?;
         let expected_sha256 = validate_sha256(&input.expected_sha256)?;
@@ -820,6 +859,7 @@ impl ServiceClient {
             .unwrap_or(false)
             && sha256_file(&destination).await? == expected_sha256
         {
+            progress(input.expected_size_bytes, input.expected_size_bytes);
             return Ok(ServiceArtifactDownload {
                 destination_path: destination.to_string_lossy().into_owned(),
                 size_bytes: input.expected_size_bytes,
@@ -836,6 +876,7 @@ impl ServiceClient {
             let _ = tokio::fs::remove_file(&partial).await;
             existing = 0;
         }
+        progress(existing, input.expected_size_bytes);
         let path = format!("/api/v1/jobs/{job_id}/artifacts/{artifact_id}");
         let mut request =
             self.authenticated_with(&self.transfer_client, &connection, Method::GET, &path);
@@ -860,6 +901,7 @@ impl ServiceClient {
             .await
             .map_err(|_| service_error("download_io", "无法创建成品临时文件。"))?;
         let mut received = existing;
+        let mut last_reported = existing;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(connection_error)?;
@@ -874,6 +916,12 @@ impl ServiceClient {
                 .write_all(&chunk)
                 .await
                 .map_err(|_| service_error("download_io", "写入成品文件失败。"))?;
+            if received == input.expected_size_bytes
+                || received.saturating_sub(last_reported) >= 1024 * 1024
+            {
+                progress(received, input.expected_size_bytes);
+                last_reported = received;
+            }
         }
         output
             .flush()
@@ -1691,19 +1739,24 @@ mod tests {
         fs::write(partial_path(&destination), &content[..3]).expect("partial file");
         let expected_sha256 = format!("{:x}", Sha256::digest(content));
         let client = connected_client(format!("http://{address}"));
-        let downloaded = tauri::async_runtime::block_on(client.download_artifact(
-            DownloadServiceArtifactInput {
-                job_id: "job-1".to_owned(),
-                artifact_id: "video-0".to_owned(),
-                destination_path: destination.to_string_lossy().into_owned(),
-                expected_size_bytes: content.len() as u64,
-                expected_sha256: expected_sha256.clone(),
-            },
-        ))
-        .expect("resumed download");
+        let mut progress_events = Vec::new();
+        let downloaded =
+            tauri::async_runtime::block_on(client.download_artifact_for_with_progress(
+                "test-instance",
+                DownloadServiceArtifactInput {
+                    job_id: "job-1".to_owned(),
+                    artifact_id: "video-0".to_owned(),
+                    destination_path: destination.to_string_lossy().into_owned(),
+                    expected_size_bytes: content.len() as u64,
+                    expected_sha256: expected_sha256.clone(),
+                },
+                |current, total| progress_events.push((current, total)),
+            ))
+            .expect("resumed download");
         assert!(downloaded.resumed);
         assert_eq!(downloaded.sha256, expected_sha256);
         assert_eq!(fs::read(destination).expect("downloaded file"), content);
+        assert_eq!(progress_events, vec![(3, 10), (10, 10)]);
     }
 
     #[test]

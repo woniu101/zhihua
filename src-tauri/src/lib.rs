@@ -2283,6 +2283,18 @@ async fn get_service_job(
     let instance_id = remote_job_instance_id(&queue, &job_id)?;
     let job = service.get_job_for(&instance_id, &job_id).await?;
     let local = queue.sync(&job).map_err(queue_service_error)?;
+    reconcile_service_job_lease(&app, &queue, &compute, &lifecycle, &local, &job)?;
+    Ok(job)
+}
+
+fn reconcile_service_job_lease(
+    app: &AppHandle,
+    _queue: &JobQueueStorage,
+    compute: &ComputeControlStore,
+    lifecycle: &ComputeLifecycle,
+    local: &LocalJob,
+    job: &ServiceJob,
+) -> Result<(), ServiceConnectionError> {
     if job.status == "completed" {
         if let Err(error) = compute.renew_worker_lease(&job.client_request_id, 900) {
             if error.code != "WORKER_LEASE_NOT_FOUND" {
@@ -2321,7 +2333,63 @@ async fn get_service_job(
             .acquire_worker_lease(worker_id, instance_id, &job.client_request_id, 3_600)
             .map_err(compute_service_error)?;
     }
-    Ok(job)
+    Ok(())
+}
+
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationRecoveryReport {
+    inspected: usize,
+    synchronized: usize,
+    downloads_ready_to_resume: usize,
+    unreachable: usize,
+}
+
+async fn recover_generation_jobs(app: &AppHandle) -> GenerationRecoveryReport {
+    let queue = app.state::<JobQueueStorage>();
+    let service = app.state::<ServiceClient>();
+    let compute = app.state::<ComputeControlStore>();
+    let lifecycle = app.state::<ComputeLifecycle>();
+    let mut report = GenerationRecoveryReport::default();
+    let Ok(jobs) = queue.list(None) else {
+        return report;
+    };
+    for local in jobs {
+        let Some(remote_job_id) = local.remote_job_id.as_deref() else {
+            continue;
+        };
+        if matches!(
+            local.status.as_str(),
+            "completed_local" | "failed" | "cancelled" | "interrupted"
+        ) {
+            continue;
+        }
+        report.inspected += 1;
+        if local.status == "downloading" {
+            if queue
+                .mark_download_retry(remote_job_id, "客户端上次在保存结果时退出")
+                .is_ok()
+            {
+                report.downloads_ready_to_resume += 1;
+            }
+        }
+        let Ok(instance_id) = remote_job_instance_id(&queue, remote_job_id) else {
+            report.unreachable += 1;
+            continue;
+        };
+        let Ok(job) = service.get_job_for(&instance_id, remote_job_id).await else {
+            report.unreachable += 1;
+            continue;
+        };
+        let Ok(synced) = queue.sync(&job) else {
+            report.unreachable += 1;
+            continue;
+        };
+        if reconcile_service_job_lease(app, &queue, &compute, &lifecycle, &synced, &job).is_ok() {
+            report.synchronized += 1;
+        }
+    }
+    report
 }
 
 #[tauri::command]
@@ -2587,6 +2655,41 @@ fn select_candidate_version(
     storage.select(&input.project_id, &input.scene_id, &input.version_id)
 }
 
+async fn download_artifact_with_queue_progress(
+    service: &ServiceClient,
+    queue: &JobQueueStorage,
+    instance_id: &str,
+    remote_job_id: &str,
+    input: DownloadServiceArtifactInput,
+    completed_before: u64,
+    total_bytes: u64,
+) -> Result<ServiceArtifactDownload, String> {
+    queue
+        .mark_downloading(remote_job_id, completed_before, total_bytes)
+        .map_err(|error| error.message)?;
+    let progress_queue = queue.clone();
+    let progress_job_id = remote_job_id.to_owned();
+    let result = service
+        .download_artifact_for_with_progress(instance_id, input, move |received, _| {
+            let _ = progress_queue.mark_downloading(
+                &progress_job_id,
+                completed_before.saturating_add(received).min(total_bytes),
+                total_bytes,
+            );
+        })
+        .await;
+    match result {
+        Ok(downloaded) => Ok(downloaded),
+        Err(error) => {
+            let _ = queue.mark_download_retry(remote_job_id, &error.message);
+            Err(format!(
+                "{} 远端结果仍保留，可稍后继续下载。",
+                error.message
+            ))
+        }
+    }
+}
+
 #[tauri::command]
 async fn download_completed_job(
     app: AppHandle,
@@ -2675,6 +2778,8 @@ async fn download_completed_job(
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
 
+    let total_bytes = artifacts.iter().map(|artifact| artifact.size_bytes).sum();
+    let mut completed_bytes = 0_u64;
     let mut candidates = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
@@ -2685,19 +2790,23 @@ async fn download_completed_job(
             .join(safe_path_component(&job.scene_id)?)
             .join(safe_path_component(&job.id)?)
             .join(&filename);
-        let downloaded = service
-            .download_artifact_for(
-                &instance_id,
-                DownloadServiceArtifactInput {
-                    job_id: job.id.clone(),
-                    artifact_id: artifact.artifact_id.clone(),
-                    destination_path: destination.to_string_lossy().into_owned(),
-                    expected_size_bytes: artifact.size_bytes,
-                    expected_sha256: artifact.sha256.clone(),
-                },
-            )
-            .await
-            .map_err(|error| error.message)?;
+        let downloaded = download_artifact_with_queue_progress(
+            &service,
+            &queue,
+            &instance_id,
+            &job.id,
+            DownloadServiceArtifactInput {
+                job_id: job.id.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256.clone(),
+            },
+            completed_bytes,
+            total_bytes,
+        )
+        .await?;
+        completed_bytes = completed_bytes.saturating_add(downloaded.size_bytes);
         candidates.push(
             generations
                 .record(RecordCandidateInput {
@@ -2804,6 +2913,8 @@ async fn download_completed_image_job(
         return Err("远端任务返回的图片数量异常。".to_owned());
     }
 
+    let total_bytes = artifacts.iter().map(|artifact| artifact.size_bytes).sum();
+    let mut completed_bytes = 0_u64;
     let mut imported = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
@@ -2813,19 +2924,23 @@ async fn download_completed_image_job(
             .join("image-jobs")
             .join(safe_path_component(&job.id)?)
             .join(filename);
-        let downloaded = service
-            .download_artifact_for(
-                &instance_id,
-                DownloadServiceArtifactInput {
-                    job_id: job.id.clone(),
-                    artifact_id: artifact.artifact_id,
-                    destination_path: temporary.to_string_lossy().into_owned(),
-                    expected_size_bytes: artifact.size_bytes,
-                    expected_sha256: artifact.sha256,
-                },
-            )
-            .await
-            .map_err(|error| error.message)?;
+        let downloaded = download_artifact_with_queue_progress(
+            &service,
+            &queue,
+            &instance_id,
+            &job.id,
+            DownloadServiceArtifactInput {
+                job_id: job.id.clone(),
+                artifact_id: artifact.artifact_id,
+                destination_path: temporary.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256,
+            },
+            completed_bytes,
+            total_bytes,
+        )
+        .await?;
+        completed_bytes = completed_bytes.saturating_add(downloaded.size_bytes);
         let result = assets
             .import_generated_file(
                 &project.id,
@@ -2904,6 +3019,8 @@ async fn download_completed_enhancement(
         return Err("SeedVR2 任务返回的视频数量异常，已停止自动下载。".to_owned());
     }
 
+    let total_bytes = artifacts.iter().map(|artifact| artifact.size_bytes).sum();
+    let mut completed_bytes = 0_u64;
     let mut enhanced_versions = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let filename = safe_artifact_filename(&artifact.artifact_id, &artifact.filename)?;
@@ -2915,19 +3032,23 @@ async fn download_completed_enhancement(
             .join("1080p")
             .join(safe_path_component(&job.id)?)
             .join(&filename);
-        let downloaded = service
-            .download_artifact_for(
-                &instance_id,
-                DownloadServiceArtifactInput {
-                    job_id: job.id.clone(),
-                    artifact_id: artifact.artifact_id.clone(),
-                    destination_path: destination.to_string_lossy().into_owned(),
-                    expected_size_bytes: artifact.size_bytes,
-                    expected_sha256: artifact.sha256.clone(),
-                },
-            )
-            .await
-            .map_err(|error| error.message)?;
+        let downloaded = download_artifact_with_queue_progress(
+            &service,
+            &queue,
+            &instance_id,
+            &job.id,
+            DownloadServiceArtifactInput {
+                job_id: job.id.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.sha256.clone(),
+            },
+            completed_bytes,
+            total_bytes,
+        )
+        .await?;
+        completed_bytes = completed_bytes.saturating_add(downloaded.size_bytes);
         enhanced_versions.push(
             generations
                 .record_enhanced(RecordEnhancedInput {
@@ -3456,13 +3577,16 @@ pub fn run() {
                 if let Some(instance_id) = configured_instance {
                     let service = app_handle.state::<ServiceClient>();
                     let compute = app_handle.state::<ComputeControlStore>();
-                    let _ = connect_service_through_tunnel_impl(
+                    let connected = connect_service_through_tunnel_impl(
                         &manager,
                         &service,
                         &compute,
                         &instance_id,
                     )
                     .await;
+                    if connected.is_ok() {
+                        let _ = recover_generation_jobs(&app_handle).await;
+                    }
                 }
             });
             Ok(())

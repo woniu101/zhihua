@@ -53,11 +53,33 @@ interface NativeServiceJob {
   promptId?: string;
   status: GenerationJob["status"];
   progress: number;
+  progressStage?: string;
+  progressMeasured?: boolean;
+  progressCurrent?: number;
+  progressTotal?: number;
+  etaSeconds?: number;
   errorCode?: string;
   errorMessage?: string;
   statusDetail?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+function jobStageMessage(job: NativeServiceJob): string {
+  if (job.errorMessage) return job.errorMessage;
+  const measured = job.progressCurrent !== undefined && job.progressTotal !== undefined
+    ? `（${job.progressCurrent}/${job.progressTotal}）`
+    : "";
+  return {
+    queued: "任务正在排队",
+    preparing: "正在准备工作流",
+    model_loading: "正在加载模型并准备生成",
+    model_inference: `模型推理中${measured}`,
+    finalizing: "正在整理并校验生成结果",
+    completed: "生成完成，等待保存到本地",
+    failed: "生成失败",
+    cancelled: "任务已取消",
+  }[job.progressStage ?? ""] ?? job.statusDetail ?? job.status;
 }
 
 function mapJob(job: NativeServiceJob): GenerationJob {
@@ -67,7 +89,12 @@ function mapJob(job: NativeServiceJob): GenerationJob {
     remotePromptId: job.promptId,
     status: job.status,
     progress: job.progress,
-    stageMessage: job.errorMessage ?? job.statusDetail ?? job.status,
+    progressStage: job.progressStage ?? job.status,
+    progressMeasured: job.progressMeasured ?? false,
+    progressCurrent: job.progressCurrent,
+    progressTotal: job.progressTotal,
+    etaSeconds: job.etaSeconds,
+    stageMessage: jobStageMessage(job),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     errorCode: job.errorCode,
@@ -96,6 +123,11 @@ export interface LocalGenerationJob {
   workflowId: string;
   status: string;
   progress: number;
+  progressStage: string;
+  progressMeasured: boolean;
+  progressCurrent?: number;
+  progressTotal?: number;
+  etaSeconds?: number;
   workerId?: string;
   leaseExpiresAt?: string;
   attempt: number;

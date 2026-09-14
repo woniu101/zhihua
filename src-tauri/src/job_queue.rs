@@ -43,6 +43,11 @@ pub struct LocalJob {
     pub workflow_id: String,
     pub status: String,
     pub progress: f64,
+    pub progress_stage: String,
+    pub progress_measured: bool,
+    pub progress_current: Option<u64>,
+    pub progress_total: Option<u64>,
+    pub eta_seconds: Option<u64>,
     pub worker_id: Option<String>,
     pub lease_expires_at: Option<String>,
     pub attempt: u32,
@@ -77,6 +82,11 @@ impl JobQueueStorage {
                 request_json      TEXT NOT NULL,
                 status            TEXT NOT NULL,
                 progress          REAL NOT NULL DEFAULT 0,
+                progress_stage    TEXT NOT NULL DEFAULT 'queued',
+                progress_measured INTEGER NOT NULL DEFAULT 0,
+                progress_current  INTEGER,
+                progress_total    INTEGER,
+                eta_seconds       INTEGER,
                 worker_id         TEXT,
                 lease_expires_at  TEXT,
                 attempt           INTEGER NOT NULL DEFAULT 0,
@@ -170,6 +180,33 @@ impl JobQueueStorage {
             migration.map_err(database_error)?;
             restore?;
         }
+        let columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(generation_jobs)")
+                .map_err(database_error)?;
+            let result = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(database_error)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            result
+        };
+        for (column, definition) in [
+            ("progress_stage", "TEXT NOT NULL DEFAULT 'queued'"),
+            ("progress_measured", "INTEGER NOT NULL DEFAULT 0"),
+            ("progress_current", "INTEGER"),
+            ("progress_total", "INTEGER"),
+            ("eta_seconds", "INTEGER"),
+        ] {
+            if !columns.iter().any(|item| item == column) {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE generation_jobs ADD COLUMN {column} {definition}"),
+                        [],
+                    )
+                    .map_err(database_error)?;
+            }
+        }
         storage.release_expired_leases()?;
         Ok(storage)
     }
@@ -223,12 +260,20 @@ impl JobQueueStorage {
             .execute(
                 "INSERT INTO generation_jobs
                  (client_request_id, remote_job_id, project_id, scene_id, kind, workflow_id,
-                  request_json, status, progress, attempt, error_code, error_message, status_detail, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12)
+                  request_json, status, progress, progress_stage, progress_measured,
+                  progress_current, progress_total, eta_seconds, attempt, error_code,
+                  error_message, status_detail, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         1, ?14, ?15, ?16, ?17, ?17)
                  ON CONFLICT(client_request_id) DO UPDATE SET
                    remote_job_id=excluded.remote_job_id,
                    status=excluded.status,
                    progress=excluded.progress,
+                   progress_stage=excluded.progress_stage,
+                   progress_measured=excluded.progress_measured,
+                   progress_current=excluded.progress_current,
+                   progress_total=excluded.progress_total,
+                   eta_seconds=excluded.eta_seconds,
                    error_code=excluded.error_code,
                    error_message=excluded.error_message,
                    status_detail=excluded.status_detail,
@@ -244,6 +289,11 @@ impl JobQueueStorage {
                     job.workflow_id,
                     job.status,
                     job.progress,
+                    job.progress_stage,
+                    job.progress_measured,
+                    job.progress_current,
+                    job.progress_total,
+                    job.eta_seconds,
                     job.error_code,
                     job.error_message,
                     job.status_detail,
@@ -275,14 +325,20 @@ impl JobQueueStorage {
         let changed = self
             .connection()?
             .execute(
-                "UPDATE generation_jobs SET status=?2, progress=?3, error_code=?4,
-             error_message=?5, status_detail=?6,
+                "UPDATE generation_jobs SET status=?2, progress=?3, progress_stage=?4,
+             progress_measured=?5, progress_current=?6, progress_total=?7, eta_seconds=?8,
+             error_code=?9, error_message=?10, status_detail=?11,
              lease_expires_at=CASE WHEN ?2 IN ('completed','failed','cancelled','interrupted') THEN NULL ELSE lease_expires_at END,
-             updated_at=?7 WHERE remote_job_id=?1",
+             updated_at=?12 WHERE remote_job_id=?1 AND status!='downloading'",
                 params![
                     job.id,
                     job.status,
                     job.progress,
+                    job.progress_stage,
+                    job.progress_measured,
+                    job.progress_current,
+                    job.progress_total,
+                    job.eta_seconds,
                     job.error_code,
                     job.error_message,
                     job.status_detail,
@@ -291,6 +347,9 @@ impl JobQueueStorage {
             )
             .map_err(database_error)?;
         if changed == 0 {
+            if let Ok(existing) = self.find_by_remote(&job.id) {
+                return Ok(existing);
+            }
             return self.record_remote(job);
         }
         self.find_by_request(&job.client_request_id)
@@ -300,8 +359,49 @@ impl JobQueueStorage {
         self.connection()?
             .execute(
                 "UPDATE generation_jobs SET status='completed_local', progress=1,
+             progress_stage='completed', progress_measured=1,
+             progress_current=1, progress_total=1, eta_seconds=0,
+             error_code=NULL, error_message=NULL, status_detail='结果已保存到本地',
              lease_expires_at=NULL, updated_at=?2 WHERE remote_job_id=?1",
                 params![remote_job_id, now_iso()],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn mark_downloading(
+        &self,
+        remote_job_id: &str,
+        current: u64,
+        total: u64,
+    ) -> QueueResult<()> {
+        if total == 0 || current > total {
+            return Err(JobQueueError::new("INVALID_PROGRESS", "下载进度数据无效"));
+        }
+        self.connection()?
+            .execute(
+                "UPDATE generation_jobs SET status='downloading',
+                 progress=CAST(?2 AS REAL)/CAST(?3 AS REAL), progress_stage='downloading',
+                 progress_measured=1, progress_current=?2, progress_total=?3,
+                 eta_seconds=NULL, error_code=NULL, error_message=NULL,
+                 status_detail='正在续传并校验生成结果', updated_at=?4
+                 WHERE remote_job_id=?1",
+                params![remote_job_id, current, total, now_iso()],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn mark_download_retry(&self, remote_job_id: &str, message: &str) -> QueueResult<()> {
+        self.connection()?
+            .execute(
+                "UPDATE generation_jobs SET status='completed', progress=1,
+                 progress_stage='completed', progress_measured=1,
+                 progress_current=1, progress_total=1, eta_seconds=0,
+                 error_code='DOWNLOAD_INTERRUPTED', error_message=?2,
+                 status_detail='结果仍在远端，可继续下载', updated_at=?3
+                 WHERE remote_job_id=?1",
+                params![remote_job_id, message, now_iso()],
             )
             .map_err(database_error)?;
         Ok(())
@@ -359,7 +459,8 @@ impl JobQueueStorage {
     pub fn list(&self, project_id: Option<&str>) -> QueueResult<Vec<LocalJob>> {
         let connection = self.connection()?;
         let sql = "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
-                          workflow_id, status, progress, worker_id, lease_expires_at,
+                          workflow_id, status, progress, progress_stage, progress_measured,
+                          progress_current, progress_total, eta_seconds, worker_id, lease_expires_at,
                           attempt, error_code, error_message, status_detail, created_at, updated_at
                    FROM generation_jobs";
         let mut statement = if project_id.is_some() {
@@ -418,7 +519,8 @@ impl JobQueueStorage {
         self.connection()?
             .query_row(
                 "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
-                    workflow_id, status, progress, worker_id, lease_expires_at,
+                    workflow_id, status, progress, progress_stage, progress_measured,
+                    progress_current, progress_total, eta_seconds, worker_id, lease_expires_at,
                     attempt, error_code, error_message, status_detail, created_at, updated_at
              FROM generation_jobs WHERE remote_job_id=?1",
                 [remote_job_id],
@@ -431,7 +533,8 @@ impl JobQueueStorage {
         self.connection()?
             .query_row(
                 "SELECT client_request_id, remote_job_id, project_id, scene_id, kind,
-                    workflow_id, status, progress, worker_id, lease_expires_at,
+                    workflow_id, status, progress, progress_stage, progress_measured,
+                    progress_current, progress_total, eta_seconds, worker_id, lease_expires_at,
                     attempt, error_code, error_message, status_detail, created_at, updated_at
              FROM generation_jobs WHERE client_request_id=?1",
                 [request_id],
@@ -451,14 +554,19 @@ fn local_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalJob> {
         workflow_id: row.get(5)?,
         status: row.get(6)?,
         progress: row.get(7)?,
-        worker_id: row.get(8)?,
-        lease_expires_at: row.get(9)?,
-        attempt: row.get(10)?,
-        error_code: row.get(11)?,
-        error_message: row.get(12)?,
-        status_detail: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        progress_stage: row.get(8)?,
+        progress_measured: row.get(9)?,
+        progress_current: row.get(10)?,
+        progress_total: row.get(11)?,
+        eta_seconds: row.get(12)?,
+        worker_id: row.get(13)?,
+        lease_expires_at: row.get(14)?,
+        attempt: row.get(15)?,
+        error_code: row.get(16)?,
+        error_message: row.get(17)?,
+        status_detail: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -555,6 +663,11 @@ mod tests {
             status: "running".into(),
             prompt_id: Some("prompt-1".into()),
             progress: 0.4,
+            progress_stage: "model_inference".into(),
+            progress_measured: true,
+            progress_current: Some(4),
+            progress_total: Some(10),
+            eta_seconds: Some(30),
             error_code: None,
             error_message: None,
             status_detail: Some("ComfyUI is executing the prompt".into()),
@@ -591,6 +704,25 @@ mod tests {
                 .worker_id
                 .as_deref(),
             Some("instance:worker-one:gpu:0")
+        );
+        queue
+            .mark_downloading("remote-1", 4, 10)
+            .expect("mark measured download");
+        let downloading = queue
+            .sync(&completed)
+            .expect("remote polling must not overwrite a local transfer");
+        assert_eq!(downloading.status, "downloading");
+        assert!(downloading.progress_measured);
+        assert_eq!(downloading.progress_current, Some(4));
+        assert_eq!(downloading.progress_total, Some(10));
+        queue
+            .mark_download_retry("remote-1", "desktop restarted")
+            .expect("make interrupted download retryable");
+        let retryable = queue.find_by_remote("remote-1").expect("retryable result");
+        assert_eq!(retryable.status, "completed");
+        assert_eq!(
+            retryable.error_code.as_deref(),
+            Some("DOWNLOAD_INTERRUPTED")
         );
         queue.mark_local_complete("remote-1").expect("complete");
         assert!(!queue

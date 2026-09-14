@@ -105,6 +105,11 @@ export interface GenerationJob {
   remotePromptId?: string;
   status: GenerationJobStatus;
   progress: number | null;
+  progressStage: string;
+  progressMeasured: boolean;
+  progressCurrent?: number;
+  progressTotal?: number;
+  etaSeconds?: number;
   stageMessage: string;
   createdAt: string;
   updatedAt: string;

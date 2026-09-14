@@ -66,7 +66,7 @@ let imagePollTimer: number | undefined;
 let imageRecoveryDelay = 2500;
 
 const imageProgress = computed(() => Math.round((imageJob.value?.progress ?? 0) * 100));
-const imageProgressMeasured = computed(() => Boolean(imageJob.value) && !(imageJob.value?.status === "running" && imageProgress.value <= 15));
+const imageProgressMeasured = computed(() => imageJob.value?.progressMeasured === true);
 const imageProgressLabel = computed(() => imageJob.value ? (imageProgressMeasured.value ? `${imageProgress.value}%` : "进行中") : "0%");
 const styleConfigured = computed(() => Boolean(projectStylePrompt(workspace.project.value?.styleProfile)));
 

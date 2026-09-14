@@ -111,7 +111,7 @@ const setDuration = (seconds: number) => {
 };
 const setQuality = (quality: CandidateQuality) => updateSelected({ quality });
 const taskPercent = computed(() => Math.max(0, Math.min(100, Math.round((task.value?.progress ?? 0) * 100))));
-const taskProgressMeasured = computed(() => Boolean(task.value) && !(task.value?.status === "running" && taskPercent.value <= 15));
+const taskProgressMeasured = computed(() => task.value?.progressMeasured === true);
 const taskProgressLabel = computed(() => task.value ? (taskProgressMeasured.value ? `${taskPercent.value}%` : "进行中") : taskError.value ? "需处理" : "空闲");
 const taskStatusLabel = computed(() => {
   const status = task.value?.status;
